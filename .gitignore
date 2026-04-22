@@ -1,0 +1,26 @@
+__pycache__/
+archive/
+.env
+.env.*
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+*.egg-info/
+.pytest_cache/
+logs/
+.claude/
+
+# bare-repo artifacts in root (legado)
+HEAD
+FETCH_HEAD
+ORIG_HEAD
+config
+description
+index
+packed-refs
+hooks/
+info/
+objects/
+refs/
