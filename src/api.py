@@ -3456,11 +3456,16 @@ async def health_check():
 
 
 @app.websocket("/ws/companies/{company_id}")
+@app.websocket("/api/ws/companies/{company_id}")
 async def websocket_companies(
     websocket: WebSocket,
     company_id: str,
     token: Optional[str] = Query(default=None),
 ):
+    # Handshake deve ser concluído antes de qualquer close() —
+    # caso contrário o browser nunca recebe o 101 e dispara onerror.
+    await websocket.accept()
+
     # --- Auth ---
     if token:
         try:
