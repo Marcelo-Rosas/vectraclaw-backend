@@ -36,7 +36,7 @@ class ConnectionManager:
     # ------------------------------------------------------------------
 
     async def connect(self, websocket: WebSocket, company_id: str) -> None:
-        await websocket.accept()
+        # accept() já foi chamado no route handler (antes da auth)
         self._connections[company_id].append(websocket)
         logger.info(
             "WS connect company=%s total=%d",

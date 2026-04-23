@@ -162,4 +162,27 @@ Resposta esperada do preflight:
 
 ---
 
+## Copiar para a outra IA (prompt único)
+
+```
+VectraClaw — aplicar 2 fixes cirúrgicos conforme docs/VEC-194-VectraClaw-Prompt-V6.1.md
+no repositório VectraClip (especificação).
+
+1. GET /tasks deve usar get_authenticated_client(request.state.token) — hoje usa
+   supabase (service_role) direto, bypassando RLS. Adicionar request: Request na
+   assinatura e try/except com fallback MOCK_TASKS (padrão idêntico a get_agents).
+
+2. get_heartbeats: proteger .eq("company_id", company_id) com guard `if company_id`
+   para não crashar quando chamado via rota fallback /api/heartbeats sem path param.
+
+3. Confirmar que app.add_middleware(CORSMiddleware, ...) está registrado DEPOIS
+   do @app.middleware("http") auth_middleware (Starlette insert(0) → último é o
+   mais externo). Isso garante CORS em 401/500.
+
+Não regredir: helpers _session_expires_to_utc / _user_created_at_to_utc, zod_user_role,
+fallback PGRST205 em approvals/audit, cliente JWT em agents/heartbeats/tasks ops.
+```
+
+---
+
 *Última atualização: 20/Abr/2026 — patch pós-auditoria V6.*

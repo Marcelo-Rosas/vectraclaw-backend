@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     deep_link_parser.add_argument('target')
 
     serve_parser = subparsers.add_parser('serve', help='run the FastAPI backend server for VectraClip')
-    serve_parser.add_argument('--port', type=int, default=3100)
+    serve_parser.add_argument('--port', type=int, default=3000)
 
     show_command = subparsers.add_parser('show-command', help='show one mirrored command entry by exact name')
     show_command.add_argument('name')

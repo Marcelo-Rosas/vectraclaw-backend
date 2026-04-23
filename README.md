@@ -109,6 +109,37 @@ Print the current Python workspace manifest:
 python3 -m src.main manifest
 ```
 
+## Comandos de Gerenciamento (VectraClaw)
+
+### Derrubar Porta do Backend (Kill Process)
+
+Se o servidor travar ou a porta estiver ocupada (default: `8000`), use os comandos abaixo:
+
+**Windows (PowerShell):**
+```powershell
+Stop-Process -Id (Get-NetTCPConnection -LocalPort 8000).OwningProcess -Force
+```
+
+**Windows (Git Bash / MINGW64):**
+```bash
+taskkill //F //PID $(netstat -ano | grep :8000 | grep LISTENING | awk '{print $5}' | tr -d '\r')
+```
+
+**Linux / macOS:**
+```bash
+# Via fuser
+fuser -k 8000/tcp
+
+# Via lsof
+lsof -ti:8000 | xargs kill -9
+```
+
+### Reiniciar Watchdog
+Se o processo de monitoramento cair:
+```bash
+python server_watchdog.py
+```
+
 List the current Python modules:
 
 ```bash
