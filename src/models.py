@@ -66,7 +66,7 @@ class Task(CamelModel):
     goal_id: Optional[str] = None
     title: str
     description: str
-    status: Literal["backlog", "queued", "in_progress", "review", "done", "blocked"]
+    status: Literal["backlog", "queued", "in_progress", "review", "done", "blocked", "skipped"]
     operation_type: Literal[
         "orchestration",
         "code_generation",
@@ -310,6 +310,33 @@ class UsageSummary:
             model_id=self.model_id,
         )
 
+class RoutineSchedule(CamelModel):
+    cron: str
+    timezone: str
+    human: str
+
+class Routine(CamelModel):
+    id: str
+    company_id: str
+    name: str
+    status: Literal["active", "paused", "error"]
+    schedule: RoutineSchedule
+    agent_id: Optional[str] = None
+    metadata: Optional[dict] = None
+    next_run_at: Optional[datetime] = None
+    last_run_at: Optional[datetime] = None
+    created_at: datetime
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        if self.next_run_at:
+            d["nextRunAt"] = self.next_run_at.isoformat().replace("+00:00", "Z")
+        if self.last_run_at:
+            d["lastRunAt"] = self.last_run_at.isoformat().replace("+00:00", "Z")
+        if self.created_at:
+            d["createdAt"] = self.created_at.isoformat().replace("+00:00", "Z")
+        return d
+
 class AuditLogEntry(CamelModel):
     id: str
     company_id: str
@@ -456,3 +483,78 @@ class PortingBacklog:
             f'- {module.name} [{module.status}] — {module.responsibility} (from {module.source_hint})'
             for module in self.modules
         ]
+
+# =====================================================================
+# SIPOC Builder Models (VEC-246)
+# =====================================================================
+
+class SipocCompany(CamelModel):
+    id: str
+    name: str
+    logo_url: Optional[str] = None
+    website: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    created_at: datetime
+    updated_at: datetime
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+class SipocSector(CamelModel):
+    id: str
+    company_id: str
+    name: str
+    slug: str
+    icon: Optional[str] = None
+    parent_sector_id: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    created_at: datetime
+    updated_at: datetime
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+class SipocPosition(CamelModel):
+    id: str
+    company_id: str
+    sector_id: Optional[str] = None
+    title: str
+    description: Optional[str] = None
+    reports_to_id: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    created_at: datetime
+    updated_at: datetime
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+class SipocProcess(CamelModel):
+    id: str
+    sector_id: str
+    position_id: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    status: Literal["rascunho", "em_revisao", "aprovado", "arquivado"] = "rascunho"
+    version: int = 1
+    responsible_id: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    created_at: datetime
+    updated_at: datetime
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+class SipocComponent(CamelModel):
+    id: str
+    process_id: str
+    type: Literal["supplier", "input", "activity", "output", "customer"]
+    content: Dict[str, Any]
+    order: int = 0
+    validation_status: Literal["verde", "amarelo", "vermelho"] = "verde"
+    validation_notes: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+    created_at: datetime
+    updated_at: datetime
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)

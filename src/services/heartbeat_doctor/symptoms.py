@@ -1,4 +1,5 @@
-from enum import Enum # Pydantic v1 prefere Enum ou StrEnum
+import os
+from enum import Enum
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -10,8 +11,7 @@ class Symptom(str, Enum):
     BURN_RATE_ANOMALY   = "burn_rate_anomaly"    # S5
     UNKNOWN_SENTINEL    = "unknown_sentinel"     # S6
 
-# Thresholds V1
-HB_GAP_THRESHOLD       = timedelta(seconds=60)
-TASK_STALE_THRESHOLD   = timedelta(minutes=5)
-SENTINEL_THRESHOLD     = timedelta(minutes=15)
-BURN_RATE_HARD_CAP_MULT = 2.0
+HB_GAP_THRESHOLD       = timedelta(seconds=int(os.getenv("DOCTOR_HB_GAP_SECONDS", "60")))
+TASK_STALE_THRESHOLD   = timedelta(minutes=int(os.getenv("DOCTOR_TASK_STALE_MINUTES", "5")))
+SENTINEL_THRESHOLD     = timedelta(minutes=int(os.getenv("DOCTOR_SENTINEL_MINUTES", "15")))
+BURN_RATE_HARD_CAP_MULT = float(os.getenv("DOCTOR_BURN_RATE_CAP_MULT", "2.0"))

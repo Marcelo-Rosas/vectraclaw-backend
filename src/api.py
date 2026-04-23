@@ -560,8 +560,13 @@ async def list_sipoc_companies(request: Request):
     if not supabase:
         return []
     try:
-        client = get_authenticated_client(request.state.token)
-        res = client.table("sipoc_companies").select("*").order("name").execute()
+        # service_role bypassa RLS; filtra manualmente por request.state.company_id.
+        # Em dev mode, request.state.token = "dev-token" não é JWT válido, então
+        # vectraclip.sipoc_company_id() retorna NULL e o RLS bloquearia tudo.
+        query = supabase.table("sipoc_companies").select("*").order("name")
+        if request.state.company_id:
+            query = query.eq("id", str(request.state.company_id))
+        res = query.execute()
         return [SipocCompany(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_sipoc_companies failed: {e}")
@@ -809,7 +814,7 @@ MOCK_AGENTS = [
     "id": "a0000000-0000-4000-8000-000000000003",
     "name": "Chronos",
     "role": "Monitoramento & Health Check",
-    "companyId": "c0000000-0000-4000-8000-000000000001",
+    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "status": "working",
     "tokenBudget": 100000,
     "currentBurnRate": 85000,
@@ -820,7 +825,7 @@ MOCK_AGENTS = [
     "id": "a0000000-0000-4000-8000-000000000004",
     "name": "Pitágoras",
     "role": "Atlas Code Review",
-    "companyId": "c0000000-0000-4000-8000-000000000001",
+    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "status": "working",
     "tokenBudget": 50000,
     "currentBurnRate": 60000,
@@ -832,7 +837,7 @@ MOCK_AGENTS = [
 MOCK_TASKS = [
   {
     "id": "7a5c0000-0000-4000-8000-000000000001",
-    "companyId": "c0000000-0000-4000-8000-000000000001",
+    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "assignedToAgentId": "a0000000-0000-4000-8000-000000000001",
     "parentTaskId": None,
     "title": "Extrair BL MEDU1234567",
@@ -846,7 +851,7 @@ MOCK_TASKS = [
   },
   {
     "id": "7a5c0000-0000-4000-8000-000000000002",
-    "companyId": "c0000000-0000-4000-8000-000000000001",
+    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "assignedToAgentId": "a0000000-0000-4000-8000-000000000003",
     "parentTaskId": None,
     "title": "Cotação Santos → Curitiba (Helios)",
@@ -860,7 +865,7 @@ MOCK_TASKS = [
   },
   {
     "id": "7a5c0000-0000-4000-8000-000000000003",
-    "companyId": "c0000000-0000-4000-8000-000000000001",
+    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "assignedToAgentId": "a0000000-0000-4000-8000-000000000004",
     "parentTaskId": None,
     "title": "Otimizar rota multimodal CPS-NVT",
@@ -876,7 +881,7 @@ MOCK_TASKS = [
 
 MOCK_GOALS = [{
     "id": "60a10000-0000-4000-8000-000000000001",
-    "companyId": "c0000000-0000-4000-8000-000000000001",
+    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "parentGoalId": None,
     "title": "Clear 50 Containers",
     "metric": "clearances",
@@ -895,7 +900,7 @@ MOCK_COMPANIES = [{
 MOCK_ROUTINES = [
     {
         "id": "rot00000-0000-4000-8000-000000000001",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "name": "Morning Oracle Briefing",
         "status": "active",
         "schedule": {"cron": "30 9 * * 1-5", "timezone": "America/Sao_Paulo", "human": "Dias úteis às 09:30"},
@@ -909,7 +914,7 @@ MOCK_ROUTINES = [
     },
     {
         "id": "rot00000-0000-4000-8000-000000000002",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "name": "Hades Inbox Triage",
         "status": "active",
         "schedule": {"cron": "0 12 * * 1-5", "timezone": "America/Sao_Paulo", "human": "Dias úteis às 12:00"},
@@ -922,7 +927,7 @@ MOCK_ROUTINES = [
     },
     {
         "id": "rot00000-0000-4000-8000-000000000003",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "name": "Olympus Health Check",
         "status": "active",
         "schedule": {"cron": "0 9 * * *", "timezone": "America/Sao_Paulo", "human": "Diário às 09:00"},
@@ -948,7 +953,7 @@ MOCK_HEARTBEATS = [{
 MOCK_ADAPTERS = [
     {
         "id": "adp00000-0000-4000-8000-000000000001",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "slug": "claude_code",
         "displayName": "Claude Code",
         "provider": "anthropic",
@@ -958,7 +963,7 @@ MOCK_ADAPTERS = [
     },
     {
         "id": "adp00000-0000-4000-8000-000000000002",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "slug": "codex",
         "displayName": "Codex",
         "provider": "openai",
@@ -968,7 +973,7 @@ MOCK_ADAPTERS = [
     },
     {
         "id": "adp00000-0000-4000-8000-000000000003",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "slug": "mcp-gmail",
         "displayName": "Google Gmail (MCP)",
         "provider": "google",
@@ -977,7 +982,7 @@ MOCK_ADAPTERS = [
     },
     {
         "id": "adp00000-0000-4000-8000-000000000004",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "slug": "mcp-slack",
         "displayName": "Slack Connect (MCP)",
         "provider": "slack",
@@ -986,7 +991,7 @@ MOCK_ADAPTERS = [
     },
     {
         "id": "adp00000-0000-4000-8000-000000000005",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "slug": "mcp-github",
         "displayName": "GitHub Ops (MCP)",
         "provider": "github",
@@ -998,7 +1003,7 @@ MOCK_ADAPTERS = [
 MOCK_ADAPTER_FIELDS = [
     {
         "id": "fld00000-0000-4000-8000-000000000001",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "adapterId": "adp00000-0000-4000-8000-000000000001",
         "fieldKey": "model_id",
         "fieldLabel": "Modelo LLM",
@@ -1013,7 +1018,7 @@ MOCK_ADAPTER_FIELDS = [
     },
     {
         "id": "fld00000-0000-4000-8000-000000000002",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "adapterId": "adp00000-0000-4000-8000-000000000001",
         "fieldKey": "temperature",
         "fieldLabel": "Temperature",
@@ -1031,7 +1036,7 @@ MOCK_ADAPTER_FIELDS = [
 MOCK_AGENT_ADAPTER_CONFIGS = [
     {
         "id": "cfg00000-0000-4000-8000-000000000001",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "agentId": "a0000000-0000-4000-8000-000000000001",
         "adapterId": "adp00000-0000-4000-8000-000000000001",
         "fieldValuesJson": {
@@ -1048,7 +1053,7 @@ MOCK_AGENT_ADAPTER_CONFIGS = [
 MOCK_AGENT_EXECUTION_CONFIGS = [
     {
         "id": "exe00000-0000-4000-8000-000000000001",
-        "companyId": "c0000000-0000-4000-8000-000000000001",
+        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
         "agentId": "a0000000-0000-4000-8000-000000000001",
         "executionMode": "REALTIME",
         "triggerConfig": {},
@@ -1063,7 +1068,7 @@ MOCK_AGENT_EXECUTION_CONFIGS = [
 
 MOCK_AUDIT = [{
     "id": "7a5c0000-0000-4000-8000-000000000001",
-    "company_id": "c0000000-0000-4000-8000-000000000001",
+    "company_id": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "actor_type": "system",
     "actor_id": "system-1",
     "action": "boot",
@@ -1074,7 +1079,7 @@ MOCK_AUDIT = [{
 
 MOCK_APPROVAL = [{
     "id": "7a5c0000-0000-4000-8000-000000000001",
-    "company_id": "c0000000-0000-4000-8000-000000000001",
+    "company_id": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
     "request_type": "task_done",
     "payload": {
         "taskId": "7a5c0000-0000-4000-8000-000000000001",
@@ -1749,8 +1754,18 @@ async def create_company(request: Request, payload: NewCompanyInput):
         if not res.data:
             raise HTTPException(status_code=500, detail="insert_returned_empty")
         created = res.data[0]
+        company_id = created["id"]
+
+        # Garante entrada espelhada em sipoc_companies com o mesmo id,
+        # necessário para GET /api/sipoc/companies retornar a nova empresa.
+        supabase.table("sipoc_companies").upsert({
+            "id": company_id,
+            "name": created["name"],
+            "metadata": {"mission": payload.mission},
+        }, on_conflict="id").execute()
+
         return {
-            "id": created["id"],
+            "id": company_id,
             "name": created["name"],
             "mission": payload.mission,
             "ownerUserId": getattr(request.state, "user_id", None) or MOCK_USER["id"],

@@ -1,9 +1,10 @@
+import os
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 class AutoHealRateLimiter:
-    WINDOW = timedelta(minutes=10)
-    MAX_HEALS = 3
+    WINDOW = timedelta(minutes=int(os.getenv("DOCTOR_RATE_LIMIT_WINDOW_MINUTES", "10")))
+    MAX_HEALS = int(os.getenv("DOCTOR_RATE_LIMIT_MAX_HEALS", "3"))
 
     def __init__(self):
         self._history: dict[str, list[datetime]] = defaultdict(list)
