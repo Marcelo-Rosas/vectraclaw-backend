@@ -68,8 +68,8 @@ class SessionBridge:
                 # Tentar importar cliente global (será inicializado em api.py)
                 from src.api import supabase_client
                 self.supabase = supabase_client
-            except (ImportError, AttributeError):
-                logger.warning("Supabase client não disponível, usando in-memory storage")
+            except Exception as e:
+                logger.warning(f"Supabase client não disponível ({e}), usando in-memory storage")
                 return None
         return self.supabase
 

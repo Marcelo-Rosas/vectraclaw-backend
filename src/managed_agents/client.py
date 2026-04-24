@@ -11,7 +11,6 @@ from typing import Optional, Any, Callable
 from dataclasses import dataclass, asdict
 
 from anthropic import Anthropic
-from anthropic.types.message import Message, ToolUseBlock, TextBlock
 
 from .tool_translator import translate_tools_to_anthropic, validate_tool_input, load_tool_schemas
 from src.m3_tools import calculate_cbm, extract_bl_pl, send_whatsapp_webhook
@@ -144,12 +143,15 @@ class ManagedAgentClient:
                 has_tool_use = False
 
                 for block in response.content:
-                    if isinstance(block, TextBlock):
-                        output_text = block.text
-                    elif isinstance(block, ToolUseBlock):
+                    block_type = getattr(block, "type", None)
+
+                    if block_type == "text":
+                        output_text = getattr(block, "text", "")
+                    elif block_type == "tool_use":
                         has_tool_use = True
-                        tool_used = block.name
-                        tool_input = block.input
+                        tool_used = getattr(block, "name", "")
+                        tool_input = getattr(block, "input", {})
+                        block_id = getattr(block, "id", "")
 
                         logger.info(f"Tool call detectado: {tool_used}")
 
@@ -173,7 +175,7 @@ class ManagedAgentClient:
                             "content": [
                                 {
                                     "type": "tool_result",
-                                    "tool_use_id": block.id,
+                                    "tool_use_id": block_id,
                                     "content": tool_result,
                                 }
                             ]
