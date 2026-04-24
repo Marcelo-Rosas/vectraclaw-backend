@@ -1,0 +1,91 @@
+{
+  "calculate_cbm": {
+    "description": "Calcula o Cubo Metragem (CBM) em metros cúbicos com exatidão matemática.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "length_cm": {
+          "type": "number",
+          "description": "Comprimento em centímetros"
+        },
+        "width_cm": {
+          "type": "number",
+          "description": "Largura em centímetros"
+        },
+        "height_cm": {
+          "type": "number",
+          "description": "Altura em centímetros"
+        },
+        "quantity": {
+          "type": "integer",
+          "description": "Quantidade de itens (padrão: 1)",
+          "default": 1
+        }
+      },
+      "required": ["length_cm", "width_cm", "height_cm"]
+    },
+    "timeout_seconds": 10,
+    "input_parser": "json",
+    "output_parser": "json"
+  },
+  "extract_bl_pl": {
+    "description": "Extrai dados de documentos logísticos (BL/PL) via OCR com suporte a PDF.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Caminho do arquivo PDF local"
+        },
+        "base64_content": {
+          "type": "string",
+          "description": "Conteúdo PDF codificado em base64"
+        },
+        "cross_ref": {
+          "type": "boolean",
+          "description": "Cruzar referências entre BL e PL se documento misto",
+          "default": false
+        }
+      },
+      "required": []
+    },
+    "timeout_seconds": 30,
+    "input_parser": "json",
+    "output_parser": "json"
+  },
+  "send_whatsapp_webhook": {
+    "description": "Envia mensagem WhatsApp via Meta Cloud API (texto ou template).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "phone": {
+          "type": "string",
+          "description": "Número de telefone com código de país (+55xx)"
+        },
+        "message": {
+          "type": "string",
+          "description": "Mensagem de texto a enviar"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["text", "template"],
+          "description": "Tipo de mensagem (texto ou template)",
+          "default": "text"
+        },
+        "template_name": {
+          "type": "string",
+          "description": "Nome do template (se type=template)"
+        },
+        "language": {
+          "type": "string",
+          "description": "Código de idioma (padrão: pt_BR)",
+          "default": "pt_BR"
+        }
+      },
+      "required": ["phone"]
+    },
+    "timeout_seconds": 15,
+    "input_parser": "json",
+    "output_parser": "json"
+  }
+}
