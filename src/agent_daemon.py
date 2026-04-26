@@ -42,17 +42,26 @@ class ResilientHarnessDaemon:
             logger.error(f"Daemon Supabase init failed: {e}")
         return self._supabase
 
+    def should_skip_task(self, task: Dict[str, Any]) -> bool:
+        """Retorna True se a task deve ser ignorada pelo daemon (ex: destinada ao CMA)."""
+        executor = task.get("executor_type", "auto")
+        if executor == "managed_agent":
+            logger.info(f"Skipping CMA task {task.get('id')} (executor_type=managed_agent)")
+            return True
+        return False
+
     def fetch_next_task(self) -> Optional[Dict[str, Any]]:
-        """Busca a próxima task com status 'queued' atribuída a este agente."""
+        """Busca a próxima task com status 'queued' destinada ao Harness."""
         client = self._get_supabase()
         if not client or not self.agent_id:
             return None
         try:
             res = (
                 client.table("tasks")
-                .select("id,title,description,operation_type,budget_limit")
+                .select("id,title,description,operation_type,budget_limit,executor_type")
                 .eq("assigned_to_agent_id", self.agent_id)
                 .eq("status", "queued")
+                .neq("executor_type", "managed_agent")  # ignora CMA tasks
                 .order("created_at")
                 .limit(1)
                 .execute()

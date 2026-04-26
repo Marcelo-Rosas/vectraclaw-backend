@@ -40,7 +40,7 @@ AGENT_ID = "a0000000-0000-4000-8000-000000000002"  # Iris (idle)
 def login() -> str:
     r = requests.post(
         f"{BASE_HTTP}/api/auth/login",
-        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "vectra123"},
+        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "VectraClaw2026!"},
     )
     r.raise_for_status()
     tok = r.json()["accessToken"]

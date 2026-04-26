@@ -482,7 +482,7 @@ async def doctor_tick(client, api_state: Any) -> None:
                     comp_res = (
                         client.table("companies")
                         .select("tier")
-                        .eq("id", agent["companyId"])
+                        .eq("company_id", agent["companyId"])
                         .execute()
                     )
                     if comp_res.data:

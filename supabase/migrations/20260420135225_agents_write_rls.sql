@@ -3,6 +3,9 @@
 -- autenticado da mesma company. SELECT já está coberto desde o piloto.
 -- =====================================================================
 
+create schema if not exists vectraclip;
+set search_path to vectraclip, public;
+
 -- UPDATE: pause / resume / kill / PATCH (VEC-196).
 create policy "agents_update_own_company"
   on vectraclip.agents

@@ -5,6 +5,16 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("MCP_Client")
 
+# Configuração padrão de servidores MCP locais.
+DEFAULT_MCP_CONFIG: Dict[str, Any] = {
+    "mcpServers": {
+        "chrome-devtools": {
+            "command": "npx",
+            "args": ["-y", "chrome-devtools-mcp@latest"],
+        }
+    }
+}
+
 class McpClient:
     """
     Cliente básico para o protocolo MCP (Model Context Protocol).

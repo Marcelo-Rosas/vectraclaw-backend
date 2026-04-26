@@ -1,24 +1,40 @@
 # Engine de Cálculo de ROI e Score de Automação
 # Objetivo: Quantificar o valor da consultoria VectraClip
 
-def calculate_automation_potential(activities):
+def calculate_automation_potential(activity_content):
     """
-    Calcula o score de automação (0-100) baseado na estrutura 5W2H.
+    Calcula o score de automação (0-100) baseado na Vectra Automation Rubric v1.
+    Recebe o dicionário 'content' de uma SipocComponent do tipo 'activity'.
     """
-    total_activities = len(activities)
-    if total_activities == 0: return 0
+    score = 0
     
-    automation_points = 0
-    for a in activities:
-        content = a.get('content', {})
-        # Regras de Decisão Claras? (High Automation Potential)
-        if "procedimento" in content.get('how', '').lower():
-            automation_points += 20
-        # Frequência alta?
-        if "diário" in content.get('when', '').lower() or "todo" in content.get('when', '').lower():
-            automation_points += 30
-            
-    return min(100, (automation_points / total_activities) * 2)
+    # 1. Repetitividade (Max 40)
+    how = activity_content.get('how', '').lower()
+    if any(word in how for word in ["procedimento", "padrão", "repetitivo", "fixo", "sempre"]):
+        score += 40
+    elif "manual" in how:
+        score += 10
+        
+    # 2. Volume Diário / Frequência (Max 15)
+    when = activity_content.get('when', '').lower()
+    if any(word in when for word in ["diário", "todo dia", "hora", "minuto", "frequente"]):
+        score += 15
+    elif "semanal" in when:
+        score += 7
+        
+    # 3. Criticidade Financeira (Max 15)
+    how_much = activity_content.get('how_much', '').lower() # Aceita snake_case do Python
+    if any(word in how_much for word in ["caro", "alto custo", "multa", "prejuízo", "$", "receita"]):
+        score += 15
+        
+    # 4. Penalidades (Ambiguidade e Julgamento)
+    if any(word in how for word in ["subjetivo", "depende", "análise humana", "julgamento"]):
+        score -= 20
+        
+    if "aprovação física" in how or "assinatura" in how:
+        score -= 10
+
+    return max(0, min(100, score))
 
 def calculate_roi(hours_saved, hourly_rate, implementation_cost):
     """

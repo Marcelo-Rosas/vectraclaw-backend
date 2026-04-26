@@ -22,7 +22,7 @@ COMPANY = "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c"
 def login() -> str:
     r = requests.post(
         f"{BASE}/api/auth/login",
-        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "vectra123"},
+        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "VectraClaw2026!"},
     )
     r.raise_for_status()
     tok = r.json()["accessToken"]

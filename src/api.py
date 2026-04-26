@@ -8,11 +8,11 @@ from typing import Dict, Any, List, Optional, Literal, Union
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 import requests
-from jose import jwt
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse, Response
+from jose import jwt  # pyright: ignore[reportMissingModuleSource]
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query, UploadFile, File  # pyright: ignore[reportMissingImports]
+from fastapi.middleware.cors import CORSMiddleware  # pyright: ignore[reportMissingImports]
+from fastapi.openapi.utils import get_openapi  # pyright: ignore[reportMissingImports]
+from fastapi.responses import JSONResponse, Response  # pyright: ignore[reportMissingImports]
 from pydantic import BaseModel, Field, validator
 
 # supabase import
@@ -26,14 +26,22 @@ from postgrest.exceptions import APIError as PostgrestAPIError
 from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
-    AgentExecutionConfig, LlmModel, AgentSpecialty, Routine,
+    AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
 )
 from src.services.heartbeat_doctor.loop import doctor_tick
 from src.services.heartbeat_doctor import audit as incident_audit
 from src.services.heartbeat_doctor import store as incident_store
 from src.ws_manager import manager as ws_manager
+from src.tenant_ids import company_row_public_id
 from src.agents.sipoc_researcher import research_sector
+from src.services.sipoc_promotion import promote_activity_to_automation
+from src.services.sipoc_validator import validate_sipoc_consistency
+from src.services.sipoc_raci import calculate_raci_stats
+from src.services.sipoc_templates import get_templates_list, get_template_detail
+from src.services.sipoc_analytics import calculate_sipoc_kpis
+from src.services.sipoc_approvals import handle_status_transition
+from src.services.sipoc_diagnostics import run_diagnostic
 
 logger = logging.getLogger("VectraClawAPI")
 app = FastAPI(title="Vectra Claw Backend API", version="0.1.0")
@@ -57,6 +65,8 @@ _OPENAPI_PUBLIC_PATHS = frozenset(
         "/sw.js",
         "/mockServiceWorker.js",
         "/login",
+        "/auth/me",
+        "/api/auth/me",
     }
 )
 
@@ -73,7 +83,7 @@ def custom_openapi():
     # / esquema inválido. "/" = mesmo host/porta de onde o /openapi.json foi carregado.
     if not openapi_schema.get("servers"):
         openapi_schema["servers"] = [
-            {"url": "/", "description": "Mesmo host (ex.: http://localhost:3100)"}
+            {"url": "/", "description": "Host atual (Auto-detectado)"}
         ]
     openapi_schema.setdefault("components", {}).setdefault("securitySchemes", {})[
         "HTTPBearer"
@@ -98,15 +108,6 @@ def custom_openapi():
 
 
 app.openapi = custom_openapi  # type: ignore[method-assign]
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    import traceback
-    logger.error(f"Global exception: {exc}\n{traceback.format_exc()}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "internal_server_error"},
-    )
 
 
 LLM_PRICE_CACHE_TTL = timedelta(hours=24)
@@ -204,26 +205,22 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 SCHEMA = os.getenv("SUPABASE_SCHEMA", "vectraclip")
 
-# Cache para JWKS com TTL de 1 hora
+# Cache para JWKS
 _JWKS_CACHE = None
-_JWKS_CACHE_LOADED_AT: Optional[datetime] = None
-_JWKS_TTL = timedelta(hours=1)
 
 def get_jwks():
-    global _JWKS_CACHE, _JWKS_CACHE_LOADED_AT
-    now = datetime.now(timezone.utc)
-    if _JWKS_CACHE and _JWKS_CACHE_LOADED_AT and (now - _JWKS_CACHE_LOADED_AT) < _JWKS_TTL:
+    global _JWKS_CACHE
+    if _JWKS_CACHE:
         return _JWKS_CACHE
     try:
         url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-        res = requests.get(url, timeout=5)
+        res = requests.get(url)
         res.raise_for_status()
         _JWKS_CACHE = res.json()
-        _JWKS_CACHE_LOADED_AT = now
         return _JWKS_CACHE
     except Exception as e:
         logger.error(f"Failed to fetch JWKS: {e}")
-        return _JWKS_CACHE  # serve o cache expirado se disponível em vez de falhar
+        return None
 
 def validate_supabase_jwt(token: str):
     jwks = get_jwks()
@@ -258,6 +255,43 @@ def get_authenticated_client(token: str) -> Client:
     )
     client.postgrest.auth(token)
     return client
+
+
+def _extract_vectraclip_claims(token: str) -> dict:
+    """Decodifica o payload do JWT (sem verificação de assinatura) e retorna o bloco vectraclip."""
+    import base64, json as _json
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = _json.loads(base64.b64decode(payload_b64))
+        return (claims.get("app_metadata") or {}).get("vectraclip") or {}
+    except Exception:
+        return {}
+
+
+def validate_jwt_company_id(token: str, url_company_id: str) -> None:
+    """Lança HTTPException 403 se o JWT não tiver ou divergir do company_id da URL.
+
+    Espelha a validação do frontend TypeScript:
+      1. Lê app_metadata.vectraclip.company_id do JWT
+      2. Valida que o claim existe
+      3. Valida que corresponde ao company_id da URL
+    Não é chamado em modo dev-token (bypass explícito).
+    """
+    if token == "dev-token":
+        return
+    vc = _extract_vectraclip_claims(token)
+    jwt_company_id = vc.get("company_id")
+    if not jwt_company_id:
+        raise HTTPException(
+            status_code=403,
+            detail="JWT sem app_metadata.vectraclip.company_id",
+        )
+    if str(jwt_company_id) != str(url_company_id):
+        raise HTTPException(
+            status_code=403,
+            detail="company_id do payload difere do company_id do JWT",
+        )
 
 # VEC-199b — DOIS clients Supabase distintos:
 #   * `supabase`       → service_role (ignora RLS) usado pelo Doctor + endpoints server-side.
@@ -375,10 +409,28 @@ def _accumulate_task_cost(task_id: Optional[str], heartbeat_cost_usd: Optional[f
     if not supabase or not task_id or heartbeat_cost_usd is None:
         return
     try:
-        supabase.rpc(
-            "increment_task_cost",
-            {"p_task_id": task_id, "p_delta": round(float(heartbeat_cost_usd), 8)},
-        ).execute()
+        current = (
+            supabase.table("tasks")
+            .select("id,company_id,cost_usd")
+            .eq("id", task_id)
+            .limit(1)
+            .execute()
+        )
+        if not current.data:
+            return
+        row = current.data[0]
+        next_cost = float(row.get("cost_usd") or 0.0) + float(heartbeat_cost_usd)
+        (
+            supabase.table("tasks")
+            .update(
+                {
+                    "cost_usd": round(next_cost, 8),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            .eq("id", task_id)
+            .execute()
+        )
     except Exception as e:
         logger.warning(f"task cost accumulation failed task={task_id}: {e}")
 
@@ -410,7 +462,7 @@ async def auth_middleware(request: Request, call_next):
     # Pular auth em rotas públicas
     # Inclui /sw.js e /favicon.ico: o browser não envia Bearer nesses GETs; se
     # retornarem 401, o service worker falha e o DevTools fica em loop estranho.
-    public_paths = {
+    public_paths = [
         "/",
         "/api",
         "/api/",
@@ -427,16 +479,18 @@ async def auth_middleware(request: Request, call_next):
         "/sw.js",
         "/mockServiceWorker.js",
         "/login",
-    }
-    if path in public_paths or path.rstrip("/") in public_paths:
+    ]
+    if any(path == p for p in public_paths):
+        return await call_next(request)
+
+    # WebSocket upgrade: o browser não envia Authorization header; o token
+    # chega como query param e a autenticação é feita dentro do route handler.
+    if path.startswith("/ws/") or path.startswith("/api/ws/"):
         return await call_next(request)
 
     auth_header = request.headers.get("Authorization")
-    # Bypass para desenvolvimento local (VEC-DEBUG) — proibido em produção
+    # Bypass para desenvolvimento local (VEC-DEBUG)
     if os.getenv("VECTRACLAW_AUTH_DISABLED") == "true":
-        if os.getenv("ENVIRONMENT", "development").lower() == "production":
-            logger.critical("VECTRACLAW_AUTH_DISABLED=true is not allowed in ENVIRONMENT=production — rejecting request")
-            return cors_error(500, "invalid_server_configuration")
         request.state.token = "dev-token"
         request.state.user_id = MOCK_USER["id"]
         request.state.company_id = MOCK_USER["companyId"]
@@ -489,69 +543,6 @@ async def root():
 
 
 # =====================================================================
-# SIPOC Builder (VEC-246) — Input models
-# =====================================================================
-
-class NewSipocCompanyInput(BaseModel):
-    name: str
-    logo_url: Optional[str] = None
-    website: Optional[str] = None
-    metadata: Dict[str, Any] = {}
-
-    class Config:
-        extra = "ignore"
-
-
-class NewSipocSectorInput(BaseModel):
-    name: str
-    slug: str
-    icon: Optional[str] = None
-    parent_sector_id: Optional[str] = None
-    metadata: Dict[str, Any] = {}
-
-    class Config:
-        extra = "ignore"
-
-
-class NewSipocPositionInput(BaseModel):
-    sector_id: Optional[str] = None
-    title: str
-    description: Optional[str] = None
-    reports_to_id: Optional[str] = None
-    metadata: Dict[str, Any] = {}
-
-    class Config:
-        extra = "ignore"
-
-
-class NewSipocProcessInput(BaseModel):
-    sector_id: str
-    name: str
-    description: Optional[str] = None
-    status: Optional[str] = "rascunho"
-    responsible_id: Optional[str] = None
-    position_id: Optional[str] = None
-    metadata: Dict[str, Any] = {}
-
-    class Config:
-        extra = "ignore"
-
-
-class UpsertSipocComponentInput(BaseModel):
-    id: Optional[str] = None
-    process_id: str
-    type: str
-    content: Dict[str, Any]
-    order: int = 0
-    validation_status: Optional[str] = "verde"
-    validation_notes: Optional[str] = None
-    metadata: Dict[str, Any] = {}
-
-    class Config:
-        extra = "ignore"
-
-
-# =====================================================================
 # SIPOC Builder (VEC-246)
 # =====================================================================
 
@@ -560,36 +551,22 @@ async def list_sipoc_companies(request: Request):
     if not supabase:
         return []
     try:
-        # service_role bypassa RLS; filtra manualmente por request.state.company_id.
-        # Em dev mode, request.state.token = "dev-token" não é JWT válido, então
-        # vectraclip.sipoc_company_id() retorna NULL e o RLS bloquearia tudo.
-        query = supabase.table("sipoc_companies").select("*").order("name")
-        if request.state.company_id:
-            query = query.eq("id", str(request.state.company_id))
-        res = query.execute()
+        res = supabase.table("sipoc_companies").select("*").order("name").execute()
         return [SipocCompany(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_sipoc_companies failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sipoc/companies")
-async def create_sipoc_company(request: Request, payload: NewSipocCompanyInput):
+async def create_sipoc_company(request: Request, payload: Dict[str, Any]):
     if not supabase:
-        return {"id": request.state.company_id or "mock-id", "name": payload.name}
+        return {"id": "mock-id", "name": payload.get("name")}
     try:
-        # service_role bypassa RLS — bootstrap necessário pois o JWT ainda não tem
-        # um sipoc_company_id para a política de INSERT verificar.
-        # O id é fixado ao company_id do vectraclip para que as políticas de
-        # SELECT/UPDATE/DELETE funcionem imediatamente após a criação.
-        insert_row = {
-            **payload.dict(exclude_none=True),
-            "id": request.state.company_id,
-        }
-        res = supabase.table("sipoc_companies").insert(insert_row).execute()
+        res = supabase.table("sipoc_companies").insert(payload).execute()
         return SipocCompany(**res.data[0]).to_zod_dict()
     except Exception as e:
         logger.error(f"create_sipoc_company failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sipoc/sectors")
 async def list_sipoc_sectors(request: Request, company_id: UUID = Query(...)):
@@ -601,20 +578,19 @@ async def list_sipoc_sectors(request: Request, company_id: UUID = Query(...)):
         return [SipocSector(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_sipoc_sectors failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sipoc/sectors")
-async def create_sipoc_sector(request: Request, payload: NewSipocSectorInput, company_id: UUID = Query(...)):
+async def create_sipoc_sector(request: Request, payload: Dict[str, Any]):
     if not supabase:
-        return {"id": "mock-id", "name": payload.name}
+        return {"id": "mock-id", "name": payload.get("name")}
     try:
         client = get_authenticated_client(request.state.token)
-        insert_row = {**payload.dict(exclude_none=True), "company_id": str(company_id)}
-        res = client.table("sipoc_sectors").insert(insert_row).execute()
+        res = client.table("sipoc_sectors").insert(payload).execute()
         return SipocSector(**res.data[0]).to_zod_dict()
     except Exception as e:
         logger.error(f"create_sipoc_sector failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sipoc/positions")
 async def list_sipoc_positions(request: Request, company_id: UUID = Query(...)):
@@ -626,20 +602,19 @@ async def list_sipoc_positions(request: Request, company_id: UUID = Query(...)):
         return [SipocPosition(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_sipoc_positions failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sipoc/positions")
-async def create_sipoc_position(request: Request, payload: NewSipocPositionInput, company_id: UUID = Query(...)):
+async def create_sipoc_position(request: Request, payload: Dict[str, Any]):
     if not supabase:
-        return {"id": "mock-id", "title": payload.title}
+        return {"id": "mock-id", "title": payload.get("title")}
     try:
         client = get_authenticated_client(request.state.token)
-        insert_row = {**payload.dict(exclude_none=True), "company_id": str(company_id)}
-        res = client.table("sipoc_positions").insert(insert_row).execute()
+        res = client.table("sipoc_positions").insert(payload).execute()
         return SipocPosition(**res.data[0]).to_zod_dict()
     except Exception as e:
         logger.error(f"create_sipoc_position failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sipoc/processes")
 async def list_sipoc_processes(request: Request, sector_id: UUID = Query(...)):
@@ -651,19 +626,19 @@ async def list_sipoc_processes(request: Request, sector_id: UUID = Query(...)):
         return [SipocProcess(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_sipoc_processes failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sipoc/processes")
-async def create_sipoc_process(request: Request, payload: NewSipocProcessInput):
+async def create_sipoc_process(request: Request, payload: Dict[str, Any]):
     if not supabase:
-        return {"id": "mock-id", "name": payload.name}
+        return {"id": "mock-id", "name": payload.get("name")}
     try:
         client = get_authenticated_client(request.state.token)
-        res = client.table("sipoc_processes").insert(payload.dict(exclude_none=True)).execute()
+        res = client.table("sipoc_processes").insert(payload).execute()
         return SipocProcess(**res.data[0]).to_zod_dict()
     except Exception as e:
         logger.error(f"create_sipoc_process failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sipoc/processes/{process_id}")
 async def get_sipoc_process(request: Request, process_id: UUID):
@@ -685,7 +660,7 @@ async def get_sipoc_process(request: Request, process_id: UUID):
         return process
     except Exception as e:
         logger.error(f"get_sipoc_process failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sipoc/components")
 async def list_sipoc_components(request: Request, process_id: UUID = Query(...)):
@@ -697,42 +672,219 @@ async def list_sipoc_components(request: Request, process_id: UUID = Query(...))
         return [SipocComponent(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_sipoc_components failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sipoc/components")
-async def upsert_sipoc_component(request: Request, payload: UpsertSipocComponentInput):
+async def upsert_sipoc_component(request: Request, payload: Dict[str, Any]):
     if not supabase:
-        return {"id": "mock-id", "type": payload.type}
+        return {"id": "mock-id", "type": payload.get("type")}
     try:
         client = get_authenticated_client(request.state.token)
-        if payload.id:
-            update_data = payload.dict(exclude={"id"}, exclude_none=True)
-            res = client.table("sipoc_components").update(update_data).eq("id", payload.id).eq("process_id", payload.process_id).execute()
+        # Se tiver ID, atualiza; senão, insere.
+        comp_id = payload.get("id")
+        if comp_id:
+            res = client.table("sipoc_components").update(payload).eq("id", comp_id).execute()
         else:
-            res = client.table("sipoc_components").insert(payload.dict(exclude={"id"}, exclude_none=True)).execute()
-
+            res = client.table("sipoc_components").insert(payload).execute()
+        
         return SipocComponent(**res.data[0]).to_zod_dict()
     except Exception as e:
         logger.error(f"upsert_sipoc_component failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
-class SipocResearchInput(BaseModel):
-    sector: str
-
-    class Config:
-        extra = "ignore"
-
-
-@app.post("/sipoc/research")
 @app.post("/api/sipoc/research")
-async def sipoc_research(request: Request, payload: SipocResearchInput):
+async def sipoc_research(request: Request, payload: Dict[str, Any]):
+    sector_name = payload.get("sector")
+    if not sector_name:
+        raise HTTPException(status_code=400, detail="Sector name is required")
     try:
-        client = get_authenticated_client(request.state.token) if supabase else None
-        result = await research_sector(payload.sector, supabase_client=client)
+        result = await research_sector(sector_name)
         return result
     except Exception as e:
         logger.error(f"sipoc_research failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/sipoc/components/{component_id}/promote")
+async def promote_sipoc_activity(request: Request, component_id: UUID):
+    if not supabase:
+        return {"success": False, "message": "Supabase not configured"}
+    try:
+        # Usamos o supabase principal (service_role) para criação de agentes/rotinas
+        result = await promote_activity_to_automation(supabase, str(component_id))
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    except Exception as e:
+        logger.error(f"promote_sipoc_activity failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/sipoc/processes/{process_id}/validate")
+async def validate_sipoc_process(request: Request, process_id: UUID):
+    if not supabase:
+        return {"score": 0, "issues": [], "is_valid": False}
+    try:
+        client = get_authenticated_client(request.state.token)
+        # Buscar todos os componentes do processo
+        res = client.table("sipoc_components").select("*").eq("process_id", process_id).execute()
+        
+        result = validate_sipoc_consistency(res.data or [])
+        return result
+    except Exception as e:
+        logger.error(f"validate_sipoc_process failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/sipoc/processes/{process_id}/raci")
+async def get_process_raci(request: Request, process_id: UUID):
+    if not supabase:
+        return {"matrix": [], "stats": {}}
+    try:
+        client = get_authenticated_client(request.state.token)
+        # Buscar dados da matriz
+        matrix_res = client.table("sipoc_raci").select("*").eq("process_id", process_id).execute()
+        # Buscar cargos para nomes
+        positions_res = client.table("sipoc_positions").select("*").execute()
+        
+        stats = calculate_raci_stats(matrix_res.data or [], positions_res.data or [])
+        return {"matrix": matrix_res.data or [], "stats": stats}
+    except Exception as e:
+        logger.error(f"get_process_raci failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/sipoc/raci")
+async def update_raci_cell(request: Request, payload: Dict[str, Any]):
+    if not supabase:
+        return {"success": False}
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("sipoc_raci").upsert(payload, on_conflict="component_id,position_id").execute()
+        return {"success": True, "data": res.data[0]}
+    except Exception as e:
+        logger.error(f"update_raci_cell failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/sipoc/templates")
+async def list_templates():
+    return get_templates_list()
+
+@app.get("/api/sipoc/templates/{template_id}")
+async def get_template(template_id: str):
+    return get_template_detail(template_id)
+
+@app.post("/api/sipoc/templates/{template_id}/clone")
+async def clone_template_to_process(request: Request, template_id: str, payload: Dict[str, Any]):
+    if not supabase:
+        return {"success": False}
+    try:
+        client = get_authenticated_client(request.state.token)
+        template = get_template_detail(template_id)
+        if not template:
+            raise HTTPException(status_code=404, detail="Template not found")
+            
+        sector_id = payload.get("sector_id")
+        process_name = payload.get("name", template["name"])
+        
+        # 1. Criar o novo processo
+        proc_res = client.table("sipoc_processes").insert({
+            "sector_id": sector_id,
+            "name": process_name,
+            "description": template["description"],
+            "status": "rascunho"
+        }).execute()
+        
+        if not proc_res.data:
+             raise HTTPException(status_code=500, detail="Failed to create process")
+             
+        new_process = proc_res.data[0]
+        
+        # 2. Inserir componentes do template
+        for i, comp in enumerate(template["components"]):
+            client.table("sipoc_components").insert({
+                "process_id": new_process["id"],
+                "type": comp["type"],
+                "content": comp["content"],
+                "order": i
+            }).execute()
+            
+        return {"success": True, "process_id": new_process["id"]}
+    except Exception as e:
+        logger.error(f"clone_template failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/sipoc/analytics")
+async def get_sipoc_analytics(request: Request):
+    if not supabase:
+        return {}
+    try:
+        client = get_authenticated_client(request.state.token)
+        procs = client.table("sipoc_processes").select("*").execute()
+        comps = client.table("sipoc_components").select("*").execute()
+        
+        return calculate_sipoc_kpis(procs.data or [], comps.data or [])
+    except Exception as e:
+        logger.error(f"get_sipoc_analytics failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/sipoc/processes/{process_id}/approve")
+async def approve_process(request: Request, process_id: UUID, payload: Dict[str, Any]):
+    if not supabase:
+        return {"success": False}
+    try:
+        client = get_authenticated_client(request.state.token)
+        action = payload.get("action", "submit")
+        
+        # 1. Buscar status atual
+        proc = client.table("sipoc_processes").select("status").eq("id", process_id).single().execute()
+        current_status = proc.data.get('status', 'rascunho')
+        
+        # 2. Calcular novo status
+        new_status = handle_status_transition(current_status, action)
+        
+        # 3. Atualizar
+        client.table("sipoc_processes").update({"status": new_status}).eq("id", process_id).execute()
+        
+        return {"success": True, "new_status": new_status}
+    except Exception as e:
+        logger.error(f"approve_process failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/sipoc/diagnose")
+async def diagnose_activity(payload: Dict[str, Any]):
+    text = payload.get("text", "")
+    if not text:
+        return {"findings": []}
+    
+    findings = run_diagnostic(text)
+    return {"findings": findings}
+
+@app.get("/api/sipoc/processes/{process_id}/edges")
+async def list_sipoc_edges(request: Request, process_id: UUID):
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("sipoc_edges").select("*").eq("process_id", process_id).execute()
+        return res.data or []
+    except Exception as e:
+        logger.error(f"list_sipoc_edges failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/sipoc/processes/{process_id}/edges")
+async def save_sipoc_edges(request: Request, process_id: UUID, payload: List[Dict[str, Any]]):
+    if not supabase:
+        return {"success": False}
+    try:
+        client = get_authenticated_client(request.state.token)
+        # 1. Limpar edges antigas
+        client.table("sipoc_edges").delete().eq("process_id", process_id).execute()
+        # 2. Inserir novas
+        if payload:
+            for edge in payload:
+                edge["process_id"] = str(process_id)
+            client.table("sipoc_edges").insert(payload).execute()
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"save_sipoc_edges failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # === Heartbeat Doctor Scheduler ===
 
@@ -775,7 +927,7 @@ MOCK_USER = {
     "name": "Marcelo Rosas",
     "email": "marcelo@vectracargo.com",
     "role": "admin",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "avatarUrl": None,
     "createdAt": "2026-04-19T00:00:00Z"
 }
@@ -790,7 +942,7 @@ MOCK_SESSION = {
 MOCK_AGENTS = [
   {
     "id": "a0000000-0000-4000-8000-000000000001",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "name": "Apollo",
     "role": "Oracle (Inteligência Central)",
     "status": "working",
@@ -801,7 +953,7 @@ MOCK_AGENTS = [
   },
   {
     "id": "a0000000-0000-4000-8000-000000000002",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "name": "Themis",
     "role": "Inbox Triage & Classificação",
     "status": "idle",
@@ -814,7 +966,7 @@ MOCK_AGENTS = [
     "id": "a0000000-0000-4000-8000-000000000003",
     "name": "Chronos",
     "role": "Monitoramento & Health Check",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "status": "working",
     "tokenBudget": 100000,
     "currentBurnRate": 85000,
@@ -825,7 +977,7 @@ MOCK_AGENTS = [
     "id": "a0000000-0000-4000-8000-000000000004",
     "name": "Pitágoras",
     "role": "Atlas Code Review",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "status": "working",
     "tokenBudget": 50000,
     "currentBurnRate": 60000,
@@ -837,7 +989,7 @@ MOCK_AGENTS = [
 MOCK_TASKS = [
   {
     "id": "7a5c0000-0000-4000-8000-000000000001",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "assignedToAgentId": "a0000000-0000-4000-8000-000000000001",
     "parentTaskId": None,
     "title": "Extrair BL MEDU1234567",
@@ -851,7 +1003,7 @@ MOCK_TASKS = [
   },
   {
     "id": "7a5c0000-0000-4000-8000-000000000002",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "assignedToAgentId": "a0000000-0000-4000-8000-000000000003",
     "parentTaskId": None,
     "title": "Cotação Santos → Curitiba (Helios)",
@@ -865,7 +1017,7 @@ MOCK_TASKS = [
   },
   {
     "id": "7a5c0000-0000-4000-8000-000000000003",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "assignedToAgentId": "a0000000-0000-4000-8000-000000000004",
     "parentTaskId": None,
     "title": "Otimizar rota multimodal CPS-NVT",
@@ -881,7 +1033,7 @@ MOCK_TASKS = [
 
 MOCK_GOALS = [{
     "id": "60a10000-0000-4000-8000-000000000001",
-    "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "companyId": "8487648a-b4db-482d-a541-898c4d249882",
     "parentGoalId": None,
     "title": "Clear 50 Containers",
     "metric": "clearances",
@@ -890,17 +1042,19 @@ MOCK_GOALS = [{
 }]
 
 MOCK_COMPANIES = [{
-    "id": "c0000000-0000-4000-8000-000000000001",
+    "id": "8487648a-b4db-482d-a541-898c4d249882",
     "name": "Vectra Cargo",
     "mission": "Logística Aduaneira Autônoma",
     "ownerUserId": "40000000-0000-4000-8000-000000000001",
+    "slug": "vectra-cargo",
+    "members": [{"userId": "40000000-0000-4000-8000-000000000001", "role": "admin", "joinedAt": "2026-04-19T00:00:00Z"}],
     "createdAt": "2026-04-19T00:00:00Z"
 }]
 
 MOCK_ROUTINES = [
     {
         "id": "rot00000-0000-4000-8000-000000000001",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": "8487648a-b4db-482d-a541-898c4d249882",
         "name": "Morning Oracle Briefing",
         "status": "active",
         "schedule": {"cron": "30 9 * * 1-5", "timezone": "America/Sao_Paulo", "human": "Dias úteis às 09:30"},
@@ -914,7 +1068,7 @@ MOCK_ROUTINES = [
     },
     {
         "id": "rot00000-0000-4000-8000-000000000002",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": "8487648a-b4db-482d-a541-898c4d249882",
         "name": "Hades Inbox Triage",
         "status": "active",
         "schedule": {"cron": "0 12 * * 1-5", "timezone": "America/Sao_Paulo", "human": "Dias úteis às 12:00"},
@@ -927,7 +1081,7 @@ MOCK_ROUTINES = [
     },
     {
         "id": "rot00000-0000-4000-8000-000000000003",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": "8487648a-b4db-482d-a541-898c4d249882",
         "name": "Olympus Health Check",
         "status": "active",
         "schedule": {"cron": "0 9 * * *", "timezone": "America/Sao_Paulo", "human": "Diário às 09:00"},
@@ -950,10 +1104,13 @@ MOCK_HEARTBEATS = [{
     "createdAt": "2026-04-19T00:00:00Z"
 }]
 
+_REAL_COMPANY_ID = "01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2"
+# IDs abaixo são apenas para modo mock (supabase=None). No DB real os UUIDs são gerados pelo gen_random_uuid().
+
 MOCK_ADAPTERS = [
     {
         "id": "adp00000-0000-4000-8000-000000000001",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": _REAL_COMPANY_ID,
         "slug": "claude_code",
         "displayName": "Claude Code",
         "provider": "anthropic",
@@ -963,7 +1120,7 @@ MOCK_ADAPTERS = [
     },
     {
         "id": "adp00000-0000-4000-8000-000000000002",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": _REAL_COMPANY_ID,
         "slug": "codex",
         "displayName": "Codex",
         "provider": "openai",
@@ -973,37 +1130,51 @@ MOCK_ADAPTERS = [
     },
     {
         "id": "adp00000-0000-4000-8000-000000000003",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": _REAL_COMPANY_ID,
+        "slug": "mcp-imap",
+        "displayName": "IMAP E-mail (MCP)",
+        "provider": "imap",
+        "isActive": True,
+        "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
+    },
+    {
+        "id": "adp00000-0000-4000-8000-000000000004",
+        "companyId": _REAL_COMPANY_ID,
         "slug": "mcp-gmail",
         "displayName": "Google Gmail (MCP)",
         "provider": "google",
         "isActive": True,
         "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
     },
     {
-        "id": "adp00000-0000-4000-8000-000000000004",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "id": "adp00000-0000-4000-8000-000000000005",
+        "companyId": _REAL_COMPANY_ID,
         "slug": "mcp-slack",
         "displayName": "Slack Connect (MCP)",
         "provider": "slack",
         "isActive": True,
         "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
     },
     {
-        "id": "adp00000-0000-4000-8000-000000000005",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "id": "adp00000-0000-4000-8000-000000000006",
+        "companyId": _REAL_COMPANY_ID,
         "slug": "mcp-github",
         "displayName": "GitHub Ops (MCP)",
         "provider": "github",
         "isActive": True,
         "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
     },
 ]
 
 MOCK_ADAPTER_FIELDS = [
+    # claude_code: modelo + temperatura
     {
         "id": "fld00000-0000-4000-8000-000000000001",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": _REAL_COMPANY_ID,
         "adapterId": "adp00000-0000-4000-8000-000000000001",
         "fieldKey": "model_id",
         "fieldLabel": "Modelo LLM",
@@ -1018,7 +1189,7 @@ MOCK_ADAPTER_FIELDS = [
     },
     {
         "id": "fld00000-0000-4000-8000-000000000002",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": _REAL_COMPANY_ID,
         "adapterId": "adp00000-0000-4000-8000-000000000001",
         "fieldKey": "temperature",
         "fieldLabel": "Temperature",
@@ -1031,18 +1202,78 @@ MOCK_ADAPTER_FIELDS = [
         "createdAt": "2026-04-19T00:00:00Z",
         "updatedAt": "2026-04-19T00:00:00Z",
     },
+    # mcp-imap: credenciais de acesso ao servidor de e-mail
+    {
+        "id": "fld00000-0000-4000-8000-000000000010",
+        "companyId": _REAL_COMPANY_ID,
+        "adapterId": "adp00000-0000-4000-8000-000000000003",
+        "fieldKey": "imap_host",
+        "fieldLabel": "Servidor IMAP",
+        "fieldType": "text",
+        "isRequired": True,
+        "optionsJson": None,
+        "triggerCondition": None,
+        "sortOrder": 10,
+        "isActive": True,
+        "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
+    },
+    {
+        "id": "fld00000-0000-4000-8000-000000000011",
+        "companyId": _REAL_COMPANY_ID,
+        "adapterId": "adp00000-0000-4000-8000-000000000003",
+        "fieldKey": "imap_port",
+        "fieldLabel": "Porta IMAP",
+        "fieldType": "number",
+        "isRequired": True,
+        "optionsJson": None,
+        "triggerCondition": None,
+        "sortOrder": 20,
+        "isActive": True,
+        "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
+    },
+    {
+        "id": "fld00000-0000-4000-8000-000000000012",
+        "companyId": _REAL_COMPANY_ID,
+        "adapterId": "adp00000-0000-4000-8000-000000000003",
+        "fieldKey": "email",
+        "fieldLabel": "Endereço de E-mail",
+        "fieldType": "text",
+        "isRequired": True,
+        "optionsJson": None,
+        "triggerCondition": None,
+        "sortOrder": 30,
+        "isActive": True,
+        "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
+    },
+    {
+        "id": "fld00000-0000-4000-8000-000000000013",
+        "companyId": _REAL_COMPANY_ID,
+        "adapterId": "adp00000-0000-4000-8000-000000000003",
+        "fieldKey": "password",
+        "fieldLabel": "Senha / App Password",
+        "fieldType": "secret",
+        "isRequired": True,
+        "optionsJson": None,
+        "triggerCondition": None,
+        "sortOrder": 40,
+        "isActive": True,
+        "createdAt": "2026-04-19T00:00:00Z",
+        "updatedAt": "2026-04-19T00:00:00Z",
+    },
 ]
 
 MOCK_AGENT_ADAPTER_CONFIGS = [
     {
         "id": "cfg00000-0000-4000-8000-000000000001",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": _REAL_COMPANY_ID,
         "agentId": "a0000000-0000-4000-8000-000000000001",
         "adapterId": "adp00000-0000-4000-8000-000000000001",
         "fieldValuesJson": {
             "model_id": "claude-opus-4-7-thinking-high",
             "temperature": 0.2,
-            "max_tokens": 8192,
         },
         "isActive": True,
         "createdAt": "2026-04-19T00:00:00Z",
@@ -1053,7 +1284,7 @@ MOCK_AGENT_ADAPTER_CONFIGS = [
 MOCK_AGENT_EXECUTION_CONFIGS = [
     {
         "id": "exe00000-0000-4000-8000-000000000001",
-        "companyId": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+        "companyId": "8487648a-b4db-482d-a541-898c4d249882",
         "agentId": "a0000000-0000-4000-8000-000000000001",
         "executionMode": "REALTIME",
         "triggerConfig": {},
@@ -1066,9 +1297,11 @@ MOCK_AGENT_EXECUTION_CONFIGS = [
     },
 ]
 
+MOCK_AGENT_SPECIALTY_CONFIGS: list = []
+
 MOCK_AUDIT = [{
     "id": "7a5c0000-0000-4000-8000-000000000001",
-    "company_id": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "company_id": "8487648a-b4db-482d-a541-898c4d249882",
     "actor_type": "system",
     "actor_id": "system-1",
     "action": "boot",
@@ -1079,7 +1312,7 @@ MOCK_AUDIT = [{
 
 MOCK_APPROVAL = [{
     "id": "7a5c0000-0000-4000-8000-000000000001",
-    "company_id": "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c",
+    "company_id": "8487648a-b4db-482d-a541-898c4d249882",
     "request_type": "task_done",
     "payload": {
         "taskId": "7a5c0000-0000-4000-8000-000000000001",
@@ -1141,10 +1374,12 @@ class LoginPayload(BaseModel):
 @app.post("/auth/login") # VEC-140: Rota direta para compatibilidade
 @app.post("/api/auth/login")
 async def login(payload: LoginPayload):
-    if not supabase:
-        return MOCK_SESSION
+    if not supabase_auth:
+        logger.error("Login abortado: supabase_auth não inicializado (verifique .env)")
+        raise HTTPException(status_code=503, detail="Serviço de autenticação indisponível")
     
     try:
+        logger.info(f"Tentativa de login para: {payload.email}")
         # Tenta login real no Supabase
         # VEC-199b: usa client dedicado a auth — NUNCA `supabase` (service_role),
         # senão o listener SIGNED_IN zera `_postgrest` e faz o Doctor virar
@@ -1157,46 +1392,58 @@ async def login(payload: LoginPayload):
         if not res.session or not res.user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        # Mapeamento do usuário do Supabase para o modelo do VectraClip.
-        # Claims de tenant ficam em app_metadata.vectraclip (VEC-194), não em user_metadata.
-        user_meta = res.user.user_metadata or {}
-        app_meta = getattr(res.user, "app_metadata", None) or {}
-        vc = app_meta.get("vectraclip") or {}
-        if not isinstance(vc, dict):
-            vc = {}
+        # Mapeamento robusto (VEC-194)
+        logger.info("Mapeando metadados do usuário...")
+        user_meta = getattr(res.user, "user_metadata", {}) or {}
+        app_meta = getattr(res.user, "app_metadata", {}) or {}
+        vc = app_meta.get("vectraclip", {})
+        if not isinstance(vc, dict): vc = {}
 
-        raw_role = vc.get("role") or user_meta.get("role") or "admin"
-        company_id = vc.get("company_id") or app_meta.get("company_id") or MOCK_USER["companyId"]
+        logger.info(f"Extraindo Role e Company (app_meta: {app_meta})")
+        raw_role = vc.get("role") or user_meta.get("role") or app_meta.get("role") or "admin"
+        company_id = vc.get("company_id") or app_meta.get("company_id") or user_meta.get("company_id") or MOCK_USER["companyId"]
+        
         display_name = (
             user_meta.get("full_name")
             or user_meta.get("name")
             or (res.user.email.split("@")[0] if res.user.email else "User")
         )
 
+        logger.info("Construindo objeto User...")
         user_data = User(
-            id=res.user.id,
-            name=display_name,
-            email=res.user.email or "",
-            role=_zod_user_role(str(raw_role) if raw_role is not None else None),
+            id=str(res.user.id),
+            name=str(display_name),
+            email=str(res.user.email or ""),
+            role=_zod_user_role(str(raw_role)),
             company_id=str(company_id),
             avatar_url=user_meta.get("avatar_url"),
             created_at=_user_created_at_to_utc(getattr(res.user, "created_at", None)),
         )
 
+        logger.info("Construindo objeto AuthSession...")
         session = AuthSession(
-            access_token=res.session.access_token,
-            refresh_token=res.session.refresh_token,
-            expires_at=_session_expires_to_utc(res.session.expires_at),
+            access_token=str(res.session.access_token),
+            refresh_token=str(res.session.refresh_token),
+            expires_at=_session_expires_to_utc(getattr(res.session, "expires_at", None)),
             user=user_data
         )
 
+        logger.info("Login bem-sucedido, serializando resposta.")
         return session.to_zod_dict()
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Login failed: {e}")
-        raise HTTPException(status_code=401, detail="Invalid login credentials")
+        err_msg = str(e).lower()
+        # Captura erros comuns de autenticação do GoTrue/Supabase
+        if "invalid login credentials" in err_msg or "invalid_credentials" in err_msg:
+             logger.warning(f"Tentativa de login falhou (credenciais): {payload.email}")
+             raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
+             
+        logger.error(f"Login CRITICAL FAILURE: {type(e).__name__} - {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Erro interno de autenticação: {str(e)}")
 
 @app.get("/auth/me")
 @app.get("/api/auth/me")
@@ -1206,11 +1453,17 @@ async def auth_me(request: Request):
     
     # Busca usuário real na tabela app_users do Supabase usando RLS
     try:
-        client = get_authenticated_client(request.state.token)
-        res = client.table("app_users").select("*").eq("id", request.state.user_id).execute()
+        token = request.state.token
+        user_id = request.state.user_id
+        
+        if not token or not user_id:
+             return MOCK_USER
+
+        client = get_authenticated_client(token)
+        res = client.table("app_users").select("*").eq("id", user_id).execute()
         
         if not res.data:
-            # Caso não exista na tabela customizada (primeiro login?), fallback para mock ou erro
+            logger.info(f"Usuário {user_id} não encontrado em app_users, usando fallback MOCK")
             return MOCK_USER
 
         row = res.data[0]
@@ -1225,8 +1478,9 @@ async def auth_me(request: Request):
         )
         return user_data.to_zod_dict()
     except Exception as e:
-        logger.error(f"auth_me failed: {e}")
-        return MOCK_USER
+        logger.error(f"Erro em auth_me: {e}")
+        # Em caso de erro catastrófico, retorna 401 para forçar re-login em vez de 500
+        raise HTTPException(status_code=401, detail=f"Session error: {str(e)}")
 
 class RefreshPayload(BaseModel):
     refreshToken: str
@@ -1289,14 +1543,20 @@ async def get_agents(request: Request, company_id: str = None):
         
     try:
         client = get_authenticated_client(request.state.token)
-        query = client.table("agents").select("*")
+        query = client.table("agents").select("*, agent_specialty_configs(specialty_id)")
         if company_id:
             query = query.eq("company_id", company_id)
         res = query.execute()
-        return [Agent(**row).to_zod_dict() for row in res.data]
+        rows = []
+        for row in res.data:
+            # Flatten specialty_id from nested join result
+            specialty_list = row.pop("agent_specialty_configs", None) or []
+            row["specialty_id"] = specialty_list[0]["specialty_id"] if specialty_list else None
+            rows.append(Agent(**row).to_zod_dict())
+        return rows
     except Exception as e:
         logger.error(f"get_agents failed: {e}")
-        return MOCK_AGENTS
+        raise HTTPException(status_code=500, detail=str(e))
 
 class NewAgentInput(BaseModel):
     name: str
@@ -1307,15 +1567,10 @@ class NewAgentInput(BaseModel):
 @app.post("/api/companies/{company_id}/agents")
 @app.post("/companies/{company_id}/agents")
 async def create_agent(company_id: str, payload: NewAgentInput):
-    adapter_map = {
-        "claude_code": "claude_code",
-        "codex": "cursor",
-        "shell": "bot",
-        "webhook": "bot",
-        "cursor": "cursor",
-        "bot": "bot",
-    }
-    adapter_type = adapter_map.get(payload.adapterType, "bot")
+    # DB CHECK constraint allows only claude_code|cursor|bot.
+    # Map frontend enum values to DB-accepted values.
+    _to_db = {"claude_code": "claude_code", "codex": "cursor", "shell": "bot", "webhook": "bot"}
+    adapter_type = _to_db.get(payload.adapterType, "claude_code")
 
     row: Dict[str, Any] = {
         "company_id": company_id,
@@ -1341,6 +1596,7 @@ async def create_agent(company_id: str, payload: NewAgentInput):
         new_agent["tokenBudget"] = payload.tokenBudget
         new_agent["currentBurnRate"] = 0
         new_agent["adapterType"] = adapter_type
+        new_agent["specialtyId"] = None
         new_agent["createdAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         MOCK_AGENTS.append(new_agent)
         return new_agent
@@ -1355,7 +1611,7 @@ async def create_agent(company_id: str, payload: NewAgentInput):
         raise
     except Exception as e:
         logger.error(f"create_agent failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/companies/{company_id}/tasks")
 @app.get("/companies/{company_id}/tasks")
@@ -1483,6 +1739,7 @@ async def create_task(request: Request, company_id: str, payload: NewTaskInput):
     abertos para `authenticated`; company_id é fixado pela rota (não pelo body)
     para evitar cross-company injection.
     """
+    validate_jwt_company_id(request.state.token, company_id)
     insert_row: Dict[str, Any] = {
         "company_id": company_id,
         "title": payload.title,
@@ -1590,6 +1847,7 @@ class UpdateGoalInput(BaseModel):
 @app.post("/companies/{company_id}/goals")
 async def create_goal(request: Request, company_id: str, payload: NewGoalInput):
     """VEC-144 — Cria goal na tabela Supabase ou fallback mock."""
+    validate_jwt_company_id(request.state.token, company_id)
     insert_row: Dict[str, Any] = {
         "company_id": company_id,
         "parent_goal_id": payload.parentGoalId,
@@ -1610,8 +1868,11 @@ async def create_goal(request: Request, company_id: str, payload: NewGoalInput):
         except HTTPException:
             raise
         except Exception as e:
+            err_str = str(e)
+            if "row-level security" in err_str.lower() or "42501" in err_str or "insufficient_privilege" in err_str.lower():
+                raise HTTPException(status_code=403, detail="Acesso negado pela política RLS — verifique app_metadata.vectraclip.company_id no JWT")
             logger.error(f"create_goal DB failed: {e}")
-            raise HTTPException(status_code=500, detail="internal_server_error")
+            raise HTTPException(status_code=500, detail=err_str)
     # Mock fallback
     new_goal = {
         "id": f"gol_tmp_{int(datetime.now().timestamp())}",
@@ -1670,7 +1931,7 @@ async def patch_goal(request: Request, goal_id: str, patch: UpdateGoalInput):
         raise
     except Exception as e:
         logger.error(f"patch_goal DB failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/goals/{goal_id}")
@@ -1697,13 +1958,80 @@ async def delete_goal(request: Request, goal_id: str):
         raise
     except Exception as e:
         logger.error(f"delete_goal DB failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/companies")
 @app.get("/companies")
-async def get_companies():
-    return MOCK_COMPANIES
+async def get_companies(request: Request):
+    if not supabase:
+        return MOCK_COMPANIES
+
+    try:
+        q = supabase.table("companies").select("company_id,name,updated_at,tier,owner_user_id")
+        caller_company = getattr(request.state, "company_id", None)
+        if caller_company:
+            q = q.eq("company_id", caller_company)
+        res = q.order("name", desc=False).execute()
+
+        # Resolve ownerUserId e members por company via app_users.
+        owner_map: Dict[str, str] = {}
+        members_map: Dict[str, List[Dict[str, Any]]] = {}
+        company_ids = [str(r.get("company_id")) for r in (res.data or []) if r.get("company_id")]
+        if company_ids:
+            try:
+                users_res = (
+                    supabase.table("app_users")
+                    .select("id,company_id,role,created_at")
+                    .in_("company_id", company_ids)
+                    .order("created_at", desc=False)
+                    .execute()
+                )
+                for u in (users_res.data or []):
+                    cid = str(u.get("company_id") or "")
+                    uid = str(u.get("id") or "")
+                    if not cid or not uid:
+                        continue
+                    role = str(u.get("role") or "member").lower()
+                    joined = str(u.get("created_at") or "").replace("+00:00", "Z") or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    members_map.setdefault(cid, []).append({
+                        "userId": uid,
+                        "role": role,
+                        "joinedAt": joined,
+                    })
+                    if cid not in owner_map:
+                        owner_map[cid] = uid
+                    if role == "admin":
+                        owner_map[cid] = uid
+            except Exception as owner_err:
+                logger.warning(f"owner resolution fallback in get_companies: {owner_err}")
+
+        import re as _re
+        def _slugify(name: str) -> str:
+            return _re.sub(r"-{2,}", "-", _re.sub(r"[^a-z0-9]+", "-", (name or "").lower())).strip("-") or "company"
+
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        out: List[Dict[str, Any]] = []
+        for row in (res.data or []):
+            cid = company_row_public_id(row)
+            name = row.get("name") or ""
+            owner_id = row.get("owner_user_id") or owner_map.get(str(cid)) or getattr(request.state, "user_id", None) or MOCK_USER["id"]
+            created_raw = row.get("updated_at") or now_iso
+            created_iso = str(created_raw).replace("+00:00", "Z")
+            out.append({
+                "id": cid,
+                "name": name,
+                "mission": row.get("mission") or "",
+                "ownerUserId": owner_id,
+                "slug": _slugify(name),
+                "members": members_map.get(str(cid)) or [{"userId": owner_id, "role": "admin", "joinedAt": created_iso}],
+                "createdAt": created_iso,
+            })
+        return out
+    except Exception as e:
+        logger.error(f"get_companies DB failed: {e}")
+        return MOCK_COMPANIES
 
 
 class NewCompanyInput(BaseModel):
@@ -1727,13 +2055,14 @@ async def create_company(request: Request, payload: NewCompanyInput):
     Cria uma company (VEC-224 - critério CRUD).
     """
     now = datetime.now(timezone.utc).isoformat()
-    # Schema real atual de vectraclip.companies: id, name, tier, created_at, updated_at
+    # Schema vectraclip.companies: company_id (PK), name, tier, created_at, updated_at
+    # — resposta HTTP mantém `id` (alias) para compat com frontend (fase 1 multi-tenant).
     # (sem mission/owner_user_id). Mantemos `mission` no contrato de resposta para
     # compatibilidade com o frontend.
     row: Dict[str, Any] = {
         "name": payload.name,
         "tier": "trial",
-        "created_at": now,
+        "owner_user_id": getattr(request.state, "user_id", None) or MOCK_USER["id"],
         "updated_at": now,
     }
 
@@ -1754,33 +2083,25 @@ async def create_company(request: Request, payload: NewCompanyInput):
         if not res.data:
             raise HTTPException(status_code=500, detail="insert_returned_empty")
         created = res.data[0]
-        company_id = created["id"]
-
-        # Garante entrada espelhada em sipoc_companies com o mesmo id,
-        # necessário para GET /api/sipoc/companies retornar a nova empresa.
-        supabase.table("sipoc_companies").upsert({
-            "id": company_id,
-            "name": created["name"],
-            "metadata": {"mission": payload.mission},
-        }, on_conflict="id").execute()
-
+        cid = company_row_public_id(created)
         return {
-            "id": company_id,
+            "id": cid,
             "name": created["name"],
             "mission": payload.mission,
-            "ownerUserId": getattr(request.state, "user_id", None) or MOCK_USER["id"],
+            "ownerUserId": created.get("owner_user_id") or getattr(request.state, "user_id", None) or MOCK_USER["id"],
             "createdAt": str(created.get("created_at", now)).replace("+00:00", "Z"),
         }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"create_company failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.patch("/api/companies/{company_id}")
 @app.patch("/companies/{company_id}")
 async def patch_company(request: Request, company_id: str, patch: UpdateCompanyInput):
+    validate_jwt_company_id(request.state.token, company_id)
     payload = patch.dict(exclude_unset=True)
     if not payload:
         raise HTTPException(status_code=400, detail="empty_patch")
@@ -1800,12 +2121,13 @@ async def patch_company(request: Request, company_id: str, patch: UpdateCompanyI
         return row
 
     try:
-        res = supabase.table("companies").update(payload).eq("id", company_id).execute()
+        res = supabase.table("companies").update(payload).eq("company_id", company_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="company_not_found")
         row = res.data[0]
+        rid = company_row_public_id(row)
         return {
-            "id": row["id"],
+            "id": rid,
             "name": row["name"],
             "mission": "",
             "ownerUserId": getattr(request.state, "user_id", None) or MOCK_USER["id"],
@@ -1815,7 +2137,7 @@ async def patch_company(request: Request, company_id: str, patch: UpdateCompanyI
         raise
     except Exception as e:
         logger.error(f"patch_company failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/companies/{company_id}")
@@ -1830,16 +2152,16 @@ async def delete_company(company_id: str):
         return Response(status_code=204)
 
     try:
-        check = supabase.table("companies").select("id").eq("id", company_id).execute()
+        check = supabase.table("companies").select("company_id").eq("company_id", company_id).execute()
         if not check.data:
             raise HTTPException(status_code=404, detail="company_not_found")
-        supabase.table("companies").delete().eq("id", company_id).execute()
+        supabase.table("companies").delete().eq("company_id", company_id).execute()
         return Response(status_code=204)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"delete_company failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/companies/{company_id}/heartbeats")
 @app.get("/companies/{company_id}/heartbeats")
@@ -2174,12 +2496,13 @@ async def list_adapters(request: Request, company_id: str):
         raise
     except Exception as e:
         logger.error(f"list_adapters failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/companies/{company_id}/adapters")
 @app.post("/companies/{company_id}/adapters")
 async def create_adapter(request: Request, company_id: str, payload: NewAdapterInput):
+    validate_jwt_company_id(request.state.token, company_id)
     row = {
         "company_id": company_id,
         "slug": payload.slug,
@@ -2209,7 +2532,7 @@ async def create_adapter(request: Request, company_id: str, payload: NewAdapterI
         return AdapterCatalogItem(**res.data[0]).to_zod_dict()
     except Exception as e:
         logger.error(f"create_adapter failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/api/adapters/{adapter_id}")
@@ -2277,7 +2600,7 @@ async def list_adapter_fields(request: Request, adapter_id: str):
         raise
     except Exception as e:
         logger.error(f"list_adapter_fields failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/adapters/{adapter_id}/fields")
@@ -2286,7 +2609,7 @@ async def create_adapter_field(request: Request, adapter_id: str, payload: NewAd
     # Precisamos saber o company_id do adapter
     if not supabase:
         adapter = next((a for a in MOCK_ADAPTERS if a["id"] == adapter_id), None)
-        company_id = adapter["companyId"] if adapter else "c0000000-0000-4000-8000-000000000001"
+        company_id = adapter["companyId"] if adapter else "8487648a-b4db-482d-a541-898c4d249882"
     else:
         res = supabase.table("adapter_catalog").select("company_id").eq("id", adapter_id).single().execute()
         company_id = res.data["company_id"]
@@ -2390,6 +2713,7 @@ async def list_routines(request: Request, company_id: str):
 @app.post("/api/companies/{company_id}/routines")
 @app.post("/companies/{company_id}/routines")
 async def create_routine(request: Request, company_id: str, payload: Dict[str, Any]):
+    validate_jwt_company_id(request.state.token, company_id)
     # Payload raw para flexibilidade de triggers
     row = {
         "company_id": company_id,
@@ -2436,7 +2760,7 @@ async def get_agent_adapter_config(request: Request, agent_id: str):
             .execute()
         )
         if not res.data:
-            raise HTTPException(status_code=404, detail="agent_adapter_config_not_found")
+            return None
         row = res.data[0]
         if caller_company and row.get("company_id") and row.get("company_id") != caller_company:
             raise HTTPException(status_code=403, detail="cross_company_forbidden")
@@ -2445,7 +2769,7 @@ async def get_agent_adapter_config(request: Request, agent_id: str):
         raise
     except Exception as e:
         logger.error(f"get_agent_adapter_config failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class UpdateAgentAdapterConfigInput(BaseModel):
@@ -2547,7 +2871,7 @@ async def put_agent_adapter_config(
         raise
     except Exception as e:
         logger.error(f"put_agent_adapter_config failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class AgentExecutionSetupInput(BaseModel):
@@ -2608,7 +2932,267 @@ async def get_agent_execution_config(request: Request, agent_id: str):
         raise
     except Exception as e:
         logger.error(f"get_agent_execution_config failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/agents/{agent_id}/specialty-config")
+@app.get("/agents/{agent_id}/specialty-config")
+async def get_agent_specialty_config(request: Request, agent_id: str):
+    if not supabase:
+        row = next((r for r in MOCK_AGENT_SPECIALTY_CONFIGS if r.get("agentId") == agent_id), None)
+        if not row:
+            return Response(status_code=204)
+        return row
+
+    try:
+        caller_company = _request_company_id(request)
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("agent_specialty_configs")
+            .select("*")
+            .eq("agent_id", agent_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return Response(status_code=204)
+        row = res.data[0]
+        if caller_company and row.get("company_id") and row.get("company_id") != caller_company:
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+        return AgentSpecialtyConfig(**row).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_agent_specialty_config failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SaveAgentSpecialtyConfigInput(BaseModel):
+    specialtyId: str
+    values: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.put("/api/agents/{agent_id}/specialty-config")
+@app.put("/agents/{agent_id}/specialty-config")
+async def put_agent_specialty_config(request: Request, agent_id: str, payload: SaveAgentSpecialtyConfigInput):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if not supabase:
+        global MOCK_AGENT_SPECIALTY_CONFIGS
+        existing = next((r for r in MOCK_AGENT_SPECIALTY_CONFIGS if r.get("agentId") == agent_id), None)
+        if existing:
+            existing["specialtyId"] = payload.specialtyId
+            existing["values"] = payload.values
+            existing["updatedAt"] = now_iso.replace("+00:00", "Z")
+            return existing
+        new_row = {
+            "id": f"asc_tmp_{int(datetime.now().timestamp())}",
+            "agentId": agent_id,
+            "specialtyId": payload.specialtyId,
+            "values": payload.values,
+            "updatedAt": now_iso.replace("+00:00", "Z"),
+        }
+        MOCK_AGENT_SPECIALTY_CONFIGS.append(new_row)
+        return new_row
+
+    try:
+        caller_company = _request_company_id(request)
+        agent_row = supabase.table("agents").select("id,company_id").eq("id", agent_id).limit(1).execute()
+        if not agent_row.data:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+        agent_company = agent_row.data[0]["company_id"]
+        if caller_company and str(agent_company) != str(caller_company):
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+
+        row_payload = {
+            "company_id": agent_company,
+            "agent_id": agent_id,
+            "specialty_id": payload.specialtyId,
+            "values": payload.values,
+            "updated_at": now_iso,
+        }
+        res = (
+            supabase.table("agent_specialty_configs")
+            .upsert(row_payload, on_conflict="agent_id")
+            .execute()
+        )
+        return AgentSpecialtyConfig(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"put_agent_specialty_config failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Inbox endpoint — IMAP fetch + heuristic classification
+# ---------------------------------------------------------------------------
+
+import imaplib
+import email as email_lib
+from email.header import decode_header as _decode_header
+import html
+import re as _re
+
+def _decode_mime_words(s: str) -> str:
+    parts = _decode_header(s)
+    decoded = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            decoded.append(part.decode(enc or "utf-8", errors="replace"))
+        else:
+            decoded.append(part)
+    return "".join(decoded)
+
+def _strip_html(text: str) -> str:
+    text = html.unescape(text)
+    text = _re.sub(r"<[^>]+>", " ", text)
+    text = _re.sub(r"\s+", " ", text).strip()
+    return text
+
+def _classify_email(subject: str, from_: str, body: str) -> tuple[str, bool, bool]:
+    """Returns (category, isQuote, isSpam)."""
+    subj_low = subject.lower()
+    from_low = from_.lower()
+
+    # Spam heuristics
+    spam_signals = ["oferta", "desconto", "grátis", "gratis", "promoção", "promocao",
+                    "!!!", "cadastre-se já", "xyz", "click here", "unsubscribe"]
+    is_spam = any(sig in subj_low or sig in from_low for sig in spam_signals)
+    if is_spam:
+        return "spam", False, True
+
+    # Quote / cotação
+    quote_signals = ["cotação", "cotacao", "proposta", "orçamento", "orcamento",
+                     "quote", "proposal", "frete", "tarifa"]
+    is_quote = any(sig in subj_low for sig in quote_signals)
+
+    # Category
+    urgent_signals = ["urgente", "confirmad", "confirmação", "os #", "coleta", "entrega",
+                      "prazo", "vence", "atraso", "atrasad"]
+    action_signals = ["re:", "fwd:", "aprovação", "aprovacao", "pagamento", "nf-e",
+                      "invoice", "pedido", "contrato"]
+    info_signals = ["newsletter", "digest", "tendência", "notícia", "boletim",
+                    "informe", "comunicado", "aviso"]
+
+    if any(sig in subj_low for sig in urgent_signals):
+        return "urgente", is_quote, False
+    if any(sig in subj_low for sig in action_signals) or is_quote:
+        return "ação", is_quote, False
+    if any(sig in subj_low or sig in from_low for sig in info_signals):
+        return "informativo", is_quote, False
+    return "ação", is_quote, False
+
+def _fetch_imap_emails(host: str, port: int, username: str, password: str, limit: int = 20) -> list[dict]:
+    """Synchronous IMAP fetch — must be run in a thread executor."""
+    mail = imaplib.IMAP4_SSL(host, int(port))
+    try:
+        mail.login(username, password)
+        mail.select("INBOX", readonly=True)
+        _, msg_ids = mail.search(None, "ALL")
+        ids = (msg_ids[0] or b"").split()
+        ids = ids[-limit:][::-1]  # most recent first
+        results = []
+        for uid in ids:
+            _, data = mail.fetch(uid, "(RFC822)")
+            raw = data[0][1] if data and data[0] else None
+            if not raw:
+                continue
+            msg = email_lib.message_from_bytes(raw)
+            subject = _decode_mime_words(msg.get("Subject", "(sem assunto)"))
+            from_ = _decode_mime_words(msg.get("From", ""))
+            date_str = msg.get("Date", "")
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(date_str)
+                received_at = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                received_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+            # Extract plain text body
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ct = part.get_content_type()
+                    if ct == "text/plain" and not part.get("Content-Disposition"):
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                            break
+                    elif ct == "text/html" and not body:
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = _strip_html(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    ct = msg.get_content_type()
+                    raw_body = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+                    body = _strip_html(raw_body) if ct == "text/html" else raw_body
+
+            excerpt = body[:200].strip()
+            category, is_quote, is_spam = _classify_email(subject, from_, body)
+            results.append({
+                "id": uid.decode(),
+                "from": from_,
+                "subject": subject,
+                "excerpt": excerpt,
+                "receivedAt": received_at,
+                "category": category,
+                "isQuote": is_quote,
+                "isSpam": is_spam,
+            })
+        return results
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
+@app.get("/api/agents/{agent_id}/inbox")
+@app.get("/agents/{agent_id}/inbox")
+async def get_agent_inbox(request: Request, agent_id: str, limit: int = 20):
+    """Fetches recent emails for the agent via IMAP using its adapter config.
+    Falls back to an empty list if no adapter config is set."""
+    try:
+        if supabase:
+            client = get_authenticated_client(request.state.token)
+            res = (
+                client.table("agent_adapter_configs")
+                .select("field_values_json")
+                .eq("agent_id", agent_id)
+                .limit(1)
+                .execute()
+            )
+            if not res.data:
+                return []
+            field_values = res.data[0].get("field_values_json") or {}
+        else:
+            # Mock fallback: find in MOCK_ADAPTER_CONFIGS
+            cfg = next((c for c in MOCK_ADAPTER_CONFIGS if c.get("agentId") == agent_id), None)
+            if not cfg:
+                return []
+            field_values = cfg.get("fieldValuesJson") or {}
+
+        host = str(field_values.get("imap_host", ""))
+        port = int(field_values.get("imap_port", 993))
+        username = str(field_values.get("email", ""))
+        password = str(field_values.get("password", ""))
+
+        if not host or not username or not password:
+            return []
+
+        loop = asyncio.get_event_loop()
+        emails = await loop.run_in_executor(
+            None,
+            lambda: _fetch_imap_emails(host, port, username, password, limit),
+        )
+        return emails
+    except imaplib.IMAP4.error as e:
+        logger.warning(f"IMAP error for agent {agent_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"imap_error: {e}")
+    except Exception as e:
+        logger.error(f"get_agent_inbox failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/api/agents/{agent_id}/execution-setup")
@@ -2702,7 +3286,7 @@ async def put_agent_execution_setup(request: Request, agent_id: str, payload: Ag
         raise
     except Exception as e:
         logger.error(f"put_agent_execution_setup failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def _dispatch_internal_authorized(request: Request) -> bool:
@@ -2880,7 +3464,7 @@ async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
         raise HTTPException(status_code=502, detail="dispatch_upstream_failed")
     except Exception as e:
         logger.error(f"post_task_dispatch failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 async def supabase_update_agent_status(token: str, agent_id: str, update: Union[str, Dict[str, Any]]):
     if isinstance(update, str):
@@ -2944,15 +3528,21 @@ async def patch_agent(agent_id: str, patch: AgentPatch, request: Request):
     if not supabase:
         return await supabase_update_agent_status(request.state.token, agent_id, payload)
 
-    client = get_authenticated_client(request.state.token)
-    res = client.table("agents").update(payload).eq("id", agent_id).execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Target Agent Not Found")
-    agent_dict = Agent(**res.data[0]).to_zod_dict()
-    company_id = res.data[0].get("company_id")
-    if company_id:
-        await ws_manager.emit_agent_updated(company_id, agent_dict)
-    return agent_dict
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("agents").update(payload).eq("id", agent_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Target Agent Not Found")
+        agent_dict = Agent(**res.data[0]).to_zod_dict()
+        company_id = res.data[0].get("company_id")
+        if company_id:
+            await ws_manager.emit_agent_updated(company_id, agent_dict)
+        return agent_dict
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_agent failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/agents/{agent_id}")
@@ -2983,7 +3573,7 @@ async def delete_agent(agent_id: str, request: Request):
         raise
     except Exception as e:
         logger.error(f"delete_agent failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/tasks/{task_id}")
 async def get_task_endpoint(request: Request, task_id: str):
@@ -3077,7 +3667,7 @@ async def delete_task(request: Request, task_id: str):
         raise
     except Exception as e:
         logger.error(f"delete_task failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/tasks/{task_id}/claim")
@@ -3456,14 +4046,11 @@ async def health_check():
 
 
 @app.websocket("/ws/companies/{company_id}")
-@app.websocket("/api/ws/companies/{company_id}")
 async def websocket_companies(
     websocket: WebSocket,
     company_id: str,
     token: Optional[str] = Query(default=None),
 ):
-    # Handshake deve ser concluído antes de qualquer close() —
-    # caso contrário o browser nunca recebe o 101 e dispara onerror.
     await websocket.accept()
 
     # --- Auth ---
@@ -3645,7 +4232,7 @@ async def api_system_prompt(format: Optional[str] = Query(default="json")):
 
     prompt = build_system_prompt()
     if format == "text":
-        from fastapi.responses import PlainTextResponse
+        from fastapi.responses import PlainTextResponse  # pyright: ignore[reportMissingImports]
         return PlainTextResponse(content=prompt, media_type="text/plain; charset=utf-8")
 
     return {
@@ -3857,11 +4444,10 @@ async def api_extract_bl_pl(
         return result
 
     except RuntimeError as exc:
-        logger.error(f"extract_bl_pl runtime error: {exc}")
-        raise HTTPException(status_code=503, detail="service_unavailable")
+        raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         logger.exception("extract_bl_pl endpoint error")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # =====================================================================
@@ -3873,11 +4459,10 @@ async def api_extract_bl_pl(
 async def list_llm_models(request: Request, active: Optional[str] = None):
     active_only = active != "false"
     if not supabase:
-        rows = [r for r in MOCK_LLM_MODELS if not active_only or r["is_active"]]
-        return [LlmModel(**r).to_zod_dict() for r in rows]
+        rows = MOCK_LLM_MODELS if active_only else MOCK_LLM_MODELS
+        return [LlmModel(**r).to_zod_dict() for r in rows if not active_only or r["is_active"]]
     try:
-        client = get_authenticated_client(request.state.token)
-        q = client.table("llm_models").select("id,provider,display_name,input_cost_per_1m,output_cost_per_1m,cache_read_cost_per_1m,context_window_k,is_active,effective_from")
+        q = supabase.table("llm_models").select("id,provider,display_name,input_cost_per_1m,output_cost_per_1m,cache_read_cost_per_1m,context_window_k,is_active,effective_from")
         if active_only:
             q = q.eq("is_active", True)
         res = q.order("display_name").execute()
@@ -3886,7 +4471,97 @@ async def list_llm_models(request: Request, active: Optional[str] = None):
         raise
     except Exception as e:
         logger.error(f"list_llm_models failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class LlmModelInput(BaseModel):
+    provider: str
+    displayName: str
+    inputCostPer1M: float
+    outputCostPer1M: float
+    cacheReadCostPer1M: float = 0.0
+    contextWindowK: int
+    effectiveFrom: str
+    isActive: Optional[bool] = True
+
+
+@app.post("/api/llm-models")
+@app.post("/llm-models")
+async def create_llm_model(request: Request, payload: LlmModelInput):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = {
+        "id": f"llm_{int(datetime.now().timestamp())}",
+        "provider": payload.provider,
+        "display_name": payload.displayName,
+        "input_cost_per_1m": payload.inputCostPer1M,
+        "output_cost_per_1m": payload.outputCostPer1M,
+        "cache_read_cost_per_1m": payload.cacheReadCostPer1M,
+        "context_window_k": payload.contextWindowK,
+        "is_active": payload.isActive if payload.isActive is not None else True,
+        "effective_from": payload.effectiveFrom,
+        "created_at": now_iso,
+    }
+    if not supabase:
+        mock_row = {k: v for k, v in row.items()}
+        MOCK_LLM_MODELS.append(mock_row)
+        return LlmModel(**mock_row).to_zod_dict()
+    try:
+        res = supabase.table("llm_models").insert(row).execute()
+        return LlmModel(**res.data[0]).to_zod_dict()
+    except Exception as e:
+        logger.error(f"create_llm_model failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/llm-models/{model_id}")
+@app.patch("/llm-models/{model_id}")
+async def patch_llm_model(request: Request, model_id: str, payload: Dict[str, Any]):
+    if not supabase:
+        m = next((r for r in MOCK_LLM_MODELS if r["id"] == model_id), None)
+        if not m:
+            raise HTTPException(status_code=404, detail="llm_model_not_found")
+        m.update(payload)
+        return LlmModel(**m).to_zod_dict()
+    try:
+        field_map = {
+            "provider": "provider",
+            "displayName": "display_name",
+            "inputCostPer1M": "input_cost_per_1m",
+            "outputCostPer1M": "output_cost_per_1m",
+            "cacheReadCostPer1M": "cache_read_cost_per_1m",
+            "contextWindowK": "context_window_k",
+            "isActive": "is_active",
+            "effectiveFrom": "effective_from",
+        }
+        update_data = {field_map[k]: v for k, v in payload.items() if k in field_map}
+        if not update_data:
+            raise HTTPException(status_code=400, detail="no_fields_to_update")
+        res = supabase.table("llm_models").update(update_data).eq("id", model_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="llm_model_not_found")
+        return LlmModel(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_llm_model failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/llm-models/{model_id}")
+@app.delete("/llm-models/{model_id}")
+async def delete_llm_model(request: Request, model_id: str):
+    if not supabase:
+        m = next((r for r in MOCK_LLM_MODELS if r["id"] == model_id), None)
+        if not m:
+            raise HTTPException(status_code=404, detail="llm_model_not_found")
+        m["is_active"] = False
+        return Response(status_code=204)
+    try:
+        supabase.table("llm_models").update({"is_active": False}).eq("id", model_id).execute()
+        return Response(status_code=204)
+    except Exception as e:
+        logger.error(f"delete_llm_model failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/agent-specialties")
@@ -3895,10 +4570,9 @@ async def list_agent_specialties(request: Request):
     if not supabase:
         return [AgentSpecialty(**r).to_zod_dict() for r in MOCK_AGENT_SPECIALTIES if r["is_active"]]
     try:
-        client = get_authenticated_client(request.state.token)
         res = (
-            client.table("agent_specialties")
-            .select("id,name,slug,domain,description,compatible_roles,is_active")
+            supabase.table("agent_specialties")
+            .select("id,name,slug,domain,description,compatible_roles,system_prompt_template,is_active")
             .eq("is_active", True)
             .order("name")
             .execute()
@@ -3908,9 +4582,155 @@ async def list_agent_specialties(request: Request):
         raise
     except Exception as e:
         logger.error(f"list_agent_specialties failed: {e}")
-        raise HTTPException(status_code=500, detail="internal_server_error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AgentSpecialtyInput(BaseModel):
+    name: str
+    slug: str
+    domain: str
+    description: str = ""
+    compatibleRoles: List[str] = Field(default_factory=list)
+    systemPromptTemplate: str = ""
+
+
+@app.post("/api/agent-specialties")
+@app.post("/agent-specialties")
+async def create_agent_specialty(request: Request, payload: AgentSpecialtyInput):
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if not supabase:
+        new_sp = {
+            "id": f"sp_{int(datetime.now().timestamp())}",
+            "name": payload.name,
+            "slug": payload.slug,
+            "domain": payload.domain,
+            "description": payload.description,
+            "compatible_roles": payload.compatibleRoles,
+            "system_prompt_template": payload.systemPromptTemplate,
+            "is_active": True,
+        }
+        MOCK_AGENT_SPECIALTIES.append(new_sp)
+        return AgentSpecialty(**new_sp).to_zod_dict()
+
+    try:
+        row = {
+            "id": f"sp_{int(datetime.now().timestamp())}",
+            "name": payload.name,
+            "slug": payload.slug,
+            "domain": payload.domain,
+            "description": payload.description,
+            "compatible_roles": payload.compatibleRoles,
+            "system_prompt_template": payload.systemPromptTemplate,
+            "is_active": True,
+            "created_at": now_iso,
+        }
+        res = supabase.table("agent_specialties").insert(row).execute()
+        return AgentSpecialty(**res.data[0]).to_zod_dict()
+    except Exception as e:
+        logger.error(f"create_agent_specialty failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/agent-specialties/{specialty_id}")
+@app.patch("/agent-specialties/{specialty_id}")
+async def patch_agent_specialty(request: Request, specialty_id: str, payload: Dict[str, Any]):
+    if not supabase:
+        sp = next((s for s in MOCK_AGENT_SPECIALTIES if s["id"] == specialty_id), None)
+        if not sp:
+            raise HTTPException(status_code=404, detail="specialty_not_found")
+        sp.update(payload)
+        return AgentSpecialty(**sp).to_zod_dict()
+
+    try:
+        update_data: Dict[str, Any] = {}
+        if "name" in payload: update_data["name"] = payload["name"]
+        if "slug" in payload: update_data["slug"] = payload["slug"]
+        if "domain" in payload: update_data["domain"] = payload["domain"]
+        if "description" in payload: update_data["description"] = payload["description"]
+        if "compatibleRoles" in payload: update_data["compatible_roles"] = payload["compatibleRoles"]
+        if "systemPromptTemplate" in payload: update_data["system_prompt_template"] = payload["systemPromptTemplate"]
+        if "isActive" in payload: update_data["is_active"] = payload["isActive"]
+        if not update_data:
+            raise HTTPException(status_code=400, detail="no_fields_to_update")
+        res = supabase.table("agent_specialties").update(update_data).eq("id", specialty_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="specialty_not_found")
+        return AgentSpecialty(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_agent_specialty failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/agent-specialties/{specialty_id}")
+@app.delete("/agent-specialties/{specialty_id}")
+async def delete_agent_specialty(request: Request, specialty_id: str):
+    if not supabase:
+        global MOCK_AGENT_SPECIALTIES
+        MOCK_AGENT_SPECIALTIES = [s for s in MOCK_AGENT_SPECIALTIES if s["id"] != specialty_id]
+        return Response(status_code=204)
+
+    try:
+        supabase.table("agent_specialties").update({"is_active": False}).eq("id", specialty_id).execute()
+        return Response(status_code=204)
+    except Exception as e:
+        logger.error(f"delete_agent_specialty failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
+# Claude Managed Agents (CMA) — Task Execution Endpoint
+# =====================================================================
+
+class ExecuteTaskRequest(BaseModel):
+    force_mode: Optional[Literal["managed_agent", "harness", "auto"]] = None
+
+
+@app.post("/api/tasks/{task_id}/execute")
+@app.post("/tasks/{task_id}/execute")
+async def execute_task_endpoint(task_id: str, body: ExecuteTaskRequest, request: Request):
+    """
+    Executa uma task imediatamente via CMA ou Harness.
+    force_mode="auto" (padrão) usa o Decision Engine para escolher.
+    """
+    from src.managed_agents.router import route_task_execution
+
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase não disponível")
+
+    # Busca task
+    try:
+        res = (
+            supabase.table("tasks")
+            .select("id,title,description,operation_type,budget_limit,company_id,assigned_to_agent_id,status,executor_type")
+            .eq("id", task_id)
+            .single()
+            .execute()
+        )
+        task = res.data
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Task não encontrada: {e}")
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Task não encontrada")
+
+    if task.get("status") == "in_progress":
+        raise HTTPException(status_code=409, detail="Task já está em execução")
+
+    try:
+        result = await route_task_execution(
+            task=task,
+            force_mode=body.force_mode,
+            supabase_client=supabase,
+            ws_manager=ws_manager,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"execute_task_endpoint error task_id={task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn  # pyright: ignore[reportMissingImports]
     uvicorn.run(app, host="0.0.0.0", port=3000)

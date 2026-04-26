@@ -24,6 +24,7 @@ class Agent(CamelModel):
     token_budget: int
     current_burn_rate: float
     adapter_type: str
+    specialty_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -51,11 +52,18 @@ class Agent(CamelModel):
             d["createdAt"] = self.created_at.isoformat().replace("+00:00", "Z")
         else:
             d["createdAt"] = str(self.created_at).replace("+00:00", "Z")
-            
+
         # Excluir updatedAt para paridade Zod (VEC-193/VEC-192 Cleanup)
         if "updatedAt" in d:
             del d["updatedAt"]
-            
+
+        # Reverse-map DB-internal values to Zod enum values.
+        # create_agent previously mapped codex→cursor, shell/webhook→bot;
+        # existing rows in DB may have those values.
+        _adapter_reverse = {"cursor": "codex", "bot": "shell"}
+        if d.get("adapterType") in _adapter_reverse:
+            d["adapterType"] = _adapter_reverse[d["adapterType"]]
+
         return d
 
 class Task(CamelModel):
@@ -80,6 +88,11 @@ class Task(CamelModel):
     spent: float
     cost_usd: float = 0.0
     claimed_at: Optional[datetime] = None
+    # CMA fields (VEC — Claude Managed Agents)
+    executor_type: Literal["harness", "managed_agent", "auto"] = "auto"
+    managed_agent_session_id: Optional[str] = None
+    executor_selected_at: Optional[datetime] = None
+    executor_rationale: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -95,7 +108,8 @@ class Task(CamelModel):
             return 0.0
         return float(v)
 
-    @validator('assigned_to_agent_id', 'parent_task_id', 'goal_id', pre=True)
+    @validator('assigned_to_agent_id', 'parent_task_id', 'goal_id',
+               'managed_agent_session_id', 'executor_rationale', pre=True)
     def empty_to_none(cls, v):
         if v == "":
             return None
@@ -103,21 +117,25 @@ class Task(CamelModel):
 
     def to_zod_dict(self):
         """
-        Dumping Customizado. 
-        IMPORTANTE: Zod no frontend não tolera 'updatedAt' na Task. 
+        Dumping Customizado.
+        IMPORTANTE: Zod no frontend não tolera 'updatedAt' na Task.
         Removendo explicitamente.
         """
         d = self.dict(by_alias=True)
         # Formatação ISO Z
-        if self.claimed_at:
-            d["claimedAt"] = self.claimed_at.isoformat().replace("+00:00", "Z")
-        if self.created_at:
-            d["createdAt"] = self.created_at.isoformat().replace("+00:00", "Z")
-        
+        for attr, key in [
+            ("claimed_at", "claimedAt"),
+            ("created_at", "createdAt"),
+            ("executor_selected_at", "executorSelectedAt"),
+        ]:
+            val = getattr(self, attr, None)
+            if val:
+                d[key] = val.isoformat().replace("+00:00", "Z") if isinstance(val, datetime) else str(val).replace("+00:00", "Z")
+
         # Excluir updatedAt para não quebrar o frontend (VEC-192 §3)
         if "updatedAt" in d:
             del d["updatedAt"]
-            
+
         return d
 
 class Goal(CamelModel):
@@ -457,7 +475,16 @@ class LlmModel(CamelModel):
     effective_from: str
 
     def to_zod_dict(self):
-        return self.dict(by_alias=True)
+        d = self.dict(by_alias=True)
+        # to_camel turns _1m → 1m (no capitalize on digit), but Zod expects 1M
+        for wrong, right in [
+            ("inputCostPer1m", "inputCostPer1M"),
+            ("outputCostPer1m", "outputCostPer1M"),
+            ("cacheReadCostPer1m", "cacheReadCostPer1M"),
+        ]:
+            if wrong in d:
+                d[right] = d.pop(wrong)
+        return d
 
 
 class AgentSpecialty(CamelModel):
@@ -467,10 +494,32 @@ class AgentSpecialty(CamelModel):
     domain: str
     description: Optional[str] = None
     compatible_roles: List[str]
-    is_active: bool
+    system_prompt_template: Optional[str] = None
+    is_active: bool = True
 
     def to_zod_dict(self):
-        return self.dict(by_alias=True)
+        d = self.dict(by_alias=True)
+        d.pop("isActive", None)
+        if d.get("systemPromptTemplate") is None:
+            d["systemPromptTemplate"] = ""
+        return d
+
+
+class AgentSpecialtyConfig(CamelModel):
+    id: str
+    company_id: str
+    agent_id: str
+    specialty_id: str
+    values: Dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        d["updatedAt"] = self.updated_at.isoformat().replace("+00:00", "Z")
+        d.pop("createdAt", None)
+        d.pop("companyId", None)
+        return d
 
 
 @dataclass(frozen=True)
@@ -487,6 +536,44 @@ class PortingBacklog:
 # =====================================================================
 # SIPOC Builder Models (VEC-246)
 # =====================================================================
+
+# =====================================================================
+# Claude Managed Agents (CMA) Models
+# =====================================================================
+
+class ManagedAgentTurn(CamelModel):
+    turn_number: int
+    tool_used: Optional[str] = None
+    tool_input: Optional[dict] = None
+    output: str
+    stop_reason: str
+    created_at: datetime
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        if self.created_at:
+            d["createdAt"] = self.created_at.isoformat().replace("+00:00", "Z")
+        return d
+
+
+class ExecutionMetadata(CamelModel):
+    executor_type: str
+    session_id: Optional[str] = None
+    turns_executed: int = 0
+    tokens_input: int = 0
+    tokens_output: int = 0
+    execution_time_seconds: float = 0.0
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        if self.started_at:
+            d["startedAt"] = self.started_at.isoformat().replace("+00:00", "Z")
+        if self.completed_at:
+            d["completedAt"] = self.completed_at.isoformat().replace("+00:00", "Z")
+        return d
+
 
 class SipocCompany(CamelModel):
     id: str

@@ -19,7 +19,7 @@
     "cli/transports/SerialBatchEventUploader.ts",
     "cli/transports/WebSocketTransport.ts",
     "cli/transports/WorkerStateUploader.ts",
-    "cli/transports/ccrClient.ts",
+    "cli/transports/ccr",
     "cli/transports/transportUtils.ts",
     "cli/update.ts"
   ]

@@ -32,7 +32,7 @@ COMPANY_ID = "88aa2edc-6a9e-4048-9bd8-c588e0dcae4c"
 AGENT_ID = "a0000000-0000-4000-8000-000000000001"
 BASE_URL = "http://127.0.0.1:3100"
 LOGIN_EMAIL = "marcelo.rosas@vectracargo.com.br"
-LOGIN_PASSWORD = "vectra123"
+LOGIN_PASSWORD = "VectraClaw2026!"
 
 
 def _base_row(undo_expires_at=None, decision="auto_healed"):

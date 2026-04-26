@@ -212,7 +212,7 @@ def _multipart_body(filename: str, pdf_bytes: bytes) -> tuple[bytes, str]:
 def _get_token() -> str:
     r = _requests.post(
         f"{BASE_URL}/api/auth/login",
-        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "vectra123"},
+        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "VectraClaw2026!"},
         timeout=10,
     )
     r.raise_for_status()

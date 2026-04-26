@@ -2,6 +2,11 @@
 
 | Documento | Conteúdo |
 |-----------|----------|
+| [**VEC-300-D1.md**](./VEC-300-D1.md) | VEC-300 D1: freeze de schema, inventário local vs remoto e decisão de origem canônica (`--linked`). |
+| [**VEC-300-D2.md**](./VEC-300-D2.md) | VEC-300 D2: extração do schema remoto canônico e geração do draft de baseline única. |
+| [**VEC-300-D3.md**](./VEC-300-D3.md) | VEC-300 D3: normalização do draft baseline para formato determinístico sem alterar semântica. |
+| [**VEC-300-D4.md**](./VEC-300-D4.md) | VEC-300 D4: ensaio de aplicação em ambiente limpo e checklist operacional de cutover. |
+| [**MULTI_TENANT_COMPANY_PK.md**](./MULTI_TENANT_COMPANY_PK.md) | Plano multi-tenant: `companies.company_id`, FKs compostas (`vec_249`), contrato API Fase 1 (`id` alias), checklist VectraClip, rollback e advisors. |
 | [**SUPABASE_DUAL_CLIENT.md**](./SUPABASE_DUAL_CLIENT.md) | Dois clients Supabase (service_role vs anon): motivo, env vars, critério de aceite, `serve`, porta presa no Windows. |
 | [VEC-199b-VectraClaw-Prompt-V1.1.md](./VEC-199b-VectraClaw-Prompt-V1.1.md) | Heartbeat Doctor V1.1 — persistência Postgres, dual client, audit 6-eventos, fix undo/get-by-id. |
 | [VEC-189-VectraClaw-Prompt.md](./VEC-189-VectraClaw-Prompt.md) | E2E audit trail: parity report 9/9 checks + trilha task→claim→heartbeat→done. **Encerrado Done.** |

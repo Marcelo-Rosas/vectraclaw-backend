@@ -84,7 +84,7 @@ print("\n[E1] GET /api/audit/parity — pre-check")
 # Então fazemos login primeiro
 r_login = _requests.post(
     f"{BASE_URL}/api/auth/login",
-    json={"email": "marcelo.rosas@vectracargo.com.br", "password": "vectra123"},
+    json={"email": "marcelo.rosas@vectracargo.com.br", "password": "VectraClaw2026!"},
     timeout=10,
 )
 if not r_login.ok:

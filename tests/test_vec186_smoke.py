@@ -97,7 +97,7 @@ check(out.get("success") is False, "success=False")
 def _login() -> str:
     r = _requests.post(
         f"{BASE_URL}/api/auth/login",
-        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "vectra123"},
+        json={"email": "marcelo.rosas@vectracargo.com.br", "password": "VectraClaw2026!"},
         timeout=10,
     )
     r.raise_for_status()

@@ -19,9 +19,11 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Protocol
 
-from fastapi import WebSocket
+
+class WebSocketLike(Protocol):
+    async def send_text(self, data: str) -> None: ...
 
 logger = logging.getLogger("VectraClawWS")
 
@@ -29,13 +31,13 @@ logger = logging.getLogger("VectraClawWS")
 class ConnectionManager:
     def __init__(self) -> None:
         # company_id → lista de sockets ativos
-        self._connections: Dict[str, List[WebSocket]] = defaultdict(list)
+        self._connections: Dict[str, List[WebSocketLike]] = defaultdict(list)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self, websocket: WebSocket, company_id: str) -> None:
+    async def connect(self, websocket: WebSocketLike, company_id: str) -> None:
         # accept() já foi chamado no route handler (antes da auth)
         self._connections[company_id].append(websocket)
         logger.info(
@@ -44,7 +46,7 @@ class ConnectionManager:
             len(self._connections[company_id]),
         )
 
-    def disconnect(self, websocket: WebSocket, company_id: str) -> None:
+    def disconnect(self, websocket: WebSocketLike, company_id: str) -> None:
         conns = self._connections.get(company_id, [])
         try:
             conns.remove(websocket)
@@ -63,7 +65,7 @@ class ConnectionManager:
     async def broadcast(self, company_id: str, message: Dict[str, Any]) -> None:
         """Envia `message` (JSON) para todos os sockets da company. Fire-and-forget."""
         text = json.dumps(message, default=str)
-        dead: List[WebSocket] = []
+        dead: List[WebSocketLike] = []
         for ws in list(self._connections.get(company_id, [])):
             try:
                 await ws.send_text(text)
@@ -97,6 +99,27 @@ class ConnectionManager:
     ) -> None:
         await self.broadcast(
             company_id, {"type": "incident_updated", "payload": payload}
+        )
+
+    async def emit_managed_agent_event(
+        self,
+        company_id: str,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Emite evento CMA em tempo real.
+
+        event_type: "managed_agent_start" | "managed_agent_turn"
+                    | "managed_agent_complete" | "managed_agent_error"
+        """
+        import datetime as _dt
+        await self.broadcast(
+            company_id,
+            {
+                "type": event_type,
+                "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                "data": payload,
+            },
         )
 
     # ------------------------------------------------------------------
