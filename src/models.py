@@ -25,6 +25,9 @@ class Agent(CamelModel):
     current_burn_rate: float
     adapter_type: str
     specialty_id: Optional[str] = None
+    system_prompt: Optional[str] = None
+    requires_approval: bool = False
+    platform_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

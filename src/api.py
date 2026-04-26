@@ -1543,19 +1543,29 @@ async def get_agents(request: Request, company_id: str = None):
         
     try:
         client = get_authenticated_client(request.state.token)
-        query = client.table("agents").select("*, agent_specialty_configs(specialty_id)")
+        query = client.table("agents").select("*")
         if company_id:
             query = query.eq("company_id", company_id)
         res = query.execute()
+
+        # Fetch specialty_ids separately to avoid PostgREST join issues
+        agent_ids = [r["id"] for r in res.data]
+        specialty_map: Dict[str, str] = {}
+        if agent_ids:
+            try:
+                sc_res = client.table("agent_specialty_configs").select("agent_id,specialty_id").in_("agent_id", agent_ids).execute()
+                for sc in sc_res.data:
+                    specialty_map[sc["agent_id"]] = sc["specialty_id"]
+            except Exception as sc_err:
+                logger.warning(f"specialty_configs lookup failed (non-fatal): {sc_err}")
+
         rows = []
         for row in res.data:
-            # Flatten specialty_id from nested join result
-            specialty_list = row.pop("agent_specialty_configs", None) or []
-            row["specialty_id"] = specialty_list[0]["specialty_id"] if specialty_list else None
+            row["specialty_id"] = specialty_map.get(row["id"])
             rows.append(Agent(**row).to_zod_dict())
         return rows
     except Exception as e:
-        logger.error(f"get_agents failed: {e}")
+        logger.error(f"get_agents failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 class NewAgentInput(BaseModel):
@@ -1563,6 +1573,12 @@ class NewAgentInput(BaseModel):
     role: str
     adapterType: str
     tokenBudget: int
+    systemPrompt: Optional[str] = None
+    requiresApproval: bool = False
+    platformUrl: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
 
 @app.post("/api/companies/{company_id}/agents")
 @app.post("/companies/{company_id}/agents")
@@ -1581,6 +1597,9 @@ async def create_agent(company_id: str, payload: NewAgentInput):
         "token_budget": payload.tokenBudget,
         "current_burn_rate": 0,
         "adapter_type": adapter_type,
+        "system_prompt": payload.systemPrompt,
+        "requires_approval": payload.requiresApproval,
+        "platform_url": payload.platformUrl or None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -2874,6 +2893,80 @@ async def put_agent_adapter_config(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# Company Secrets (Vault)
+# ---------------------------------------------------------------------------
+
+class CompanySecretInput(BaseModel):
+    name: str
+    value: str
+    description: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
+
+
+@app.get("/api/companies/{company_id}/secrets")
+@app.get("/companies/{company_id}/secrets")
+async def list_company_secrets(request: Request, company_id: str):
+    """List secret names (never values) for a company."""
+    if not supabase:
+        return []
+    try:
+        caller_company = _request_company_id(request)
+        if caller_company and caller_company != company_id:
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+        res = (
+            supabase.table("company_secrets")
+            .select("id,name,description,created_at,updated_at")
+            .eq("company_id", company_id)
+            .order("name")
+            .execute()
+        )
+        return [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "description": r.get("description"),
+                "createdAt": r["created_at"],
+                "updatedAt": r["updated_at"],
+            }
+            for r in res.data
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"list_company_secrets failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/companies/{company_id}/secrets")
+@app.post("/companies/{company_id}/secrets")
+async def upsert_company_secret(request: Request, company_id: str, payload: CompanySecretInput):
+    """Create or update a named secret in Vault (stored encrypted)."""
+    if not supabase:
+        return {"name": payload.name, "created": True}
+    try:
+        caller_company = _request_company_id(request)
+        if caller_company and caller_company != company_id:
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+        res = supabase.rpc(
+            "upsert_company_secret",
+            {
+                "p_company_id": company_id,
+                "p_name": payload.name,
+                "p_value": payload.value,
+                "p_description": payload.description,
+            },
+        ).execute()
+        return {"name": payload.name, "vaultSecretId": res.data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"upsert_company_secret failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class AgentExecutionSetupInput(BaseModel):
     executionMode: Literal["REALTIME", "CRON", "TRIGGER"]
     triggerConfig: Dict[str, Any] = Field(default_factory=dict)
@@ -3983,9 +4076,21 @@ async def _set_approval_status(request: Request, approval_id: str, status: str) 
 
     try:
         client = get_authenticated_client(request.state.token)
+
+        # Fetch first so we can act on request_type after updating
+        fetch_res = client.table("approvals").select("*").eq("id", approval_id).limit(1).execute()
+        if not fetch_res.data:
+            raise HTTPException(404, "Target Approval Not Found")
+        approval_row = fetch_res.data[0]
+
         res = client.table("approvals").update(patch).eq("id", approval_id).execute()
         if not res.data:
             raise HTTPException(404, "Target Approval Not Found")
+
+        # Auto-create agent when a hire_agent approval is approved
+        if status == "approved" and approval_row.get("request_type") == "hire_agent":
+            _auto_create_agent_from_approval(approval_row)
+
         return CouncilApproval(**res.data[0]).to_zod_dict()
     except HTTPException:
         raise
@@ -3996,8 +4101,34 @@ async def _set_approval_status(request: Request, approval_id: str, status: str) 
         raise HTTPException(500, str(e))
     except Exception as e:
         logger.error(f"set_approval_status failed: {e}")
-        # Mantém a UX funcional em ambiente de dev mesmo sem tabela pronta.
         return _mock_set_approval_status(approval_id, status)
+
+
+def _auto_create_agent_from_approval(approval_row: dict) -> None:
+    """Creates an agent row when a hire_agent approval is approved. Non-fatal."""
+    try:
+        p = approval_row.get("payload") or {}
+        company_id = approval_row.get("company_id")
+        if not company_id:
+            return
+        _to_db = {"claude_code": "claude_code", "codex": "cursor", "shell": "bot", "webhook": "bot"}
+        adapter_type = _to_db.get(str(p.get("adapterType", "claude_code")), "claude_code")
+        row: Dict[str, Any] = {
+            "company_id": company_id,
+            "name": str(p.get("name", "Unnamed Agent")),
+            "role": str(p.get("role", "Agent")),
+            "reports_to_id": p.get("reportsToId") or None,
+            "status": "idle",
+            "token_budget": int(p.get("tokenBudget", 50000)),
+            "current_burn_rate": 0,
+            "adapter_type": adapter_type,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("agents").insert(row).execute()
+        logger.info(f"auto_create_agent_from_approval: created agent '{row['name']}' for company {company_id}")
+    except Exception as e:
+        logger.error(f"auto_create_agent_from_approval failed (non-fatal): {e}")
 
 
 @app.post("/api/approvals/{approval_id}/approve")
