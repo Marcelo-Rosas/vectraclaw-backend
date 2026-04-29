@@ -3471,6 +3471,36 @@ def _normalize_5w2h_payload(body: dict) -> dict:
     return result
 
 
+def _validate_5w2h(normalized: dict) -> dict:
+    """Validate required 5W2H fields and return a status + error list (never blocks save).
+
+    Returns:
+        {"status": "verde"|"amarelo"|"vermelho", "errors": [{"field": str, "message": str}]}
+
+    Rules:
+    - Required fields: why, how, who, when  (howMuch is NOT validated)
+    - verde    = all 4 filled
+    - amarelo  = 1, 2 or 3 of the 4 filled
+    - vermelho = none of the 4 filled
+    """
+    five = normalized.get("fiveW2H") or {}
+    required = ["why", "how", "who", "when"]
+    missing = [f for f in required if not five.get(f, "").strip()]
+
+    if len(missing) == 0:
+        status = "verde"
+    elif len(missing) == 4:
+        status = "vermelho"
+    else:
+        status = "amarelo"
+
+    errors = [
+        {"field": f, "message": "Campo 5W2H obrigatório não preenchido"}
+        for f in missing
+    ]
+    return {"status": status, "errors": errors}
+
+
 def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
     """Map a workflow_steps DB row → frontend SIPOC dict, preferring sipoc_meta when present."""
     meta: dict = r.get("sipoc_meta") or {}
@@ -3521,6 +3551,9 @@ def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
                 "how": w_how,
                 "howMuch": w_how_much,
             },
+            "validationStatus": r.get("validation_status") or "verde",
+            "validationErrors": r.get("validation_errors") or [],
+            "contractVersion": r.get("contract_version") or "v1",
             "createdAt": r.get("created_at") or datetime.now(timezone.utc).isoformat(),
         }
     # legacy row without sipoc_meta
@@ -3542,6 +3575,9 @@ def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
         "customers": [],
         "decisions": "",
         "fiveW2H": {"what": "", "why": "", "who": "", "where": "", "when": "", "how": "", "howMuch": {}},
+        "validationStatus": r.get("validation_status") or "verde",
+        "validationErrors": r.get("validation_errors") or [],
+        "contractVersion": r.get("contract_version") or "v1",
         "createdAt": r.get("created_at") or datetime.now(timezone.utc).isoformat(),
     }
 
@@ -3589,6 +3625,7 @@ async def create_workflow_step(company_id: str, request: Request):
         next_order = (max_res.data[0]["step_order"] + 1) if max_res.data else 1
 
         normalized = _normalize_5w2h_payload(body)
+        validation = _validate_5w2h(normalized)
         nome = normalized.get("nome") or "Etapa"
         slug = _wf_slugify(nome)
         requires_approval = normalized.get("responsavel") == "humano"
@@ -3602,6 +3639,9 @@ async def create_workflow_step(company_id: str, request: Request):
             "specialty_slug": specialty_slug,
             "requires_approval": requires_approval,
             "sipoc_meta": normalized,
+            "contract_version": "v2",
+            "validation_status": validation["status"],
+            "validation_errors": validation["errors"],
         }).execute().data[0]
 
         return _sipoc_step_to_dict(row, company_id, {})
@@ -3626,6 +3666,7 @@ async def update_workflow_step(step_id: str, request: Request):
             raise HTTPException(404, "Workflow step not found")
 
         normalized = _normalize_5w2h_payload(body)
+        validation = _validate_5w2h(normalized)
         nome = normalized.get("nome") or row.get("name") or "Etapa"
         requires_approval = normalized.get("responsavel") == "humano"
         specialty_slug = (normalized.get("ferramentas") or [None])[0]
@@ -3636,6 +3677,9 @@ async def update_workflow_step(step_id: str, request: Request):
             "specialty_slug": specialty_slug,
             "requires_approval": requires_approval,
             "sipoc_meta": normalized,
+            "contract_version": "v2",
+            "validation_status": validation["status"],
+            "validation_errors": validation["errors"],
         }).eq("id", step_id).execute().data[0]
 
         return _sipoc_step_to_dict(updated, body.get("companyId") or "", {})
