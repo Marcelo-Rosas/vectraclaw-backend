@@ -6,6 +6,7 @@ import fnmatch
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Literal, Union
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import requests
 from jose import jwt  # pyright: ignore[reportMissingModuleSource]
@@ -28,10 +29,12 @@ from src.models import (
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
+    Project, Run, RunTranscriptEntry,
 )
 from src.services.heartbeat_doctor.loop import doctor_tick
 from src.services.heartbeat_doctor import audit as incident_audit
 from src.services.heartbeat_doctor import store as incident_store
+from src.services.morpheus_dispatcher import MorpheusDispatcher
 from src.ws_manager import manager as ws_manager
 from src.tenant_ids import company_row_public_id
 from src.agents.sipoc_researcher import research_sector
@@ -44,6 +47,11 @@ from src.services.sipoc_approvals import handle_status_transition
 from src.services.sipoc_diagnostics import run_diagnostic
 
 logger = logging.getLogger("VectraClawAPI")
+
+# Windows ProactorEventLoop dispara ConnectionResetError 10054 quando o cliente
+# fecha a conexão abruptamente — é ruído do OS, não um bug da aplicação.
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
 app = FastAPI(title="Vectra Claw Backend API", version="0.1.0")
 
 # OpenAPI: o JWT é validado no middleware (não via `Security()` por rota), então o schema
@@ -129,7 +137,7 @@ class AgentPatch(BaseModel):
     reports_to_id: Optional[str] = Field(default=None, alias="reportsToId")
 
     class Config:
-        allow_population_by_field_name = True
+        populate_by_name = True
         extra = "ignore"
 
 
@@ -387,6 +395,20 @@ def _resolve_model_prices(model_id: Optional[str]) -> Optional[Dict[str, float]]
     return _llm_price_cache.get(model_id)
 
 
+def _validate_active_model_id(model_id: Optional[str]) -> None:
+    """
+    Garante que o model_id informado no heartbeat existe e está ativo em llm_models.
+    Se model_id vier vazio, a validação é ignorada (heartbeat sem pricing modelado).
+    """
+    if not model_id:
+        return
+    if _resolve_model_prices(model_id) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid_model_id_or_inactive:{model_id}",
+        )
+
+
 def _calculate_heartbeat_cost_usd(
     *,
     model_id: Optional[str],
@@ -411,7 +433,7 @@ def _accumulate_task_cost(task_id: Optional[str], heartbeat_cost_usd: Optional[f
     try:
         current = (
             supabase.table("tasks")
-            .select("id,company_id,cost_usd")
+            .select("id,company_id,assigned_to_agent_id,cost_usd,budget_limit,status")
             .eq("id", task_id)
             .limit(1)
             .execute()
@@ -420,19 +442,161 @@ def _accumulate_task_cost(task_id: Optional[str], heartbeat_cost_usd: Optional[f
             return
         row = current.data[0]
         next_cost = float(row.get("cost_usd") or 0.0) + float(heartbeat_cost_usd)
-        (
+        update_payload: Dict[str, Any] = {
+            "cost_usd": round(next_cost, 8),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        budget_limit = float(row.get("budget_limit") or 0.0)
+        status = str(row.get("status") or "")
+        if budget_limit > 0 and next_cost > budget_limit and status not in ("done", "blocked"):
+            # Circuit breaker financeiro: pausa execução quando excede orçamento.
+            update_payload["status"] = "blocked"
+        update_res = (
             supabase.table("tasks")
-            .update(
-                {
-                    "cost_usd": round(next_cost, 8),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
+            .update(update_payload)
             .eq("id", task_id)
             .execute()
         )
+        if update_res.data and row.get("company_id"):
+            try:
+                task_dict = Task(**update_res.data[0]).to_zod_dict()
+                ws_manager.broadcast_nowait(
+                    row["company_id"],
+                    {"type": "task_updated", "payload": task_dict},
+                )
+            except Exception:
+                pass
+        if update_payload.get("status") == "blocked":
+            _emit_budget_blocked_heartbeat(
+                company_id=row.get("company_id"),
+                agent_id=row.get("assigned_to_agent_id"),
+                task_id=task_id,
+                cost_usd=next_cost,
+                budget_limit=budget_limit,
+            )
     except Exception as e:
         logger.warning(f"task cost accumulation failed task={task_id}: {e}")
+
+
+def _emit_budget_blocked_heartbeat(
+    *,
+    company_id: Optional[str],
+    agent_id: Optional[str],
+    task_id: Optional[str],
+    cost_usd: float,
+    budget_limit: float,
+) -> None:
+    if not supabase or not company_id or not agent_id or not task_id:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row: Dict[str, Any] = {
+        "company_id": company_id,
+        "agent_id": agent_id,
+        "task_id": task_id,
+        "status": "error",
+        "tokens_used": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "model_id": None,
+        "cost_usd": round(float(cost_usd), 8),
+        "log_excerpt": (
+            f"Circuit breaker: budget_limit_exceeded "
+            f"(cost_usd={round(float(cost_usd), 4)}, budget_limit={round(float(budget_limit), 4)})"
+        ),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    try:
+        res = supabase.table("heartbeats").insert(row).execute()
+        if res.data:
+            hb_payload = Heartbeat(**res.data[0]).to_zod_dict()
+        else:
+            hb_payload = {
+                "id": f"hb_budget_{int(datetime.now().timestamp())}",
+                "agentId": agent_id,
+                "taskId": task_id,
+                "status": "error",
+                "tokensUsed": 0,
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "cacheReadTokens": 0,
+                "costUsd": round(float(cost_usd), 8),
+                "logExcerpt": row["log_excerpt"],
+                "createdAt": now_iso.replace("+00:00", "Z"),
+            }
+        ws_manager.broadcast_nowait(
+            company_id,
+            {"type": "heartbeat", "payload": hb_payload},
+        )
+    except Exception as e:
+        logger.warning(f"emit budget blocked heartbeat failed task={task_id}: {e}")
+
+
+def _task_over_budget(task: Dict[str, Any]) -> bool:
+    try:
+        budget_limit = float(task.get("budget_limit") or 0.0)
+        if budget_limit <= 0:
+            return False
+        return float(task.get("cost_usd") or 0.0) > budget_limit
+    except Exception:
+        return False
+
+
+def _task_is_approved(task: Dict[str, Any]) -> bool:
+    return bool(task.get("approved_at") or task.get("approved_by_user_id"))
+
+
+def _agent_requires_approval(agent_id: Optional[str]) -> bool:
+    if not supabase or not agent_id:
+        return False
+    try:
+        res = (
+            supabase.table("agents")
+            .select("requires_approval")
+            .eq("id", agent_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return False
+        return bool(res.data[0].get("requires_approval"))
+    except Exception:
+        return False
+
+
+def _enforce_task_execution_gates(task: Dict[str, Any], *, source: str) -> None:
+    """
+    Gates obrigatórios para iniciar/retomar execução:
+    - orçamento excedido -> bloqueia task e nega execução
+    - agente requer aprovação humana -> exige approved_at/by antes de executar
+    """
+    task_id = task.get("id")
+    if _task_over_budget(task):
+        try:
+            if supabase and task_id and str(task.get("status") or "") not in ("done", "blocked"):
+                supabase.table("tasks").update(
+                    {
+                        "status": "blocked",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ).eq("id", task_id).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=409, detail="budget_limit_exceeded")
+
+    if _agent_requires_approval(task.get("assigned_to_agent_id")) and not _task_is_approved(task):
+        try:
+            if supabase and task_id and str(task.get("status") or "") not in ("review", "done"):
+                supabase.table("tasks").update(
+                    {
+                        "status": "review",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ).eq("id", task_id).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=409, detail=f"task_requires_approval:{source}")
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -886,6 +1050,25 @@ async def save_sipoc_edges(request: Request, process_id: UUID, payload: List[Dic
         logger.error(f"save_sipoc_edges failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# === Morpheus Dispatcher Scheduler ===
+
+async def morpheus_scheduler(interval_s: int):
+    logger.info(f"[morpheus] scheduler started interval={interval_s}s")
+    while True:
+        try:
+            if supabase:
+                dispatcher = MorpheusDispatcher(supabase)
+                dispatched = dispatcher.dispatch()
+                if dispatched:
+                    logger.info(f"[morpheus] {dispatched} task(s) dispatched this cycle")
+            else:
+                logger.debug("[morpheus] skip tick: no supabase client")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[morpheus] scheduler error: {e}")
+        await asyncio.sleep(interval_s)
+
 # === Heartbeat Doctor Scheduler ===
 
 async def doctor_scheduler(interval_s: int):
@@ -906,17 +1089,19 @@ async def doctor_scheduler(interval_s: int):
 @app.on_event("startup")
 async def startup_event():
     _refresh_llm_price_cache(force=True)
-    # Registrar tick de 30s
     app.state.doctor_task = asyncio.create_task(doctor_scheduler(interval_s=30))
+    app.state.morpheus_task = asyncio.create_task(morpheus_scheduler(interval_s=10))
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    if hasattr(app.state, "doctor_task"):
-        app.state.doctor_task.cancel()
-        try:
-            await app.state.doctor_task
-        except asyncio.CancelledError:
-            pass
+    for task_attr in ("doctor_task", "morpheus_task"):
+        task = getattr(app.state, task_attr, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 # =====================================================================
 # Database Mocks (Adequados perfeitamente ao Zod Schema do VectraClip)
@@ -1401,7 +1586,22 @@ async def login(payload: LoginPayload):
 
         logger.info(f"Extraindo Role e Company (app_meta: {app_meta})")
         raw_role = vc.get("role") or user_meta.get("role") or app_meta.get("role") or "admin"
-        company_id = vc.get("company_id") or app_meta.get("company_id") or user_meta.get("company_id") or MOCK_USER["companyId"]
+        company_id = vc.get("company_id") or app_meta.get("company_id") or user_meta.get("company_id")
+
+        # Se não veio nos metadados do JWT, busca em app_users (fonte de verdade)
+        if not company_id and supabase:
+            try:
+                lookup = supabase.table("app_users").select("company_id,role").eq("id", str(res.user.id)).execute()
+                if lookup.data:
+                    company_id = lookup.data[0].get("company_id")
+                    raw_role = lookup.data[0].get("role") or raw_role
+                    logger.info(f"company_id resolvido via app_users: {company_id}")
+            except Exception as lu_err:
+                logger.warning(f"Falha ao buscar app_users: {lu_err}")
+
+        if not company_id:
+            company_id = MOCK_USER["companyId"]
+            logger.warning(f"company_id não encontrado para {res.user.id}, usando fallback mock")
         
         display_name = (
             user_meta.get("full_name")
@@ -1645,10 +1845,16 @@ async def get_tasks(request: Request, company_id: str = None):
         if company_id:
             query = query.eq("company_id", company_id)
         res = query.execute()
-        return [Task(**row).to_zod_dict() for row in res.data]
+        out = []
+        for row in res.data:
+            try:
+                out.append(Task(**row).to_zod_dict())
+            except Exception as row_err:
+                logger.warning(f"get_tasks: skipping invalid row id={row.get('id')}: {row_err}")
+        return out
     except Exception as e:
         logger.error(f"get_tasks failed: {e}")
-        return MOCK_TASKS
+        return []
 
 class NewTaskInput(BaseModel):
     """
@@ -1715,9 +1921,10 @@ class UpdateTaskInput(BaseModel):
     )
     parent_task_id: Optional[str] = Field(default=None, alias="parentTaskId")
     goal_id: Optional[str] = Field(default=None, alias="goalId")
+    output_json: Optional[Dict[str, Any]] = Field(default=None, alias="outputJson")
 
     class Config:
-        allow_population_by_field_name = True
+        populate_by_name = True
         extra = "ignore"
 
     @validator("spent", pre=True)
@@ -1745,6 +1952,7 @@ def _task_patch_payload_to_camel(patch_snake: Dict[str, Any]) -> Dict[str, Any]:
         "assigned_to_agent_id": "assignedToAgentId",
         "parent_task_id": "parentTaskId",
         "goal_id": "goalId",
+        "output_json": "outputJson",
     }
     return {key_map[k]: v for k, v in patch_snake.items()}
 
@@ -2230,6 +2438,7 @@ class NewHeartbeatInput(BaseModel):
 async def post_heartbeat(request: Request, payload: NewHeartbeatInput):
     """Agente reporta heartbeat; Claw persiste e emite WS `heartbeat`."""
     now = datetime.now(timezone.utc).isoformat()
+    _validate_active_model_id(payload.modelId)
     input_tokens = max(0, int(payload.inputTokens or 0))
     output_tokens = max(0, int(payload.outputTokens or 0))
     cache_read_tokens = max(0, int(payload.cacheReadTokens or 0))
@@ -2347,6 +2556,94 @@ async def get_approvals(request: Request, company_id: str = None):
         logger.error(f"get_approvals failed: {e}")
         return [CouncilApproval(**row).to_zod_dict() for row in MOCK_APPROVAL]
 
+# === Projects ===
+
+@app.get("/api/companies/{company_id}/projects")
+@app.get("/companies/{company_id}/projects")
+@app.get("/api/projects")
+async def get_projects(request: Request, company_id: str = None):
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        query = client.table("projects").select("*").order("created_at", desc=True)
+        if company_id:
+            query = query.eq("company_id", company_id)
+        res = query.execute()
+        return [Project(**row).to_zod_dict() for row in res.data]
+    except PostgrestAPIError as e:
+        if e.code == "PGRST205":
+            logger.warning("vectraclip.projects missing; returning empty list")
+            return []
+        raise
+    except Exception as e:
+        logger.error(f"get_projects failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/companies/{company_id}/projects")
+@app.post("/companies/{company_id}/projects")
+async def create_project(company_id: str, request: Request):
+    body = await request.json()
+    payload = {
+        "company_id": company_id,
+        "name": body["name"],
+        "mission": body.get("mission", ""),
+        "status": body.get("status", "backlog"),
+        "lead_agent_id": body.get("leadAgentId"),
+        "target_date": body.get("targetDate"),
+        "issue_completion_pct": body.get("issueCompletionPct", 0),
+    }
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("projects").insert(payload).execute()
+        return Project(**res.data[0]).to_zod_dict()
+    except Exception as e:
+        logger.error(f"create_project failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/projects/{project_id}")
+@app.get("/projects/{project_id}")
+async def get_project(project_id: str, request: Request):
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("projects").select("*").eq("id", project_id).single().execute()
+        return Project(**res.data).to_zod_dict()
+    except Exception as e:
+        logger.error(f"get_project failed: {e}")
+        raise HTTPException(404, "Project not found")
+
+
+@app.patch("/api/projects/{project_id}")
+@app.patch("/projects/{project_id}")
+async def update_project(project_id: str, request: Request):
+    body = await request.json()
+    patch = {}
+    for k, v in body.items():
+        snake = "".join(["_" + c.lower() if c.isupper() else c for c in k]).lstrip("_")
+        patch[snake] = v
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("projects").update(patch).eq("id", project_id).execute()
+        return Project(**res.data[0]).to_zod_dict()
+    except Exception as e:
+        logger.error(f"update_project failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/projects/{project_id}")
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: str, request: Request):
+    try:
+        client = get_authenticated_client(request.state.token)
+        client.table("projects").delete().eq("id", project_id).execute()
+        return Response(status_code=204)
+    except Exception as e:
+        logger.error(f"delete_project failed: {e}")
+        raise HTTPException(500, str(e))
+
+
 # === Operações sobre item ===
 
 @app.get("/api/agents/{agent_id}")
@@ -2458,6 +2755,79 @@ def _chronos_log_dispatch_event(payload: Dict[str, Any]) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Runs & Transcripts (VEC-320)
+# -----------------------------------------------------------------------------
+
+@app.get("/api/companies/{company_id}/runs")
+@app.get("/companies/{company_id}/runs")
+async def list_runs(request: Request, company_id: str, agentId: Optional[str] = None, since: Optional[str] = None):
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        query = (
+            client.table("runs")
+            .select("*")
+            .eq("company_id", company_id)
+            .order("started_at", desc=True)
+            .limit(100)
+        )
+        if agentId:
+            query = query.eq("agent_id", agentId)
+        if since:
+            query = query.gte("started_at", since)
+        res = query.execute()
+        return [Run(**row).to_zod_dict() for row in res.data]
+    except PostgrestAPIError as e:
+        if e.code == "PGRST205":
+            logger.warning("vectraclip.runs missing; returning empty list")
+            return []
+        raise
+    except Exception as e:
+        logger.error(f"list_runs failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/runs/{run_id}")
+@app.get("/runs/{run_id}")
+async def get_run(request: Request, run_id: str):
+    if not supabase:
+        raise HTTPException(404, "run not found")
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("runs").select("*").eq("id", run_id).single().execute()
+        return Run(**res.data).to_zod_dict()
+    except Exception as e:
+        logger.error(f"get_run failed: {e}")
+        raise HTTPException(404, "run not found")
+
+
+@app.get("/api/runs/{run_id}/transcript")
+@app.get("/runs/{run_id}/transcript")
+async def get_run_transcript(request: Request, run_id: str):
+    if not supabase:
+        return {"runId": run_id, "entries": []}
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("run_transcript_entries")
+            .select("*")
+            .eq("run_id", run_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        entries = [RunTranscriptEntry(**row).to_zod_dict() for row in res.data]
+        return {"runId": run_id, "entries": entries}
+    except PostgrestAPIError as e:
+        if e.code == "PGRST205":
+            return {"runId": run_id, "entries": []}
+        raise
+    except Exception as e:
+        logger.error(f"get_run_transcript failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+# -----------------------------------------------------------------------------
 # Adapters & Connectors (VEC-242 / VEC-201)
 # -----------------------------------------------------------------------------
 
@@ -2474,7 +2844,7 @@ class UpdateAdapterInput(BaseModel):
 class NewAdapterFieldInput(BaseModel):
     fieldKey: str
     fieldLabel: str
-    fieldType: Literal["text", "textarea", "number", "boolean", "select", "multiselect", "file_upload", "secret"]
+    fieldType: Literal["text", "textarea", "number", "boolean", "select", "multiselect", "file_upload", "secret", "url"]
     isRequired: bool
     sortOrder: int = 10
 
@@ -2497,7 +2867,7 @@ async def list_adapters(request: Request, company_id: str):
         ]
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         if caller_company and caller_company != company_id:
             raise HTTPException(status_code=403, detail="cross_company_forbidden")
 
@@ -2589,7 +2959,7 @@ async def list_adapter_fields(request: Request, adapter_id: str):
         ]
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         client = get_authenticated_client(request.state.token)
 
         adapter_res = (
@@ -2759,6 +3129,648 @@ async def create_routine(request: Request, company_id: str, payload: Dict[str, A
         raise HTTPException(500, str(e))
 
 
+@app.get("/api/routines/{routine_id}")
+@app.get("/routines/{routine_id}")
+async def get_routine(request: Request, routine_id: str):
+    if not supabase:
+        row = next((r for r in MOCK_ROUTINES if r.get("id") == routine_id), None)
+        if not row:
+            raise HTTPException(404, "routine_not_found")
+        return row
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("routines").select("*").eq("id", routine_id).limit(1).execute()
+        if not res.data:
+            raise HTTPException(404, "routine_not_found")
+        return Routine(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_routine failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/routines/{routine_id}")
+@app.patch("/routines/{routine_id}")
+async def patch_routine(request: Request, routine_id: str, payload: Dict[str, Any]):
+    if not supabase:
+        row = next((r for r in MOCK_ROUTINES if r.get("id") == routine_id), None)
+        if not row:
+            raise HTTPException(404, "routine_not_found")
+        row.update(payload)
+        return row
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("routines").select("id").eq("id", routine_id).limit(1).execute()
+        if not res.data:
+            raise HTTPException(404, "routine_not_found")
+
+        # Normalise camelCase keys from the frontend to snake_case for DB
+        CAMEL_TO_SNAKE = {
+            "agentId": "agent_id",
+            "promptTemplate": "prompt_template",
+            "nextRunAt": "next_run_at",
+        }
+        normalised = {CAMEL_TO_SNAKE.get(k, k): v for k, v in payload.items()}
+
+        ALLOWED = {"name", "status", "schedule", "agent_id", "prompt_template",
+                   "description", "metadata", "next_run_at"}
+        update_data = {k: v for k, v in normalised.items() if k in ALLOWED}
+        if not update_data:
+            raise HTTPException(400, "no_valid_fields")
+
+        updated = client.table("routines").update(update_data).eq("id", routine_id).execute()
+        return Routine(**updated.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_routine failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/routines/{routine_id}")
+@app.delete("/routines/{routine_id}")
+async def delete_routine(request: Request, routine_id: str):
+    if not supabase:
+        before = len(MOCK_ROUTINES)
+        MOCK_ROUTINES[:] = [r for r in MOCK_ROUTINES if r.get("id") != routine_id]
+        if len(MOCK_ROUTINES) == before:
+            raise HTTPException(404, "routine_not_found")
+        return Response(status_code=204)
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("routines").select("id").eq("id", routine_id).limit(1).execute()
+        if not res.data:
+            raise HTTPException(404, "routine_not_found")
+        client.table("routines").delete().eq("id", routine_id).execute()
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_routine failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/agents/{agent_id}/routines")
+@app.get("/agents/{agent_id}/routines")
+async def list_agent_routines(request: Request, agent_id: str):
+    if not supabase:
+        return [r for r in MOCK_ROUTINES if r.get("agentId") == agent_id]
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("routines").select("*").eq("agent_id", agent_id).execute()
+        return [Routine(**row).to_zod_dict() for row in (res.data or [])]
+    except Exception as e:
+        logger.error(f"list_agent_routines failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/routines/{routine_id}/run-now")
+@app.post("/routines/{routine_id}/run-now")
+async def run_routine_now(request: Request, routine_id: str):
+    if not supabase:
+        row = next((r for r in MOCK_ROUTINES if r.get("id") == routine_id), None)
+        if not row:
+            raise HTTPException(404, "routine_not_found")
+        return {"triggered": True, "routineId": routine_id}
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("routines").select("*").eq("id", routine_id).limit(1).execute()
+        if not res.data:
+            raise HTTPException(404, "routine_not_found")
+        routine_row = res.data[0]
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        schedule = routine_row.get("schedule") or {}
+        cron_expr = (
+            routine_row.get("cron_expression")
+            or (schedule.get("cron") if isinstance(schedule, dict) else None)
+            or ""
+        )
+        tz_name = (schedule.get("timezone") if isinstance(schedule, dict) else None) or "UTC"
+        next_run_iso = _compute_next_run_at(now_utc, cron_expr, tz_name)
+
+        # Mark current run and pre-compute next run so UI/daemon stay in sync.
+        routine_update = {"last_run_at": now_iso}
+        if next_run_iso:
+            routine_update["next_run_at"] = next_run_iso
+        client.table("routines").update(routine_update).eq("id", routine_id).execute()
+
+        # Create a Task record with status=queued so the daemon picks it up
+        prompt_template = routine_row.get("prompt_template") or ""
+        description = prompt_template \
+            .replace("{{now}}", now_iso) \
+            .replace("{{lastRun}}", routine_row.get("last_run_at") or "nunca")
+        task_payload = {
+            "company_id": routine_row.get("company_id"),
+            "assigned_to_agent_id": routine_row.get("agent_id"),
+            "title": f"[Rotina] {routine_row.get('name', 'Rotina')}",
+            "description": description,
+            "status": "queued",
+            "operation_type": routine_row.get("operation_type") or "email_lead",
+            "output_json": {"hermes_leads": []},
+            "budget_limit": 0,
+            "spent": 0,
+            "cost_usd": 0,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+        }
+        task_id = None
+        task_err_msg = None
+        try:
+            # Use service_role client to bypass RLS on tasks insert
+            task_res = supabase.table("tasks").insert(task_payload).execute()
+            if task_res.data:
+                task_id = task_res.data[0].get("id")
+                logger.info(f"run_routine_now: task created id={task_id}")
+                # Push real-time update so the board refreshes instantly
+                try:
+                    task_obj = Task(**task_res.data[0])
+                    company_id_for_ws = routine_row.get("company_id")
+                    if company_id_for_ws:
+                        asyncio.create_task(
+                            ws_manager.emit_task_updated(company_id_for_ws, task_obj.to_zod_dict())
+                        )
+                except Exception as ws_err:
+                    logger.debug(f"run_routine_now: ws emit skipped: {ws_err}")
+        except Exception as task_err:
+            task_err_msg = str(task_err)
+            logger.error(f"run_routine_now: task creation failed: {task_err}")
+
+        return {"triggered": True, "routineId": routine_id, "taskId": task_id, "taskError": task_err_msg}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"run_routine_now failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/companies/{company_id}/workflow-steps")
+@app.get("/companies/{company_id}/workflow-steps")
+async def list_workflow_steps(request: Request, company_id: str):
+    """Returns SIPOC-like workflow steps mapped from workflow_definitions/workflow_steps."""
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        defs = (
+            client.table("workflow_definitions")
+            .select("id, company_id, slug, name")
+            .or_(f"company_id.eq.{company_id},company_id.is.null")
+            .eq("is_active", True)
+            .execute()
+        )
+        wf_defs = defs.data or []
+        if not wf_defs:
+            return []
+
+        def_by_id = {d.get("id"): d for d in wf_defs if d.get("id")}
+        wf_ids = [d["id"] for d in wf_defs if d.get("id")]
+        if not wf_ids:
+            return []
+        steps_res = (
+            client.table("workflow_steps")
+            .select("*")
+            .in_("workflow_id", wf_ids)
+            .order("step_order")
+            .execute()
+        )
+        rows = steps_res.data or []
+
+        # Build id -> step_code to resolve "proximo"
+        id_to_code = {
+            r.get("id"): f"{(r.get('slug') or 'step').upper()}-{int(r.get('step_order') or 0)}"
+            for r in rows
+        }
+
+        mapped = []
+        for r in rows:
+            wf = def_by_id.get(r.get("workflow_id")) or {}
+            step_code = f"{(r.get('slug') or 'step').upper()}-{int(r.get('step_order') or 0)}"
+            requires_approval = bool(r.get("requires_approval"))
+            next_id = r.get("on_success_step_id")
+            mapped.append(
+                {
+                    "id": r.get("id"),
+                    "companyId": company_id,
+                    "stepCode": step_code,
+                    "nome": r.get("name") or r.get("slug") or "Etapa",
+                    "descricao": (
+                        f"Workflow '{wf.get('name') or wf.get('slug') or 'pipeline'}' — "
+                        f"step {int(r.get('step_order') or 0)}"
+                    ),
+                    "responsavel": "humano" if requires_approval else "agente",
+                    "setor": "Pipeline",
+                    "ferramentas": [r.get("specialty_slug")] if r.get("specialty_slug") else [],
+                    "slaHoras": None,
+                    "alertas": [],
+                    "proximo": [id_to_code.get(next_id)] if next_id and id_to_code.get(next_id) else [],
+                    "suppliers": [
+                        {
+                            "nome": "Etapa anterior",
+                            "tipo": "etapa_anterior",
+                            "referencia": wf.get("slug") or "workflow",
+                        }
+                    ],
+                    "inputs": [
+                        {
+                            "nome": "task.output_json",
+                            "tipo": "dado_estruturado",
+                            "formato": "jsonb",
+                            "obrigatorio": True,
+                            "canal": "database",
+                        }
+                    ],
+                    "outputs": [
+                        {
+                            "nome": "task.output_json",
+                            "tipo": "dado_estruturado",
+                            "formato": "jsonb",
+                            "destino": r.get("specialty_slug") or "pipeline",
+                            "canal": "database",
+                        }
+                    ],
+                    "customers": [
+                        {
+                            "nome": "Próxima etapa",
+                            "tipo": "etapa_seguinte",
+                            "referencia": id_to_code.get(next_id) if next_id else None,
+                        }
+                    ],
+                    "decisions": [
+                        {
+                            "condicao": "sucesso",
+                            "acao": "avança para próxima etapa",
+                            "proximoStep": id_to_code.get(next_id) if next_id else None,
+                        },
+                        {
+                            "condicao": "falha",
+                            "acao": f"on_failure_action={r.get('on_failure_action') or 'block'}",
+                        },
+                    ],
+                    "createdAt": r.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        return mapped
+    except Exception as e:
+        logger.warning(f"list_workflow_steps failed: {e}")
+        return []
+
+
+# ── helpers shared by POST / PUT ──────────────────────────────────────────────
+import re as _re_wf
+
+def _wf_slugify(name: str) -> str:
+    return _re_wf.sub(r"-{2,}", "-", _re_wf.sub(r"[^a-z0-9]+", "-", (name or "").lower())).strip("-") or "step"
+
+
+def _normalize_5w2h_payload(body: dict) -> dict:
+    """Normalise incoming payload so sipoc_meta always has a canonical fiveW2H dict.
+
+    Rules:
+    - If body already has ``fiveW2H`` (dict), use it as the base.
+    - Otherwise collect flat fields: what, why, who, where, when, how.
+    - howMuch: string → {"description": str}; dict → as-is; absent → {}
+      Also handles snake_case ``how_much`` as fallback when ``howMuch`` is absent.
+    - Returns a shallow copy of body with ``fiveW2H`` set (flat fields kept for
+      backward-compatibility during the transition window).
+    """
+    result = dict(body)
+
+    existing = body.get("fiveW2H")
+    if isinstance(existing, dict):
+        five = dict(existing)
+    else:
+        five = {
+            "what": body.get("what") or "",
+            "why": body.get("why") or "",
+            "who": body.get("who") or "",
+            "where": body.get("where") or "",
+            "when": body.get("when") or "",
+            "how": body.get("how") or "",
+        }
+
+    # Normalise howMuch -------------------------------------------------------
+    # Priority: fiveW2H.howMuch > flat howMuch > flat how_much
+    inner_how_much = five.get("howMuch")
+    flat_how_much = body.get("howMuch") or body.get("how_much")
+
+    if inner_how_much is None:
+        if isinstance(flat_how_much, dict):
+            five["howMuch"] = flat_how_much
+        elif isinstance(flat_how_much, str) and flat_how_much:
+            five["howMuch"] = {"description": flat_how_much}
+        else:
+            five["howMuch"] = {}
+    elif isinstance(inner_how_much, str):
+        # Coerce string inside fiveW2H to canonical dict form
+        five["howMuch"] = {"description": inner_how_much} if inner_how_much else {}
+    # else: already a dict — keep as-is
+
+    result["fiveW2H"] = five
+    return result
+
+
+def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
+    """Map a workflow_steps DB row → frontend SIPOC dict, preferring sipoc_meta when present."""
+    meta: dict = r.get("sipoc_meta") or {}
+    step_code = f"{(r.get('slug') or 'step').upper()}-{int(r.get('step_order') or 0)}"
+    next_id = r.get("on_success_step_id")
+    requires_approval = bool(r.get("requires_approval"))
+    if meta:
+        five = meta.get("fiveW2H") or {}
+        w_what  = five.get("what")  or meta.get("what")  or ""
+        w_why   = five.get("why")   or meta.get("why")   or ""
+        w_who   = five.get("who")   or meta.get("who")   or ""
+        w_where = five.get("where") or meta.get("where") or ""
+        w_when  = five.get("when")  or meta.get("when")  or ""
+        w_how   = five.get("how")   or meta.get("how")   or ""
+        raw_hm  = five.get("howMuch") or meta.get("howMuch") or {}
+        w_how_much = raw_hm if isinstance(raw_hm, dict) else ({"description": raw_hm} if raw_hm else {})
+        return {
+            "id": r.get("id"),
+            "companyId": company_id,
+            "stepCode": step_code,
+            "nome": meta.get("nome") or r.get("name") or "Etapa",
+            "descricao": meta.get("descricao") or "",
+            "responsavel": meta.get("responsavel") or ("humano" if requires_approval else "agente"),
+            "setor": meta.get("setor") or "Pipeline",
+            "ferramentas": meta.get("ferramentas") or ([r.get("specialty_slug")] if r.get("specialty_slug") else []),
+            "slaHoras": meta.get("slaHoras"),
+            "alertas": meta.get("alertas") or [],
+            "proximo": meta.get("proximo") or ([id_to_code.get(next_id)] if next_id and id_to_code.get(next_id) else []),
+            "suppliers": meta.get("suppliers") or [],
+            "inputs": meta.get("inputs") or [],
+            "outputs": meta.get("outputs") or [],
+            "customers": meta.get("customers") or [],
+            "decisions": meta.get("decisions") or "",
+            # flat legacy fields (kept for backward-compat)
+            "why": w_why,
+            "who": w_who,
+            "where": w_where,
+            "when": w_when,
+            "how": w_how,
+            "howMuch": w_how_much,
+            # canonical nested object
+            "fiveW2H": {
+                "what": w_what,
+                "why": w_why,
+                "who": w_who,
+                "where": w_where,
+                "when": w_when,
+                "how": w_how,
+                "howMuch": w_how_much,
+            },
+            "createdAt": r.get("created_at") or datetime.now(timezone.utc).isoformat(),
+        }
+    # legacy row without sipoc_meta
+    return {
+        "id": r.get("id"),
+        "companyId": company_id,
+        "stepCode": step_code,
+        "nome": r.get("name") or r.get("slug") or "Etapa",
+        "descricao": "",
+        "responsavel": "humano" if requires_approval else "agente",
+        "setor": "Pipeline",
+        "ferramentas": [r.get("specialty_slug")] if r.get("specialty_slug") else [],
+        "slaHoras": None,
+        "alertas": [],
+        "proximo": [id_to_code.get(next_id)] if next_id and id_to_code.get(next_id) else [],
+        "suppliers": [],
+        "inputs": [],
+        "outputs": [],
+        "customers": [],
+        "decisions": "",
+        "fiveW2H": {"what": "", "why": "", "who": "", "where": "", "when": "", "how": "", "howMuch": {}},
+        "createdAt": r.get("created_at") or datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _ensure_sipoc_workflow(client, company_id: str) -> str:
+    """Find or create a company-owned workflow_definition for SIPOC steps. Returns its id."""
+    res = (
+        client.table("workflow_definitions")
+        .select("id")
+        .eq("company_id", company_id)
+        .eq("slug", "sipoc-customizado")
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]["id"]
+    ins = client.table("workflow_definitions").insert({
+        "company_id": company_id,
+        "name": "SIPOC Customizado",
+        "slug": "sipoc-customizado",
+        "description": "Etapas SIPOC definidas pela empresa",
+        "is_active": True,
+    }).execute()
+    return ins.data[0]["id"]
+
+
+@app.post("/api/companies/{company_id}/workflow-steps")
+@app.post("/companies/{company_id}/workflow-steps")
+async def create_workflow_step(company_id: str, request: Request):
+    body = await request.json()
+    if not supabase:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        client = get_authenticated_client(request.state.token)
+        wf_id = _ensure_sipoc_workflow(client, company_id)
+
+        max_res = (
+            client.table("workflow_steps")
+            .select("step_order")
+            .eq("workflow_id", wf_id)
+            .order("step_order", desc=True)
+            .limit(1)
+            .execute()
+        )
+        next_order = (max_res.data[0]["step_order"] + 1) if max_res.data else 1
+
+        normalized = _normalize_5w2h_payload(body)
+        nome = normalized.get("nome") or "Etapa"
+        slug = _wf_slugify(nome)
+        requires_approval = normalized.get("responsavel") == "humano"
+        specialty_slug = (normalized.get("ferramentas") or [None])[0]
+
+        row = client.table("workflow_steps").insert({
+            "workflow_id": wf_id,
+            "step_order": next_order,
+            "name": nome,
+            "slug": slug,
+            "specialty_slug": specialty_slug,
+            "requires_approval": requires_approval,
+            "sipoc_meta": normalized,
+        }).execute().data[0]
+
+        return _sipoc_step_to_dict(row, company_id, {})
+    except Exception as e:
+        logger.error(f"create_workflow_step failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.put("/api/workflow-steps/{step_id}")
+@app.put("/workflow-steps/{step_id}")
+@app.patch("/api/workflow-steps/{step_id}")
+@app.patch("/workflow-steps/{step_id}")
+async def update_workflow_step(step_id: str, request: Request):
+    body = await request.json()
+    if not supabase:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        client = get_authenticated_client(request.state.token)
+        existing = client.table("workflow_steps").select("*").eq("id", step_id).single().execute()
+        row = existing.data
+        if not row:
+            raise HTTPException(404, "Workflow step not found")
+
+        normalized = _normalize_5w2h_payload(body)
+        nome = normalized.get("nome") or row.get("name") or "Etapa"
+        requires_approval = normalized.get("responsavel") == "humano"
+        specialty_slug = (normalized.get("ferramentas") or [None])[0]
+
+        updated = client.table("workflow_steps").update({
+            "name": nome,
+            "slug": _wf_slugify(nome),
+            "specialty_slug": specialty_slug,
+            "requires_approval": requires_approval,
+            "sipoc_meta": normalized,
+        }).eq("id", step_id).execute().data[0]
+
+        return _sipoc_step_to_dict(updated, body.get("companyId") or "", {})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"update_workflow_step failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/workflow-steps/{step_id}")
+@app.delete("/workflow-steps/{step_id}")
+async def delete_workflow_step(step_id: str, request: Request):
+    if not supabase:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        client = get_authenticated_client(request.state.token)
+        client.table("workflow_steps").delete().eq("id", step_id).execute()
+        return Response(status_code=204)
+    except Exception as e:
+        logger.error(f"delete_workflow_step failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/companies/{company_id}/hermes/whitelist")
+@app.get("/companies/{company_id}/hermes/whitelist")
+async def list_hermes_whitelist(request: Request, company_id: str):
+    """Returns all sender whitelist entries for the company."""
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("hermes_sender_whitelist")
+            .select("*")
+            .eq("company_id", company_id)
+            .order("created_at")
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"list_hermes_whitelist failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/companies/{company_id}/hermes/whitelist")
+@app.post("/companies/{company_id}/hermes/whitelist")
+async def create_hermes_whitelist_entry(request: Request, company_id: str):
+    """Adds an email address to the Hermes sender whitelist."""
+    if not supabase:
+        raise HTTPException(501, "mock_not_supported")
+    try:
+        body = await request.json()
+        email = (body.get("email") or "").strip().lower()
+        if not email:
+            raise HTTPException(400, "email_required")
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("hermes_sender_whitelist")
+            .insert({
+                "company_id": company_id,
+                "email": email,
+                "label": body.get("label") or None,
+                "is_active": body.get("isActive", True),
+            })
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(500, "insert_failed")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"create_hermes_whitelist_entry failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/companies/{company_id}/hermes/whitelist/{entry_id}")
+@app.patch("/companies/{company_id}/hermes/whitelist/{entry_id}")
+async def update_hermes_whitelist_entry(request: Request, company_id: str, entry_id: str):
+    """Updates label or is_active for a whitelist entry."""
+    if not supabase:
+        raise HTTPException(501, "mock_not_supported")
+    try:
+        body = await request.json()
+        updates: dict = {}
+        if "label" in body:
+            updates["label"] = body["label"]
+        if "isActive" in body:
+            updates["is_active"] = body["isActive"]
+        if not updates:
+            raise HTTPException(400, "no_fields_to_update")
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("hermes_sender_whitelist")
+            .update(updates)
+            .eq("id", entry_id)
+            .eq("company_id", company_id)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(404, "entry_not_found")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"update_hermes_whitelist_entry failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/companies/{company_id}/hermes/whitelist/{entry_id}")
+@app.delete("/companies/{company_id}/hermes/whitelist/{entry_id}")
+async def delete_hermes_whitelist_entry(request: Request, company_id: str, entry_id: str):
+    """Removes an email address from the whitelist."""
+    if not supabase:
+        raise HTTPException(501, "mock_not_supported")
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("hermes_sender_whitelist")
+            .delete()
+            .eq("id", entry_id)
+            .eq("company_id", company_id)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(404, "entry_not_found")
+        return {"deleted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_hermes_whitelist_entry failed: {e}")
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/agents/{agent_id}/adapter-config")
 @app.get("/agents/{agent_id}/adapter-config")
 async def get_agent_adapter_config(request: Request, agent_id: str):
@@ -2769,7 +3781,7 @@ async def get_agent_adapter_config(request: Request, agent_id: str):
         return row
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         client = get_authenticated_client(request.state.token)
         res = (
             client.table("agent_adapter_configs")
@@ -2829,7 +3841,7 @@ async def put_agent_adapter_config(
         return new_row
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         # service_role para mutação consistente; validações de tenant são explícitas.
         agent_row = (
             supabase.table("agents")
@@ -2913,7 +3925,7 @@ async def list_company_secrets(request: Request, company_id: str):
     if not supabase:
         return []
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         if caller_company and caller_company != company_id:
             raise HTTPException(status_code=403, detail="cross_company_forbidden")
         res = (
@@ -2947,7 +3959,7 @@ async def upsert_company_secret(request: Request, company_id: str, payload: Comp
     if not supabase:
         return {"name": payload.name, "created": True}
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         if caller_company and caller_company != company_id:
             raise HTTPException(status_code=403, detail="cross_company_forbidden")
         res = supabase.rpc(
@@ -2976,7 +3988,7 @@ class AgentExecutionSetupInput(BaseModel):
     isActive: Optional[bool] = True
 
     class Config:
-        allow_population_by_field_name = True
+        populate_by_name = True
         extra = "ignore"
 
     @validator("functionUrl", "authSecretRef", "authHeaderName", pre=True)
@@ -2992,7 +4004,7 @@ class TaskDispatchInput(BaseModel):
     attempt: int = 1
 
     class Config:
-        allow_population_by_field_name = True
+        populate_by_name = True
         extra = "ignore"
 
 
@@ -3006,7 +4018,7 @@ async def get_agent_execution_config(request: Request, agent_id: str):
         return row
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         client = get_authenticated_client(request.state.token)
         res = (
             client.table("agent_execution_configs")
@@ -3038,21 +4050,23 @@ async def get_agent_specialty_config(request: Request, agent_id: str):
         return row
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         client = get_authenticated_client(request.state.token)
         res = (
             client.table("agent_specialty_configs")
             .select("*")
             .eq("agent_id", agent_id)
-            .limit(1)
             .execute()
         )
         if not res.data:
-            return Response(status_code=204)
-        row = res.data[0]
-        if caller_company and row.get("company_id") and row.get("company_id") != caller_company:
-            raise HTTPException(status_code=403, detail="cross_company_forbidden")
-        return AgentSpecialtyConfig(**row).to_zod_dict()
+            return []
+        
+        configs = res.data
+        if caller_company:
+            # Filtragem básica de segurança se o RLS não for suficiente
+            configs = [c for c in configs if str(c.get("company_id")) == str(caller_company)]
+            
+        return [AgentSpecialtyConfig(**row).to_zod_dict() for row in configs]
     except HTTPException:
         raise
     except Exception as e:
@@ -3061,7 +4075,7 @@ async def get_agent_specialty_config(request: Request, agent_id: str):
 
 
 class SaveAgentSpecialtyConfigInput(BaseModel):
-    specialtyId: str
+    specialty_id: str
     values: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -3073,14 +4087,14 @@ async def put_agent_specialty_config(request: Request, agent_id: str, payload: S
         global MOCK_AGENT_SPECIALTY_CONFIGS
         existing = next((r for r in MOCK_AGENT_SPECIALTY_CONFIGS if r.get("agentId") == agent_id), None)
         if existing:
-            existing["specialtyId"] = payload.specialtyId
+            existing["specialtyId"] = payload.specialty_id
             existing["values"] = payload.values
             existing["updatedAt"] = now_iso.replace("+00:00", "Z")
             return existing
         new_row = {
             "id": f"asc_tmp_{int(datetime.now().timestamp())}",
             "agentId": agent_id,
-            "specialtyId": payload.specialtyId,
+            "specialtyId": payload.specialty_id,
             "values": payload.values,
             "updatedAt": now_iso.replace("+00:00", "Z"),
         }
@@ -3088,10 +4102,11 @@ async def put_agent_specialty_config(request: Request, agent_id: str, payload: S
         return new_row
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         agent_row = supabase.table("agents").select("id,company_id").eq("id", agent_id).limit(1).execute()
         if not agent_row.data:
             raise HTTPException(status_code=404, detail="agent_not_found")
+        
         agent_company = agent_row.data[0]["company_id"]
         if caller_company and str(agent_company) != str(caller_company):
             raise HTTPException(status_code=403, detail="cross_company_forbidden")
@@ -3099,20 +4114,58 @@ async def put_agent_specialty_config(request: Request, agent_id: str, payload: S
         row_payload = {
             "company_id": agent_company,
             "agent_id": agent_id,
-            "specialty_id": payload.specialtyId,
+            "specialty_id": payload.specialty_id,
             "values": payload.values,
             "updated_at": now_iso,
         }
+        
         res = (
             supabase.table("agent_specialty_configs")
-            .upsert(row_payload, on_conflict="agent_id")
+            .upsert(row_payload, on_conflict="agent_id,specialty_id")
             .execute()
         )
+        
+        if not res.data:
+            logger.error(f"put_agent_specialty_config: upsert returned no data for agent {agent_id}")
+            raise HTTPException(status_code=500, detail="database_upsert_failed")
+            
         return AgentSpecialtyConfig(**res.data[0]).to_zod_dict()
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"put_agent_specialty_config failed: {e}")
+        logger.error(f"put_agent_specialty_config failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/agents/{agent_id}/specialty-config/{specialty_id}")
+@app.delete("/agents/{agent_id}/specialty-config/{specialty_id}")
+async def delete_agent_specialty_config(request: Request, agent_id: str, specialty_id: str):
+    if not supabase:
+        global MOCK_AGENT_SPECIALTY_CONFIGS
+        MOCK_AGENT_SPECIALTY_CONFIGS[:] = [
+            r for r in MOCK_AGENT_SPECIALTY_CONFIGS 
+            if not (r.get("agentId") == agent_id and r.get("specialtyId") == specialty_id)
+        ]
+        return Response(status_code=204)
+
+    try:
+        caller_company = _resolve_company_id(request)
+        client = get_authenticated_client(request.state.token)
+        
+        # Validação de tenant
+        check = client.table("agent_specialty_configs").select("company_id").eq("agent_id", agent_id).eq("specialty_id", specialty_id).limit(1).execute()
+        if not check.data:
+            raise HTTPException(status_code=404, detail="specialty_config_not_found")
+        
+        if caller_company and str(check.data[0]["company_id"]) != str(caller_company):
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+
+        client.table("agent_specialty_configs").delete().eq("agent_id", agent_id).eq("specialty_id", specialty_id).execute()
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_agent_specialty_config failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3131,10 +4184,23 @@ def _decode_mime_words(s: str) -> str:
     decoded = []
     for part, enc in parts:
         if isinstance(part, bytes):
-            decoded.append(part.decode(enc or "utf-8", errors="replace"))
+            try:
+                decoded.append(part.decode(enc or "utf-8", errors="replace"))
+            except LookupError:
+                # Some providers send invalid labels like "unknown-8bit".
+                decoded.append(part.decode("utf-8", errors="replace"))
+            except Exception:
+                decoded.append(part.decode("latin-1", errors="replace"))
         else:
             decoded.append(part)
     return "".join(decoded)
+
+def _safe_charset(enc: str | None) -> str:
+    """Normalizes invalid charset labels emitted by some providers."""
+    enc_norm = (enc or "utf-8").strip().lower()
+    if enc_norm in {"unknown-8bit", "unknown_8bit", "x-unknown"}:
+        return "utf-8"
+    return enc_norm
 
 def _strip_html(text: str) -> str:
     text = html.unescape(text)
@@ -3209,17 +4275,17 @@ def _fetch_imap_emails(host: str, port: int, username: str, password: str, limit
                     if ct == "text/plain" and not part.get("Content-Disposition"):
                         payload = part.get_payload(decode=True)
                         if payload:
-                            body = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                            body = payload.decode(_safe_charset(part.get_content_charset()), errors="replace")
                             break
                     elif ct == "text/html" and not body:
                         payload = part.get_payload(decode=True)
                         if payload:
-                            body = _strip_html(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+                            body = _strip_html(payload.decode(_safe_charset(part.get_content_charset()), errors="replace"))
             else:
                 payload = msg.get_payload(decode=True)
                 if payload:
                     ct = msg.get_content_type()
-                    raw_body = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+                    raw_body = payload.decode(_safe_charset(msg.get_content_charset()), errors="replace")
                     body = _strip_html(raw_body) if ct == "text/html" else raw_body
 
             excerpt = body[:200].strip()
@@ -3241,37 +4307,146 @@ def _fetch_imap_emails(host: str, port: int, username: str, password: str, limit
         except Exception:
             pass
 
+def _resolve_vault_secret(company_id: str, name: str) -> str:
+    """Reads a decrypted vault secret via read_company_secret RPC (service role)."""
+    if not supabase:
+        return ""
+    try:
+        res = supabase.rpc(
+            "read_company_secret",
+            {"p_company_id": company_id, "p_name": name},
+        ).execute()
+        return res.data or ""
+    except Exception as e:
+        logger.warning(f"[vault] failed to resolve secret {name!r} for company {company_id}: {e}")
+        return ""
+
+
+def _resolve_field_value(value: str, company_id: str) -> str:
+    """If value is a 'secret:NAME' reference, resolves it from vault; otherwise returns as-is."""
+    if value and value.startswith("secret:"):
+        name = value[len("secret:"):].strip()
+        return _resolve_vault_secret(company_id, name)
+    return value
+
+
+def _resolve_imap_field(field_values: dict, *keys: str, default: str = "") -> str:
+    """Returns the first non-empty value found among the given key aliases."""
+    for k in keys:
+        v = field_values.get(k)
+        if v and str(v).strip():
+            return str(v).strip()
+    return default
+
+
+def _resolve_imap_port(field_values: dict) -> int:
+    raw = field_values.get("imap_port") or field_values.get("inbox_imap_port")
+    try:
+        return int(raw) if raw is not None else 993
+    except (ValueError, TypeError):
+        logger.warning(f"[inbox] invalid imap_port value {raw!r}, falling back to 993")
+        return 993
+
+
+def _compute_next_run_at(now_utc: datetime, cron_expr: str, tz_name: str) -> Optional[str]:
+    """
+    Computes next execution timestamp (UTC ISO) for a narrow cron subset:
+    - `M H * * *` (daily)
+    - `*/N * * * *` (every N minutes)
+    Returns None for unsupported/invalid expressions.
+    """
+    if not cron_expr:
+        return None
+    parts = cron_expr.strip().split()
+    if len(parts) != 5:
+        return None
+
+    minute_part, hour_part, day_part, month_part, weekday_part = parts
+    if day_part != "*" or month_part != "*" or weekday_part != "*":
+        return None
+
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except Exception:
+        tz = timezone.utc
+
+    local_now = now_utc.astimezone(tz)
+
+    # Pattern: */N * * * *
+    if minute_part.startswith("*/") and hour_part == "*":
+        try:
+            step = int(minute_part[2:])
+            if step <= 0:
+                return None
+            minute_bucket = (local_now.minute // step + 1) * step
+            next_local = local_now.replace(second=0, microsecond=0)
+            if minute_bucket >= 60:
+                next_local = (next_local + timedelta(hours=1)).replace(minute=0)
+            else:
+                next_local = next_local.replace(minute=minute_bucket)
+            return next_local.astimezone(timezone.utc).isoformat()
+        except Exception:
+            return None
+
+    # Pattern: M H * * *
+    try:
+        minute = int(minute_part)
+        hour = int(hour_part)
+    except Exception:
+        return None
+    if not (0 <= minute <= 59 and 0 <= hour <= 23):
+        return None
+
+    next_local = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if next_local <= local_now:
+        next_local = next_local + timedelta(days=1)
+    return next_local.astimezone(timezone.utc).isoformat()
+
+
 @app.get("/api/agents/{agent_id}/inbox")
 @app.get("/agents/{agent_id}/inbox")
 async def get_agent_inbox(request: Request, agent_id: str, limit: int = 20):
-    """Fetches recent emails for the agent via IMAP using its adapter config.
-    Falls back to an empty list if no adapter config is set."""
+    """Fetches recent emails via IMAP using the agent's adapter config.
+    Returns [] when no IMAP credentials are configured."""
     try:
+        company_id: str = ""
         if supabase:
             client = get_authenticated_client(request.state.token)
             res = (
                 client.table("agent_adapter_configs")
-                .select("field_values_json")
+                .select("field_values_json, company_id")
                 .eq("agent_id", agent_id)
                 .limit(1)
                 .execute()
             )
             if not res.data:
+                logger.debug(f"[inbox] no adapter config for agent {agent_id}")
                 return []
             field_values = res.data[0].get("field_values_json") or {}
+            company_id = res.data[0].get("company_id", "")
         else:
-            # Mock fallback: find in MOCK_ADAPTER_CONFIGS
-            cfg = next((c for c in MOCK_ADAPTER_CONFIGS if c.get("agentId") == agent_id), None)
+            cfg = next(
+                (c for c in MOCK_AGENT_ADAPTER_CONFIGS if c.get("agentId") == agent_id),
+                None,
+            )
             if not cfg:
+                logger.debug(f"[inbox] no mock config for agent {agent_id}")
                 return []
             field_values = cfg.get("fieldValuesJson") or {}
+            company_id = cfg.get("companyId", "")
 
-        host = str(field_values.get("imap_host", ""))
-        port = int(field_values.get("imap_port", 993))
-        username = str(field_values.get("email", ""))
-        password = str(field_values.get("password", ""))
+        # Accept both schema naming conventions: imap_* (adapter) and inbox_imap_* (specialty)
+        host = _resolve_imap_field(field_values, "imap_host", "inbox_imap_host")
+        port = _resolve_imap_port(field_values)
+        username = _resolve_imap_field(field_values, "email", "inbox_email")
+        raw_password = _resolve_imap_field(field_values, "password", "inbox_password")
+        password = _resolve_field_value(raw_password, company_id)
 
-        if not host or not username or not password:
+        if not host:
+            logger.debug(f"[inbox] agent {agent_id} has no IMAP host — not an email agent")
+            return []
+        if not username or not password:
+            logger.warning(f"[inbox] agent {agent_id} has IMAP host but missing email/password")
             return []
 
         loop = asyncio.get_event_loop()
@@ -3281,11 +4456,11 @@ async def get_agent_inbox(request: Request, agent_id: str, limit: int = 20):
         )
         return emails
     except imaplib.IMAP4.error as e:
-        logger.warning(f"IMAP error for agent {agent_id}: {e}")
-        raise HTTPException(status_code=502, detail=f"imap_error: {e}")
+        logger.warning(f"[inbox] IMAP protocol error for agent {agent_id}: {e}")
+        return []
     except Exception as e:
-        logger.error(f"get_agent_inbox failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[inbox] unexpected error for agent {agent_id}: {type(e).__name__}: {e}")
+        return []
 
 
 @app.put("/api/agents/{agent_id}/execution-setup")
@@ -3329,7 +4504,7 @@ async def put_agent_execution_setup(request: Request, agent_id: str, payload: Ag
         return new_row
 
     try:
-        caller_company = _request_company_id(request)
+        caller_company = _resolve_company_id(request)
         agent_row = (
             supabase.table("agents")
             .select("id,company_id")
@@ -3395,7 +4570,7 @@ def _dispatch_internal_authorized(request: Request) -> bool:
 async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
     started = datetime.now(timezone.utc)
     internal_ok = _dispatch_internal_authorized(request)
-    caller_company = _request_company_id(request)
+    caller_company = _resolve_company_id(request)
 
     if not internal_ok:
         # Modo dev/MVP: permite disparo autenticado como usuário, mas exige alinhamento de tenant.
@@ -3425,7 +4600,7 @@ async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
 
         task_res = (
             supabase.table("tasks")
-            .select("id,company_id,assigned_to_agent_id,title,status")
+            .select("id,company_id,assigned_to_agent_id,title,status,budget_limit,cost_usd,approved_at,approved_by_user_id")
             .eq("id", payload.taskId)
             .limit(1)
             .execute()
@@ -3437,6 +4612,7 @@ async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
         agent_id = task.get("assigned_to_agent_id")
         if not agent_id:
             raise HTTPException(status_code=400, detail="task_missing_assignee")
+        _enforce_task_execution_gates(task, source="dispatch")
 
         if not internal_ok:
             if not caller_company or caller_company != task_company:
@@ -3466,8 +4642,39 @@ async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
             .execute()
         )
         exec_row = exec_res.data[0] if exec_res.data else None
+        execution_mode = str((exec_row or {}).get("execution_mode") or "REALTIME").upper()
         function_url = (exec_row or {}).get("function_url")
         if not function_url:
+            # REALTIME agents are consumed by the daemon poller and do not require
+            # an HTTP function_url. For CRON/TRIGGER, keep requiring function_url.
+            if execution_mode == "REALTIME":
+                duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                _chronos_log_dispatch_event(
+                    {
+                        "event": "dispatch.realtime_noop",
+                        "reason": "realtime_poller",
+                        "companyId": task_company,
+                        "agentId": agent_id,
+                        "taskId": payload.taskId,
+                        "durationMs": duration_ms,
+                    }
+                )
+                response = {
+                    "ok": True,
+                    "dispatched": True,
+                    "mode": execution_mode,
+                    "reason": "realtime_poller",
+                }
+                if payload.idempotencyKey:
+                    cache = getattr(app.state, "dispatch_idempotency_cache", None)
+                    if isinstance(cache, dict):
+                        cache_key = f"{caller_company or 'internal'}:{payload.taskId}:{payload.idempotencyKey}"
+                        cache[cache_key] = {
+                            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
+                            "response": response,
+                        }
+                return response
+
             duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
             _chronos_log_dispatch_event(
                 {
@@ -3559,6 +4766,18 @@ async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
         logger.error(f"post_task_dispatch failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _assert_not_system_agent(client, agent_id: str) -> None:
+    """Raises 403 if the agent is a protected system agent."""
+    try:
+        res = client.table("agents").select("is_system").eq("id", agent_id).limit(1).execute()
+        if res.data and res.data[0].get("is_system"):
+            raise HTTPException(status_code=403, detail="system_agent_immutable")
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # on DB error, let the main operation surface its own error
+
+
 async def supabase_update_agent_status(token: str, agent_id: str, update: Union[str, Dict[str, Any]]):
     if isinstance(update, str):
         patch = {"status": update}
@@ -3595,19 +4814,53 @@ async def supabase_update_agent_status(token: str, agent_id: str, update: Union[
 @app.post("/api/agents/{agent_id}/pause")
 @app.post("/agents/{agent_id}/pause")
 async def pause_agent(agent_id: str, request: Request):
+    if supabase:
+        _assert_not_system_agent(get_authenticated_client(request.state.token), agent_id)
     return await supabase_update_agent_status(request.state.token, agent_id, AgentStatus.PAUSED)
 
 
 @app.post("/api/agents/{agent_id}/resume")
 @app.post("/agents/{agent_id}/resume")
 async def resume_agent(agent_id: str, request: Request):
+    if supabase:
+        _assert_not_system_agent(get_authenticated_client(request.state.token), agent_id)
     return await supabase_update_agent_status(request.state.token, agent_id, AgentStatus.IDLE)
 
 
 @app.post("/api/agents/{agent_id}/kill")
 @app.post("/agents/{agent_id}/kill")
 async def kill_agent(agent_id: str, request: Request):
+    if supabase:
+        _assert_not_system_agent(get_authenticated_client(request.state.token), agent_id)
     return await supabase_update_agent_status(request.state.token, agent_id, AgentStatus.OFFLINE)
+
+
+@app.post("/api/agents/{agent_id}/abort-task")
+@app.post("/agents/{agent_id}/abort-task")
+async def abort_agent_task(agent_id: str, request: Request):
+    """Cancela a task in_progress do agente sem matar o agente."""
+    if not supabase:
+        return {"aborted": 0, "agentId": agent_id}
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("tasks")
+            .update({"status": "blocked"})
+            .eq("agent_id", agent_id)
+            .eq("status", "in_progress")
+            .execute()
+        )
+        aborted = res.data or []
+        for row in aborted:
+            company_id = row.get("company_id")
+            if company_id:
+                await ws_manager.emit_task_updated(company_id, Task(**row).to_zod_dict())
+        logger.info(f"abort-task: {len(aborted)} task(s) abortada(s) para agente {agent_id}")
+        return {"aborted": len(aborted), "agentId": agent_id, "tasks": [t["id"] for t in aborted]}
+    except Exception as e:
+        logger.error(f"abort_agent_task failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.patch("/api/agents/{agent_id}")
@@ -3623,6 +4876,7 @@ async def patch_agent(agent_id: str, patch: AgentPatch, request: Request):
 
     try:
         client = get_authenticated_client(request.state.token)
+        _assert_not_system_agent(client, agent_id)
         res = client.table("agents").update(payload).eq("id", agent_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Target Agent Not Found")
@@ -3654,9 +4908,11 @@ async def delete_agent(agent_id: str, request: Request):
 
     try:
         client = get_authenticated_client(request.state.token)
-        check = client.table("agents").select("id,company_id").eq("id", agent_id).execute()
+        check = client.table("agents").select("id,company_id,is_system").eq("id", agent_id).execute()
         if not check.data:
             raise HTTPException(status_code=404, detail="Target Agent Not Found")
+        if check.data[0].get("is_system"):
+            raise HTTPException(status_code=403, detail="system_agent_immutable")
         company_id = check.data[0].get("company_id")
         client.table("agents").delete().eq("id", agent_id).execute()
         if company_id:
@@ -3768,6 +5024,16 @@ async def claim_task(request: Request, task_id: str):
     if not supabase: return MOCK_TASKS[0]
     try:
         client = get_authenticated_client(request.state.token)
+        current = (
+            client.table("tasks")
+            .select("id,company_id,assigned_to_agent_id,status,budget_limit,cost_usd,approved_at,approved_by_user_id")
+            .eq("id", task_id)
+            .limit(1)
+            .execute()
+        )
+        if not current.data:
+            raise HTTPException(404, "Target Task Not Found")
+        _enforce_task_execution_gates(current.data[0], source="claim")
         res = client.table("tasks").update({
             "status": "in_progress",
             "claimed_at": datetime.now(timezone.utc).isoformat(),
@@ -4096,7 +5362,7 @@ async def _set_approval_status(request: Request, approval_id: str, status: str) 
         raise
     except PostgrestAPIError as e:
         if e.code == "PGRST205":
-            logger.warning("vectraclip.approvals missing on update; using mock approvals")
+            logger.debug("vectraclip.approvals missing on update; using mock approvals")
             return _mock_set_approval_status(approval_id, status)
         raise HTTPException(500, str(e))
     except Exception as e:
@@ -4177,6 +5443,7 @@ async def health_check():
 
 
 @app.websocket("/ws/companies/{company_id}")
+@app.websocket("/api/ws/companies/{company_id}")
 async def websocket_companies(
     websocket: WebSocket,
     company_id: str,
@@ -4188,9 +5455,18 @@ async def websocket_companies(
     if token:
         try:
             claims = validate_supabase_jwt(token)
-            token_company = claims.get("company_id") or claims.get(
-                "user_metadata", {}
-            ).get("company_id")
+            if claims:
+                token_company = (
+                    claims.get("company_id")
+                    or claims.get("user_metadata", {}).get("company_id")
+                    or claims.get("app_metadata", {})
+                    .get("vectraclip", {})
+                    .get("company_id")
+                )
+            else:
+                # Fallback local para evitar falso-negativo de WS quando houver
+                # oscilação na validação via JWKS. Mantém guard de company.
+                token_company = (_extract_vectraclip_claims(token) or {}).get("company_id")
             if token_company and token_company != company_id:
                 await websocket.close(code=4001, reason="company_mismatch")
                 return
@@ -4703,7 +5979,7 @@ async def list_agent_specialties(request: Request):
     try:
         res = (
             supabase.table("agent_specialties")
-            .select("id,name,slug,domain,description,compatible_roles,system_prompt_template,is_active")
+            .select("id,name,slug,domain,description,compatible_roles,system_prompt_template,config_schema,is_active")
             .eq("is_active", True)
             .order("name")
             .execute()
@@ -4723,6 +5999,7 @@ class AgentSpecialtyInput(BaseModel):
     description: str = ""
     compatibleRoles: List[str] = Field(default_factory=list)
     systemPromptTemplate: str = ""
+    configSchema: Optional[Dict[str, Any]] = None
 
 
 @app.post("/api/agent-specialties")
@@ -4738,6 +6015,7 @@ async def create_agent_specialty(request: Request, payload: AgentSpecialtyInput)
             "description": payload.description,
             "compatible_roles": payload.compatibleRoles,
             "system_prompt_template": payload.systemPromptTemplate,
+            "config_schema": payload.configSchema,
             "is_active": True,
         }
         MOCK_AGENT_SPECIALTIES.append(new_sp)
@@ -4752,6 +6030,7 @@ async def create_agent_specialty(request: Request, payload: AgentSpecialtyInput)
             "description": payload.description,
             "compatible_roles": payload.compatibleRoles,
             "system_prompt_template": payload.systemPromptTemplate,
+            "config_schema": payload.configSchema,
             "is_active": True,
             "created_at": now_iso,
         }
@@ -4780,6 +6059,7 @@ async def patch_agent_specialty(request: Request, specialty_id: str, payload: Di
         if "description" in payload: update_data["description"] = payload["description"]
         if "compatibleRoles" in payload: update_data["compatible_roles"] = payload["compatibleRoles"]
         if "systemPromptTemplate" in payload: update_data["system_prompt_template"] = payload["systemPromptTemplate"]
+        if "configSchema" in payload: update_data["config_schema"] = payload["configSchema"]
         if "isActive" in payload: update_data["is_active"] = payload["isActive"]
         if not update_data:
             raise HTTPException(status_code=400, detail="no_fields_to_update")
@@ -4834,7 +6114,7 @@ async def execute_task_endpoint(task_id: str, body: ExecuteTaskRequest, request:
     try:
         res = (
             supabase.table("tasks")
-            .select("id,title,description,operation_type,budget_limit,company_id,assigned_to_agent_id,status,executor_type")
+            .select("id,title,description,operation_type,budget_limit,cost_usd,approved_at,approved_by_user_id,company_id,assigned_to_agent_id,status,executor_type")
             .eq("id", task_id)
             .single()
             .execute()
@@ -4848,6 +6128,7 @@ async def execute_task_endpoint(task_id: str, body: ExecuteTaskRequest, request:
 
     if task.get("status") == "in_progress":
         raise HTTPException(status_code=409, detail="Task já está em execução")
+    _enforce_task_execution_gates(task, source="execute")
 
     try:
         result = await route_task_execution(
@@ -4862,6 +6143,170 @@ async def execute_task_endpoint(task_id: str, body: ExecuteTaskRequest, request:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# VEC-237-G  Plutus approval gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ApproveTaskBody(BaseModel):
+    approved_by_user_id: Optional[str] = None
+
+
+@app.post("/api/tasks/{task_id}/approve")
+async def approve_task(task_id: str, request: Request, body: ApproveTaskBody = ApproveTaskBody()):
+    """
+    Sets approved_at + approved_by_user_id on a task in status=review.
+    Plutus daemon picks it up on the next tick and executes step 3 (insert_quote).
+    """
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase não disponível")
+
+    try:
+        res = (
+            supabase.table("tasks")
+            .select("id, status, company_id, operation_type, output_json")
+            .eq("id", task_id)
+            .single()
+            .execute()
+        )
+        task = res.data
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Task não encontrada: {e}")
+
+    if task.get("status") not in ("review", "blocked"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task não está em review. Status atual: {task.get('status')}",
+        )
+
+    user_payload = getattr(request.state, "user", {}) or {}
+    approver_id = (
+        body.approved_by_user_id
+        or user_payload.get("sub")
+        or user_payload.get("id")
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    operation_type = task.get("operation_type") or ""
+    output_json = task.get("output_json") or {}
+    update_payload = {
+        "approved_at": now_iso,
+        "approved_by_user_id": approver_id,
+        "status": "queued",  # default behavior keeps existing Plutus flow
+        "updated_at": now_iso,
+    }
+
+    # Mercator gate: human approves truck suggestion, then routes to Hodos stage.
+    if operation_type == "freight-quotation-approval":
+        briefing = (output_json.get("briefing") or {}) if isinstance(output_json, dict) else {}
+        suggestion = (briefing.get("vehicle_suggestion") or {}) if isinstance(briefing, dict) else {}
+        if isinstance(suggestion, dict):
+            suggestion["approval_status"] = "approved"
+            suggestion["approved_at"] = now_iso
+            suggestion["approved_by_user_id"] = approver_id
+            briefing["vehicle_suggestion"] = suggestion
+            output_json["briefing"] = briefing
+        update_payload.update(
+            {
+                "status": "review",
+                "operation_type": "route-cost-calculation",
+                "output_json": output_json,
+            }
+        )
+
+    try:
+        updated = (
+            supabase.table("tasks")
+            .update(update_payload)
+            .eq("id", task_id)
+            .execute()
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao aprovar task: {e}")
+
+    company_id = task.get("company_id", "")
+    try:
+        from src.models import Task as TaskModel
+        task_payload = TaskModel(**updated.data[0]).to_zod_dict()
+        ws_manager.broadcast_nowait(
+            company_id,
+            {"type": "task_updated", "payload": task_payload},
+        )
+    except Exception:
+        pass
+
+    return {"approved": True, "task_id": task_id, "approved_by": approver_id}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VEC-237-I  Workflow CRUD
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/companies/{company_id}/workflows")
+async def list_workflows(company_id: str, request: Request):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase não disponível")
+    res = (
+        supabase.table("workflow_definitions")
+        .select("*")
+        .or_(f"company_id.eq.{company_id},company_id.is.null")
+        .eq("is_active", True)
+        .execute()
+    )
+    return res.data or []
+
+
+@app.get("/api/workflows/{workflow_id}/steps")
+async def list_workflow_steps(workflow_id: str, request: Request):
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Supabase não disponível")
+    res = (
+        supabase.table("workflow_steps")
+        .select("*")
+        .eq("workflow_id", workflow_id)
+        .order("step_order")
+        .execute()
+    )
+    return res.data or []
+
+
 if __name__ == "__main__":
     import uvicorn  # pyright: ignore[reportMissingImports]
     uvicorn.run(app, host="0.0.0.0", port=3000)
+
+
+
+from fastapi.responses import StreamingResponse
+import json
+import asyncio
+from fastapi import Request, HTTPException
+
+@app.post("/api/workflow/run-orchestrator")
+async def run_flow_orchestrator(request: Request):
+    try:
+        from src.services.flow_orchestrator import build_orchestrator
+        from langchain_core.messages import HumanMessage
+    except ImportError:
+        raise HTTPException(status_code=500, detail="LangGraph engine not installed or built.")
+        
+    data = await request.json()
+    prompt = data.get("prompt", "Inicie o fluxo base.")
+    
+    app_orchestrator = build_orchestrator()
+    initial_state = {
+        "messages": [HumanMessage(content=prompt)],
+        "context_data": {},
+        "iteration_count": 0,
+        "current_node": "supervisor"
+    }
+    
+    async def event_generator():
+        # Transmite os eventos passo a passo usando Server-Sent Events (SSE)
+        for output in app_orchestrator.stream(initial_state):
+            for key, value in output.items():
+                event_data = {"node": key, "message": f"Nó Concluído: {key}"}
+                yield f"data: {json.dumps(event_data)}\n\n"
+                await asyncio.sleep(0.5)
+        yield "data: {\"node\": \"END\", \"message\": \"Fluxo Finalizado\"}\n\n"
+        
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
