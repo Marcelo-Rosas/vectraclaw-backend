@@ -2,7 +2,8 @@ import os
 import time
 import logging
 import traceback
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
 
 from .runtime import PortRuntime
 
@@ -71,6 +72,39 @@ class ResilientHarnessDaemon:
             logger.warning(f"fetch_next_task failed: {e}")
             return None
 
+    def _get_matching_specialty_id(self, operation_type: str) -> Optional[str]:
+        """
+        VEC-326: Resolve qual especialidade do agente deve ser usada para esta task.
+        Busca uma specialty cujo slug ou ID dê match com o operation_type da task.
+        """
+        client = self._get_supabase()
+        if not client or not self.agent_id or not operation_type:
+            return None
+        
+        try:
+            # Busca todas as especialidades configuradas para este agente
+            res = (
+                client.table("agent_specialty_configs")
+                .select("specialty_id, agent_specialties(slug)")
+                .eq("agent_id", self.agent_id)
+                .execute()
+            )
+            
+            for row in res.data:
+                spec_id = row.get("specialty_id")
+                # agent_specialties é um join (lista ou objeto dependendo do postgrest)
+                spec_data = row.get("agent_specialties")
+                spec_slug = spec_data.get("slug") if spec_data else None
+                
+                # Match exato por ID ou Slug
+                if operation_type in [spec_id, spec_slug]:
+                    return spec_id
+            
+            return None
+        except Exception as e:
+            logger.warning(f"_get_matching_specialty_id failed: {e}")
+            return None
+
     def _claim_task(self, task_id: str) -> bool:
         """Marca a task como in_progress atomicamente."""
         client = self._get_supabase()
@@ -99,10 +133,10 @@ class ResilientHarnessDaemon:
         except Exception as e:
             logger.warning(f"_complete_task failed task={task_id}: {e}")
 
-    def execute_task(self, prompt: str):
-        logger.info(f"Ordem Recebida: {prompt}")
+    def execute_task(self, prompt: str, specialty_id: Optional[str] = None):
+        logger.info(f"Ordem Recebida: {prompt} (Specialty: {specialty_id or 'default'})")
         try:
-            # Reutiliza o roteador estrito do claw-code (turn-loop)
+            # TODO: No M4, injetaremos a specialty_id no Runtime para carregar tools específicas
             results = self.runtime.run_turn_loop(
                 prompt,
                 limit=int(os.getenv("DAEMON_TASK_RESULT_LIMIT", "5")),
@@ -116,33 +150,53 @@ class ResilientHarnessDaemon:
             logger.info("Tarefa processada e resolvida com sucesso.")
             
         except Exception:
-             # O Agente não pode "capotar" por causa de alucinação ou erros de infraestrutura
              logger.error(f"Erro catastrófico da sub-task interceptado. Stack: {traceback.format_exc()}")
              logger.warning("Falha isolada! O agente reportará erro ao banco mas o Daemon continuará vivo.")
 
     def check_and_trigger_routines(self):
-        """
-        VEC-242: Verifica se há rotinas agendadas para agora (Trigger Engine).
-        """
-        # No M1, apenas logamos o check. No M4, integraremos com APScheduler ou Cron.
-        logger.debug("Trigger Engine: Checking scheduled routines...")
+        """VEC-242: Verifica se há rotinas agendadas para agora."""
         pass
+
+    def _recover_stale_tasks(self) -> None:
+        """Na inicialização, reseta tasks in_progress deixadas por crashes anteriores."""
+        client = self._get_supabase()
+        if not client or not self.agent_id:
+            return
+        try:
+            res = (
+                client.table("tasks")
+                .update({"status": "queued"})
+                .eq("assigned_to_agent_id", self.agent_id)
+                .eq("status", "in_progress")
+                .execute()
+            )
+            recovered = len(res.data or [])
+            if recovered:
+                logger.warning(f"Recovery: {recovered} task(s) in_progress resetada(s) para queued")
+        except Exception as e:
+            logger.warning(f"_recover_stale_tasks failed: {e}")
 
     def run_forever(self):
         self.is_running = True
         logger.info("=== Inicializando Vectra Claw Agent Engine ===")
         logger.info(f"agent_id={self.agent_id or 'não configurado'} polling={self.polling_interval}s")
+        self._recover_stale_tasks()
 
         while self.is_running:
             try:
                 task = self.fetch_next_task()
                 if task:
                     task_id = task["id"]
+                    op_type = task.get("operation_type", "other")
+                    
                     if self._claim_task(task_id):
-                        prompt = f"[{task.get('operation_type','other')}] {task['title']}\n\n{task.get('description','')}"
+                        # VEC-326: Tenta achar a especialidade correta para esta task
+                        specialty_id = self._get_matching_specialty_id(op_type)
+                        
+                        prompt = f"[{op_type}] {task['title']}\n\n{task.get('description','')}"
                         success = False
                         try:
-                            self.execute_task(prompt)
+                            self.execute_task(prompt, specialty_id=specialty_id)
                             success = True
                         finally:
                             self._complete_task(task_id, success)

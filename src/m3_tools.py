@@ -6,19 +6,26 @@ import urllib.error
 logger = logging.getLogger("M3_Logistics_Tools")
 
 def calculate_cbm(payload_json: str) -> str:
-    """Calcula o Cubo Metragem (CBM) com exatidão matemática."""
+    """Calcula o Cubo Metragem (CBM) com exatidão matemática, usando o novo motor de cubagem."""
     try:
+        from src.services.freight.calculator import calculate_freight_cubage, CubageRequest
         data = json.loads(payload_json)
-        # Se os dados vierem em cm, divide por 100
-        length = float(data.get("length_cm", 0)) / 100
-        width = float(data.get("width_cm", 0)) / 100
-        height = float(data.get("height_cm", 0)) / 100
-        quantity = int(data.get("quantity", 1))
-        
-        cbm = length * width * height * quantity
-        result = {"success": True, "cbm_total": round(cbm, 4), "items": quantity}
-        logger.info(f"CBM Calculado: {cbm}")
-        return json.dumps(result)
+        req = CubageRequest(**data)
+        res = calculate_freight_cubage(req)
+        logger.info(f"Cubagem Calculada: {res.total_volume_m3} m3, Taxável: {res.total_taxable_weight_kg}")
+        return res.model_dump_json()
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+def infer_vehicle_capacity(payload_json: str) -> str:
+    """Infere a capacidade de carga baseando-se no tipo de veículo (Cavalo Mecânico, etc)."""
+    try:
+        from src.services.freight.calculator import calculate_vehicle_capacity, VehicleCapacityRequest
+        data = json.loads(payload_json)
+        req = VehicleCapacityRequest(**data)
+        res = calculate_vehicle_capacity(req)
+        logger.info(f"Capacidade Inferida: max_payload={res.max_payload_kg}")
+        return res.model_dump_json()
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
 
@@ -141,6 +148,7 @@ def send_whatsapp_webhook(payload_json: str) -> str:
 # Mapping dictionary for dynamic dispatch
 TOOLS_REGISTRY = {
     "calculate_cbm": calculate_cbm,
+    "infer_vehicle_capacity": infer_vehicle_capacity,
     "extract_bl_pl": extract_bl_pl,
     "send_whatsapp_webhook": send_whatsapp_webhook
 }

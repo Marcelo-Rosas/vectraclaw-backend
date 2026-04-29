@@ -12,7 +12,7 @@ def to_camel(string: str) -> str:
 class CamelModel(BaseModel):
     class Config:
         alias_generator = to_camel
-        allow_population_by_field_name = True
+        validate_by_name = True  # pydantic v2.13+ (replaces allow_population_by_field_name)
 
 class Agent(CamelModel):
     id: str
@@ -28,6 +28,7 @@ class Agent(CamelModel):
     system_prompt: Optional[str] = None
     requires_approval: bool = False
     platform_url: Optional[str] = None
+    is_system: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -85,6 +86,14 @@ class Task(CamelModel):
         "research",
         "document_generation",
         "qa_testing",
+        "email_lead",
+        "freight-quotation",
+        "freight-quotation-approval",
+        "route-cost-calculation",
+        "crm-fill-precheck",
+        "crm-fill-finalize",
+        "crm-fill",
+        "oracle-research",
         "other",
     ] = "other"
     budget_limit: int
@@ -645,6 +654,50 @@ class SipocComponent(CamelModel):
     metadata: Dict[str, Any] = {}
     created_at: datetime
     updated_at: datetime
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+
+class Project(CamelModel):
+    id: str
+    company_id: str
+    name: str
+    mission: Optional[str] = None
+    status: str = "backlog"
+    lead_agent_id: Optional[str] = None
+    target_date: Optional[str] = None
+    issue_completion_pct: int = 0
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+
+class Run(CamelModel):
+    id: str
+    company_id: str
+    agent_id: Optional[str] = None
+    status: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    trigger: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+
+class RunTranscriptEntry(CamelModel):
+    id: str
+    run_id: str
+    role: Optional[str] = None
+    content: Optional[str] = None
+    tool_name: Optional[str] = None
+    tool_input: Optional[Dict[str, Any]] = None
+    tool_output: Optional[str] = None
+    created_at: Optional[datetime] = None
 
     def to_zod_dict(self):
         return self.dict(by_alias=True)
