@@ -134,12 +134,6 @@ fuser -k 8000/tcp
 lsof -ti:8000 | xargs kill -9
 ```
 
-### Reiniciar Watchdog
-Se o processo de monitoramento cair:
-```bash
-python server_watchdog.py
-```
-
 List the current Python modules:
 
 ```bash
