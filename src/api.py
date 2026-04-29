@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Literal, Union
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+import httpx
 import requests
 from jose import jwt  # pyright: ignore[reportMissingModuleSource]
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query, UploadFile, File  # pyright: ignore[reportMissingImports]
@@ -3419,6 +3420,75 @@ async def list_workflow_steps(request: Request, company_id: str):
 
 # ── helpers shared by POST / PUT ──────────────────────────────────────────────
 import re as _re_wf
+import json as _json_wf
+
+
+async def _call_llm_sipoc_element(element: str, step_context: dict, locked: dict) -> list:
+    """Chama Claude Haiku para sugerir itens de um elemento SIPOC."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return []
+
+    # Constrói contexto acumulado
+    five = step_context.get("fiveW2H", {})
+    ctx_lines = [
+        f"Step: {step_context.get('nome', '')}",
+        f"Descrição: {step_context.get('descricao', '')}",
+        f"O quê (what): {five.get('what', '')}",
+        f"Por quê (why): {five.get('why', '')}",
+        f"Quem (who): {five.get('who', '')}",
+        f"Onde (where): {five.get('where', '')}",
+        f"Quando (when): {five.get('when', '')}",
+        f"Como (how): {five.get('how', '')}",
+    ]
+    if locked.get("suppliers"):
+        ctx_lines.append(f"Fornecedores aceitos: {_json_wf.dumps(locked['suppliers'], ensure_ascii=False)}")
+    if locked.get("inputs"):
+        ctx_lines.append(f"Entradas aceitas: {_json_wf.dumps(locked['inputs'], ensure_ascii=False)}")
+    if locked.get("outputs"):
+        ctx_lines.append(f"Saídas aceitas: {_json_wf.dumps(locked['outputs'], ensure_ascii=False)}")
+
+    element_instructions = {
+        "suppliers": "Sugira os FORNECEDORES (S do SIPOC): quem ou o que fornece insumos para este step. Retorne JSON array com objetos {nome, tipo ('agente'|'humano'|'sistema_externo'|'etapa_anterior'), referencia}.",
+        "inputs": "Sugira as ENTRADAS (I do SIPOC): dados, arquivos ou eventos que chegam neste step. Retorne JSON array com objetos {nome, tipo ('arquivo'|'dado_estruturado'|'evento'|'confirmacao_humana'), formato, obrigatorio (bool), canal ('database'|'email'|'api'|'webhook'|'filesystem'|'upload'|'manual'|'whatsapp'|'ui'|'siscomex'), canalDetalhe}.",
+        "outputs": "Sugira as SAÍDAS (O do SIPOC): o que este step produz. Retorne JSON array com objetos {nome, tipo ('arquivo'|'dado_estruturado'|'notificacao'|'confirmacao'), formato, destino, canal, canalDetalhe}.",
+        "customers": "Sugira os CLIENTES (C do SIPOC): quem ou o que consome as saídas deste step. Retorne JSON array com objetos {nome, tipo ('etapa_seguinte'|'humano'|'sistema_externo'|'cliente_final'), referencia, canalAprovacao}.",
+    }
+
+    system = "Você é um especialista em SIPOC (Suppliers, Inputs, Process, Outputs, Customers) para processos de automação empresarial. Responda SOMENTE com JSON válido, sem markdown, sem explicações."
+    user_msg = "\n".join(ctx_lines) + "\n\n" + element_instructions.get(element, "")
+
+    try:
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 1024,
+                    "system": system,
+                    "messages": [{"role": "user", "content": user_msg}],
+                },
+                timeout=30.0,
+            )
+        if resp.status_code != 200:
+            logger.error(f"suggest_sipoc_element LLM error: {resp.text}")
+            return []
+        content = resp.json()["content"][0]["text"].strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.rsplit("```", 1)[0].strip()
+        return _json_wf.loads(content)
+    except Exception as e:
+        logger.error(f"suggest_sipoc_element failed: {e}")
+        return []
+
 
 def _wf_slugify(name: str) -> str:
     return _re_wf.sub(r"-{2,}", "-", _re_wf.sub(r"[^a-z0-9]+", "-", (name or "").lower())).strip("-") or "step"
@@ -3702,6 +3772,19 @@ async def delete_workflow_step(step_id: str, request: Request):
     except Exception as e:
         logger.error(f"delete_workflow_step failed: {e}")
         raise HTTPException(500, str(e))
+
+
+@app.post("/api/workflow-steps/suggest-sipoc-element")
+@app.post("/workflow-steps/suggest-sipoc-element")
+async def suggest_sipoc_element(request: Request):
+    body = await request.json()
+    element = body.get("element")
+    if element not in ("suppliers", "inputs", "outputs", "customers"):
+        raise HTTPException(400, "element must be suppliers|inputs|outputs|customers")
+    step_context = body.get("step_context", {})
+    locked = body.get("locked", {})
+    suggestions = await _call_llm_sipoc_element(element, step_context, locked)
+    return {"element": element, "suggestions": suggestions}
 
 
 @app.get("/api/companies/{company_id}/hermes/whitelist")
