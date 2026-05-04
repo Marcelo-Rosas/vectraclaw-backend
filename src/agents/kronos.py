@@ -1246,6 +1246,163 @@ def entrypoint(task: dict, supabase_client: Any) -> dict:
     }
 
 
+def entrypoint_backlog(task: dict, supabase_client: Any) -> dict:
+    """
+    Entrypoint para operation_type='conciliacao-backlog'.
+
+    Modo 1 (primeira execução — output_json.phase ausente):
+      - Scrape MPF via kronos_scrape.scrape_pendentes()
+      - Lê OFX via scan_ofx_directory()
+      - Reconcilia via reconcile()
+      - Envia relatório via dispatch_to_hermes_reporter()
+      - Retorna {"status_override": "review", "output_json": {"phase": "await_approval", ...}}
+
+    Modo 2 (retomada — output_json.phase == "await_approval"):
+      - Lê matches de task["output_json"]["matches"]
+      - Filtra por input_json["approved_items"] se presente (senão aplica todos)
+      - Aplica baixas via kronos_apply.apply_baixa()
+      - Retorna {"output_json": {"phase": "baixas_applied", ...}}
+    """
+    input_json = task.get("input_json") or {}
+    desc = task.get("description", "")
+
+    ofx_path       = input_json.get("ofx_path")       or _parse_env_line(desc, "OFX_PATH")
+    periodo_inicio = input_json.get("periodo_inicio")  or _parse_env_line(desc, "PERIODO_INICIO")
+    periodo_fim    = input_json.get("periodo_fim")     or _parse_env_line(desc, "PERIODO_FIM")
+    recipient      = input_json.get("recipient")       or _parse_env_line(desc, "RECIPIENT", DEFAULT_RECIPIENT)
+    task_id        = task.get("id", "unknown")
+    company_id     = task.get("company_id", "")
+
+    # Detecção de modo
+    current_output = task.get("output_json") or {}
+    phase = current_output.get("phase")
+    is_resume = (phase == "await_approval")
+
+    # ── Modo 2: retomada após review ─────────────────────────────────────────
+    if is_resume:
+        all_matches = current_output.get("matches", [])
+        approved_items = input_json.get("approved_items")  # list[str] ou None
+        if approved_items:
+            matches_to_apply = [
+                m for m in all_matches
+                if m.get("planner_descricao") in approved_items
+            ]
+        else:
+            matches_to_apply = all_matches
+
+        try:
+            from src.agents.kronos_apply import apply_baixa
+            apply_result = apply_baixa(matches_to_apply)
+        except ImportError:
+            logger.error("entrypoint_backlog: kronos_apply não disponível")
+            return {"status": "errored", "error": "kronos_apply não disponível"}
+        except Exception as e:
+            logger.error("entrypoint_backlog: apply_baixa falhou — %s", e)
+            return {"status": "errored", "error": f"apply_baixa falhou: {e}"}
+
+        return {
+            "output_json": {
+                "phase": "baixas_applied",
+                "total_aplicados": len(apply_result.get("confirmados", [])),
+                "confirmados": apply_result.get("confirmados", []),
+                "nao_encontrados": apply_result.get("nao_encontrados", []),
+                "erros": apply_result.get("erros", []),
+            }
+        }
+
+    # ── Modo 1: primeira execução ─────────────────────────────────────────────
+
+    # Validações obrigatórias
+    if not ofx_path:
+        msg = "entrypoint_backlog: OFX_PATH ausente"
+        logger.error(msg)
+        return {"status": "errored", "error": msg}
+
+    if not periodo_inicio or not periodo_fim:
+        msg = "entrypoint_backlog: PERIODO_INICIO e/ou PERIODO_FIM ausentes"
+        logger.error(msg)
+        return {"status": "errored", "error": msg}
+
+    # 1. Scrape MPF
+    try:
+        from src.agents.kronos_scrape import scrape_pendentes
+        pendentes = scrape_pendentes(periodo_inicio, periodo_fim)
+    except ImportError:
+        logger.error("entrypoint_backlog: kronos_scrape não disponível — playwright instalado?")
+        return {"status": "errored", "error": "kronos_scrape não disponível"}
+    except Exception as e:
+        logger.error("entrypoint_backlog: scrape_pendentes falhou — %s", e)
+        return {"status": "errored", "error": f"scrape_pendentes falhou: {e}"}
+
+    if len(pendentes) == 0:
+        logger.warning("entrypoint_backlog: nenhum pendente retornado pelo scrape — período pode estar vazio")
+
+    # 2. Converte pendentes para PlannerEntry
+    from datetime import datetime as _dt
+    from decimal import Decimal as _D
+    planner_entries = []
+    for p in pendentes:
+        try:
+            planner_entries.append(PlannerEntry(
+                data=_dt.strptime(p["data"], "%Y-%m-%d").date(),
+                descricao=p.get("descricao", ""),
+                valor=_D(str(p.get("valor", "0"))),
+                tipo="despesa",
+                categoria=p.get("categoria"),
+                subcategoria=p.get("subcategoria"),
+                raw_row=p,
+            ))
+        except Exception as exc:
+            logger.warning("entrypoint_backlog: ignorando pendente inválido: %s — %s", p, exc)
+
+    # 3. Lê OFX
+    try:
+        ofx_txns = scan_ofx_directory(ofx_path, inicio=periodo_inicio, fim=periodo_fim)
+    except Exception as e:
+        logger.error("entrypoint_backlog: scan_ofx_directory falhou — %s", e)
+        return {"status": "errored", "error": f"scan_ofx_directory falhou: {e}"}
+
+    if len(ofx_txns) == 0:
+        msg = "entrypoint_backlog: nenhuma transação OFX encontrada no período"
+        logger.error(msg)
+        return {"status": "errored", "error": msg}
+
+    # 4. Carrega regras e reconcilia
+    db_rules = load_rules_from_db(supabase_client) if supabase_client else None
+    report = reconcile(ofx_txns, planner_entries, tolerance_days=10, db_rules=db_rules)
+
+    # 5. Formata e persiste
+    report_md = format_report_markdown(report)
+    results_dir = Path(os.getenv("AUDIT_RESULTS_DIR", "./audit-results"))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    md_path = results_dir / f"{task_id}_backlog.md"
+    md_path.write_text(report_md, encoding="utf-8")
+    logger.info("entrypoint_backlog: relatório persistido em %s", md_path)
+
+    # 6. Envia email via HermesReporter
+    period_label = f"{periodo_inicio} a {periodo_fim}"
+    child_task_id = ""
+    if supabase_client:
+        try:
+            child_task_id = dispatch_to_hermes_reporter(
+                supabase_client, company_id, task_id, report_md,
+                recipient=recipient, period_label=period_label,
+            )
+        except Exception as e:
+            logger.error("entrypoint_backlog: falha ao criar task para HermesReporter: %s", e)
+
+    return {
+        "status_override": "review",
+        "output_json": {
+            "phase": "await_approval",
+            "matches": report.matches,
+            "report_summary": report.totais,
+            "report_md_path": str(md_path),
+            "hermes_task_id": child_task_id,
+        },
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
