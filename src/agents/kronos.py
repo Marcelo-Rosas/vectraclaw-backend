@@ -1264,12 +1264,13 @@ def entrypoint_backlog(task: dict, supabase_client: Any) -> dict:
       - Retorna {"output_json": {"phase": "baixas_applied", ...}}
     """
     input_json = task.get("input_json") or {}
+    inp = {k.upper(): v for k, v in input_json.items()}  # normaliza para MAIÚSCULO
     desc = task.get("description", "")
 
-    ofx_path       = input_json.get("ofx_path")       or _parse_env_line(desc, "OFX_PATH")
-    periodo_inicio = input_json.get("periodo_inicio")  or _parse_env_line(desc, "PERIODO_INICIO")
-    periodo_fim    = input_json.get("periodo_fim")     or _parse_env_line(desc, "PERIODO_FIM")
-    recipient      = input_json.get("recipient")       or _parse_env_line(desc, "RECIPIENT", DEFAULT_RECIPIENT)
+    ofx_path       = inp.get("OFX_PATH")       or _parse_env_line(desc, "OFX_PATH")
+    periodo_inicio = inp.get("PERIODO_INICIO")  or _parse_env_line(desc, "PERIODO_INICIO")
+    periodo_fim    = inp.get("PERIODO_FIM")     or _parse_env_line(desc, "PERIODO_FIM")
+    recipient      = inp.get("RECIPIENT")       or _parse_env_line(desc, "RECIPIENT", DEFAULT_RECIPIENT)
     task_id        = task.get("id", "unknown")
     company_id     = task.get("company_id", "")
 
@@ -1434,6 +1435,8 @@ def _parse_valor(s: str) -> Decimal:
 
 def _parse_date(s: str) -> date:
     """Tenta varios formatos de data comuns em exportações brasileiras."""
+    # Normaliza: remove hora se presente (ex: '2026-04-30 00:00:00' → '2026-04-30')
+    s = s.strip().split(" ")[0].split("T")[0]
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y", "%m/%d/%Y"):
         try:
             return datetime.strptime(s, fmt).date()
