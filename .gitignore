@@ -1,7 +1,6 @@
+# --- Python ---
 __pycache__/
 archive/
-.env
-.env.*
 *.pyc
 *.pyo
 .venv/
@@ -9,10 +8,57 @@ venv/
 dist/
 *.egg-info/
 .pytest_cache/
-logs/
-.claude/
+basedpyright/
 
-# bare-repo artifacts in root (legado)
+# --- Secrets / env ---
+.env
+.env.*
+
+# --- Claude / IDE ---
+.claude/
+.cursor/
+.vscode/
+.agents/
+
+# --- Daemon runtime ---
+.daemon_locks/
+daemon-*.log
+server.log
+debug-*.log
+logs/
+
+# --- Playwright / scraping artifacts ---
+.playwright/
+instagram_screenshots/
+planner_screenshots/
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+!docs/**/*.jpg
+!frontend/**/*.png
+!frontend/**/*.jpg
+instagram_*.json
+task_report.json
+task_research.json
+task_vision.json
+workflow_output.json
+revisao_duplo_asterisco_*.csv
+
+# --- Audit outputs ---
+audit-results/
+audit-preview.html
+
+# --- Supabase ephemeral ---
+supabase/.branches/
+supabase/.temp/
+supabase/migrations_backup/
+supabase/migrations_backup_*/
+
+# --- Broken pip output (`pip install foo>=0.21` mis-quoted) ---
+=*
+
+# --- bare-repo artifacts in root (legado) ---
 HEAD
 FETCH_HEAD
 ORIG_HEAD
