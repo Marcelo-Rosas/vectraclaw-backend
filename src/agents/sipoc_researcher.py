@@ -5,7 +5,7 @@ from typing import Optional, Any
 logger = logging.getLogger("SipocResearcher")
 
 SYSTEM_PROMPT = """
-Você é o "Vectra Sipoc Master", um consultor sênior em Excelência Operacional e Arquitetura de Agentes de IA.
+Você é o "Oracle", agente conversacional oficial do SIPOC no ecossistema Vectra e consultor sênior em Excelência Operacional e Arquitetura de Agentes de IA.
 Sua missão é mapear setores empresariais com foco total em IDENTIFICAR OPORTUNIDADES DE AUTOMAÇÃO.
 
 ### DIRETRIZES DE CONTEÚDO:
@@ -37,30 +37,35 @@ Sua missão é mapear setores empresariais com foco total em IDENTIFICAR OPORTUN
    - Ambiguidade/Julgamento: -20 pts se depender de análise subjetiva.
    - Aprovação Física: -10 pts.
 
-### FORMATO DE SAÍDA (JSON):
+### FORMATO DE SAÍDA (JSON) — use EXATAMENTE estas chaves camelCase:
 {
   "setor": "Nome do Setor",
-  "processos_sugeridos": [
+  "processosSugeridos": [
     {
       "nome": "Nome do Processo",
       "descricao": "Resumo executivo",
+      "sipocBase": {
+        "suppliers": ["Fornecedor A"],
+        "inputs": ["Dado X"],
+        "outputs": ["Entrega Y"],
+        "customers": ["Cliente Z"]
+      },
+      "automacaoScoreEstimado": 75,
       "atividades": [
         {
           "nome": "Ação específica",
           "5w2h": {
             "what": "", "why": "", "who": "", "where": "", "when": "", "how": "", "howMuch": ""
           },
-          "logicPattern": "Enum",
-          "automationScore": 0-100,
+          "logicPattern": "SIMPLE",
+          "automationScore": 75,
           "automationJustification": "Por que esta pontuação?"
         }
-      ],
-      "sipoc_base": {
-        "suppliers": [], "inputs": [], "outputs": [], "customers": []
-      }
+      ]
     }
   ],
-  "oportunidades_ia": ["Onde o Claude/GPT brilha aqui"]
+  "riscosComuns": ["Risco operacional 1", "Risco operacional 2"],
+  "oportunidadesIa": ["Onde o Claude/GPT brilha aqui"]
 }
 """
 
@@ -82,6 +87,16 @@ _GENERIC_FALLBACK_BASELINE = {
     "oportunidadesIa": ["Mapeamento assistido por IA", "Análise de gargalos"],
 }
 
+ORACLE_AGENT_ID = "oracle"
+ORACLE_AGENT_NAME = "Oracle"
+
+
+def _with_oracle_identity(payload: dict) -> dict:
+    payload["agent_id"] = ORACLE_AGENT_ID
+    payload["agent_name"] = ORACLE_AGENT_NAME
+    payload["agent_role"] = "sipoc_conversational"
+    return payload
+
 
 def _normalize_slug(name: str) -> str:
     """Normaliza o nome do setor para corresponder ao sector_slug no banco."""
@@ -92,59 +107,70 @@ def _normalize_slug(name: str) -> str:
 
 import json
 import logging
-import os
-import httpx
 from typing import Optional, Any
 
 logger = logging.getLogger("SipocResearcher")
 
-# ... (SYSTEM_PROMPT já atualizado no passo anterior)
 
 async def _call_llm_for_sipoc(sector_name: str) -> dict:
     """
-    Chama o Claude (Anthropic) para gerar um baseline de alta qualidade.
+    Gera baseline SIPOC via Google Gemini (google-genai SDK, GEMINI_API_KEY).
+    response_mime_type="application/json" evita fences de markdown no output.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        logger.warning("ANTHROPIC_API_KEY não encontrada. Usando fallback estático.")
+    from src.services.gemini_client import generate, DEFAULT_MODEL
+
+    full_prompt = (
+        f"Gere um baseline SIPOC completo e detalhado para o setor de: {sector_name}. "
+        "Siga rigorosamente o formato JSON e as diretrizes do Sistema."
+    )
+    try:
+        text, metadata = await generate(
+            DEFAULT_MODEL,
+            full_prompt,
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+        logger.info(
+            "sipoc baseline gerado via Gemini (tokens=%s, dur=%dms)",
+            metadata["tokens"]["total"], metadata["duration_ms"],
+        )
+        return json.loads(text)
+    except Exception as e:
+        logger.error(f"Falha na geração Gemini: {e}")
         return {}
 
-    prompt = f"Gere um baseline SIPOC completo e detalhado para o setor de: {sector_name}. Siga rigorosamente o formato JSON e as diretrizes do Sistema."
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-3-5-sonnet-20240620",
-                    "max_tokens": 4096,
-                    "system": SYSTEM_PROMPT,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2
-                },
-                timeout=60.0
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"Erro na API da Anthropic: {response.text}")
-                return {}
-            
-            data = response.json()
-            content = data["content"][0]["text"]
-            
-            # Limpeza básica caso o modelo coloque markdown em volta do JSON
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            
-            return json.loads(content)
-    except Exception as e:
-        logger.error(f"Falha na geração via LLM: {e}")
-        return {}
+def _normalize_research_output(raw: dict) -> dict:
+    """Garante que o output da LLM respeita o schema Zod do frontend (camelCase)."""
+    processos_raw = raw.get("processosSugeridos") or raw.get("processos_sugeridos") or []
+    processos = []
+    for p in processos_raw:
+        sipoc = p.get("sipocBase") or p.get("sipoc_base") or {}
+        atividades = p.get("atividades") or []
+        scores = [
+            a.get("automationScore", 0)
+            for a in atividades
+            if isinstance(a.get("automationScore"), (int, float))
+        ]
+        score = int(sum(scores) / len(scores)) if scores else int(p.get("automacaoScoreEstimado", 50))
+        processos.append({
+            "nome": p.get("nome", ""),
+            "descricao": p.get("descricao", ""),
+            "sipocBase": {
+                "suppliers": sipoc.get("suppliers", []),
+                "inputs": sipoc.get("inputs", []),
+                "outputs": sipoc.get("outputs", []),
+                "customers": sipoc.get("customers", []),
+            },
+            "automacaoScoreEstimado": max(0, min(100, score)),
+            "atividades": atividades,
+        })
+    return {
+        "setor": raw.get("setor", ""),
+        "processosSugeridos": processos,
+        "riscosComuns": raw.get("riscosComuns") or raw.get("riscos_comuns") or [],
+        "oportunidadesIa": raw.get("oportunidadesIa") or raw.get("oportunidades_ia") or [],
+    }
+
 
 async def research_sector(sector_name: str, supabase_client: Optional[Any] = None) -> dict:
     """
@@ -166,13 +192,13 @@ async def research_sector(sector_name: str, supabase_client: Optional[Any] = Non
                 .maybe_single()
                 .execute()
             )
-            if res.data:
+            if res and res.data:
                 row = res.data
-                payload = row["baseline"]
+                payload = _normalize_research_output(row["baseline"])
                 payload["setor"] = row["sector_display_name"]
                 payload["source"] = row["source"]
                 logger.info(f"research_sector: baseline encontrado no banco para '{slug}'")
-                return payload
+                return _with_oracle_identity(payload)
         except Exception as e:
             logger.warning(f"research_sector: DB lookup failed for '{slug}': {e}")
 
@@ -180,22 +206,22 @@ async def research_sector(sector_name: str, supabase_client: Optional[Any] = Non
     logger.info(f"research_sector: gerando baseline via IA para '{sector_name}'...")
     llm_payload = await _call_llm_for_sipoc(sector_name)
     if llm_payload:
+        llm_payload = _normalize_research_output(llm_payload)
         llm_payload["source"] = "ai_generation"
-        # Opcional: Salvar no banco para cache futuro
         if supabase_client:
             try:
-                supabase_client.table("sipoc_sector_baselines").insert({
+                supabase_client.table("sipoc_sector_baselines").upsert({
                     "sector_slug": slug,
                     "sector_display_name": sector_name,
                     "baseline": llm_payload,
                     "source": "ai_generation"
-                }).execute()
+                }, on_conflict="sector_slug").execute()
             except: pass
-        return llm_payload
+        return _with_oracle_identity(llm_payload)
 
     # 3. Fallback genérico (último recurso)
     logger.info(f"research_sector: usando fallback genérico para '{slug}'")
-    payload = dict(_GENERIC_FALLBACK_BASELINE)
+    payload = _normalize_research_output(dict(_GENERIC_FALLBACK_BASELINE))
     payload["setor"] = sector_name.capitalize()
     payload["source"] = "fallback"
-    return payload
+    return _with_oracle_identity(payload)
