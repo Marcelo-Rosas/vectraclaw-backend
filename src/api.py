@@ -2435,9 +2435,23 @@ class NewHeartbeatInput(BaseModel):
     taskId: Optional[str] = None
 
 
-@app.post("/api/heartbeats")
-async def post_heartbeat(request: Request, payload: NewHeartbeatInput):
-    """Agente reporta heartbeat; Claw persiste e emite WS `heartbeat`."""
+async def _emit_heartbeat_internal(
+    payload: NewHeartbeatInput,
+    supabase_client=None,
+    ws_manager_inst=None,
+) -> Dict[str, Any]:
+    """
+    Núcleo de persistência + WS emit do heartbeat. Sem dependência de FastAPI Request.
+
+    Chamado por:
+    - POST /api/heartbeats (endpoint público — agentes externos)
+    - src.managed_agents.router após execução CMA — fechamento sintético
+      (heartbeat com status=idle/error e tokens consumidos pela inferência)
+
+    Calcula custo, faz insert em vectraclip.heartbeats, emite WS `heartbeat`,
+    acumula task cost. Args opcionais permitem injetar clientes em testes;
+    default usa os globais do módulo.
+    """
     now = datetime.now(timezone.utc).isoformat()
     _validate_active_model_id(payload.modelId)
     input_tokens = max(0, int(payload.inputTokens or 0))
@@ -2468,25 +2482,26 @@ async def post_heartbeat(request: Request, payload: NewHeartbeatInput):
         "updated_at": now,
     }
 
-    if supabase:
+    sb = supabase_client if supabase_client is not None else supabase
+    wm = ws_manager_inst if ws_manager_inst is not None else ws_manager
+
+    if sb:
         try:
-            # Busca company_id do agente (service_role para não depender de JWT do daemon)
-            agent_res = supabase.table("agents").select("company_id").eq("id", payload.agentId).execute()
+            agent_res = sb.table("agents").select("company_id").eq("id", payload.agentId).execute()
             if agent_res.data:
                 row["company_id"] = agent_res.data[0]["company_id"]
-            res = supabase.table("heartbeats").insert(row).execute()
+            res = sb.table("heartbeats").insert(row).execute()
             if res.data:
                 hb_dict = Heartbeat(**res.data[0]).to_zod_dict()
                 company_id = row.get("company_id")
                 _accumulate_task_cost(payload.taskId, heartbeat_cost)
-                if company_id:
-                    await ws_manager.emit_heartbeat(company_id, hb_dict)
+                if company_id and wm:
+                    await wm.emit_heartbeat(company_id, hb_dict)
                 return hb_dict
         except Exception as e:
-            logger.error(f"post_heartbeat DB failed: {e}")
+            logger.error(f"_emit_heartbeat_internal DB failed: {e}")
 
-    # Fallback mock
-    mock_hb = {
+    return {
         "id": f"hb_mock_{int(datetime.now().timestamp())}",
         "agentId": payload.agentId,
         "taskId": payload.taskId,
@@ -2500,7 +2515,12 @@ async def post_heartbeat(request: Request, payload: NewHeartbeatInput):
         "logExcerpt": payload.logExcerpt,
         "createdAt": now.replace("+00:00", "Z"),
     }
-    return mock_hb
+
+
+@app.post("/api/heartbeats")
+async def post_heartbeat(request: Request, payload: NewHeartbeatInput):
+    """Agente reporta heartbeat; Claw persiste e emite WS `heartbeat`."""
+    return await _emit_heartbeat_internal(payload)
 
 
 @app.get("/api/companies/{company_id}/audit-log")
