@@ -6470,7 +6470,9 @@ HERMES_REPORTER_AGENT_ID = "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"
 # ─────────────────────────────────────────────────────────────────────────────
 from src.api_routes import prospects as _prospects_routes  # noqa: E402
 from src.api_routes import research_templates as _research_templates_routes  # noqa: E402
+from src.api_routes import workflows as _workflows_routes  # noqa: E402
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
+app.include_router(_workflows_routes.router)
 
