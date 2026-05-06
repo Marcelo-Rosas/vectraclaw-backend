@@ -6472,9 +6472,11 @@ from src.api_routes import prospects as _prospects_routes  # noqa: E402
 from src.api_routes import research_templates as _research_templates_routes  # noqa: E402
 from src.api_routes import workflows as _workflows_routes  # noqa: E402
 from src.api_routes import system as _system_routes  # noqa: E402
+from src.api_routes import kronos_rules as _kronos_rules_routes  # noqa: E402
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
 app.include_router(_workflows_routes.router)
 app.include_router(_system_routes.router)
+app.include_router(_kronos_rules_routes.router)
 
