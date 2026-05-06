@@ -6474,6 +6474,7 @@ from src.api_routes import workflows as _workflows_routes  # noqa: E402
 from src.api_routes import system as _system_routes  # noqa: E402
 from src.api_routes import kronos_rules as _kronos_rules_routes  # noqa: E402
 from src.api_routes import tasks_workflow as _tasks_workflow_routes  # noqa: E402
+from src.api_routes import companies_extras as _companies_extras_routes  # noqa: E402
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -6481,4 +6482,5 @@ app.include_router(_workflows_routes.router)
 app.include_router(_system_routes.router)
 app.include_router(_kronos_rules_routes.router)
 app.include_router(_tasks_workflow_routes.router)
+app.include_router(_companies_extras_routes.router)
 
