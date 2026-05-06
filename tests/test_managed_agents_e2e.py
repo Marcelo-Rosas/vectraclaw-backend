@@ -225,19 +225,23 @@ async def test_websocket_events_emitted():
 
     task = _make_task(operation_type="research")
 
-    with patch("src.managed_agents.router.ManagedAgentClient") as MockClient:
-        mock_client_instance = MagicMock()
-        mock_client_instance.execute_task = AsyncMock(return_value=ExecutionResult(
-            success=True,
-            content="Resultado",
-            tool_calls=[],
-            turn_count=1,
-            tokens_input=10,
-            tokens_output=10,
-            execution_time_seconds=0.5,
-        ))
-        MockClient.return_value = mock_client_instance
+    # Após VEC-326: router usa get_agent_client (factory) em vez de instanciar
+    # ManagedAgentClient diretamente. Patch aplicado no ponto de uso do router.
+    mock_client_instance = MagicMock()
+    mock_client_instance.execute_task = AsyncMock(return_value=ExecutionResult(
+        success=True,
+        content="Resultado",
+        tool_calls=[],
+        turn_count=1,
+        tokens_input=10,
+        tokens_output=10,
+        execution_time_seconds=0.5,
+    ))
 
+    with patch(
+        "src.managed_agents.router.get_agent_client",
+        return_value=mock_client_instance,
+    ):
         await route_task_execution(
             task=task,
             force_mode="managed_agent",
@@ -250,3 +254,201 @@ async def test_websocket_events_emitted():
     call_types = [c.kwargs.get("event_type") or c.args[1] for c in mock_ws.emit_managed_agent_event.call_args_list]
     assert "managed_agent_start" in call_types
     assert "managed_agent_complete" in call_types
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat após execução CMA — Anthropic e Ollama
+# ---------------------------------------------------------------------------
+
+def _make_supabase_for_provider(provider: str | None):
+    """Mock supabase compatível com o lookup de provider feito pelo router.
+
+    Se `provider=None`, simula agente sem agent_adapter_configs (router cai no
+    fallback 'anthropic'). Quaisquer outros .table().update() viram no-op.
+    """
+    sb = MagicMock()
+
+    def _table(name: str):
+        tbl = MagicMock()
+        if name == "agent_adapter_configs" and provider is not None:
+            res = MagicMock()
+            res.data = [{
+                "field_values_json": {"model_id": f"model-of-{provider}"},
+                "adapter_catalog": {"provider": provider},
+            }]
+            tbl.select.return_value.eq.return_value.limit.return_value.execute.return_value = res
+        elif name == "agent_adapter_configs" and provider is None:
+            res = MagicMock()
+            res.data = []
+            tbl.select.return_value.eq.return_value.limit.return_value.execute.return_value = res
+        else:
+            # tasks.update etc — só não pode crashar
+            tbl.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+        return tbl
+
+    sb.table.side_effect = _table
+    return sb
+
+
+@pytest.mark.asyncio
+async def test_router_emits_heartbeat_for_anthropic():
+    """Após execução CMA com provider=anthropic (default/fallback), o router
+    deve disparar _emit_heartbeat_internal com modelo Anthropic e logExcerpt
+    contendo 'Anthropic'."""
+    task = _make_task(operation_type="research")
+
+    mock_client = MagicMock()
+    mock_client.execute_task = AsyncMock(return_value=ExecutionResult(
+        success=True,
+        content="ok",
+        tool_calls=[],
+        turn_count=1,
+        tokens_input=50,
+        tokens_output=120,
+        execution_time_seconds=2.0,
+        tokens_per_second=60.0,
+    ))
+
+    sb = _make_supabase_for_provider(None)  # fallback: anthropic
+
+    with patch(
+        "src.managed_agents.router.get_agent_client",
+        return_value=mock_client,
+    ), patch("src.api._emit_heartbeat_internal", new=AsyncMock()) as mock_emit:
+        await route_task_execution(
+            task=task,
+            force_mode="managed_agent",
+            supabase_client=sb,
+            ws_manager=None,
+        )
+
+    assert mock_emit.call_count == 1
+    payload = mock_emit.call_args.args[0]  # NewHeartbeatInput
+    assert payload.agentId == "agent-xyz"
+    assert payload.taskId == "task-e2e-001"
+    assert payload.status == "idle"
+    assert payload.tokensUsed == 170  # 50 + 120
+    assert payload.inputTokens == 50
+    assert payload.outputTokens == 120
+    assert payload.modelId.startswith("claude")  # CMA_MODEL default
+    assert "Anthropic" in payload.logExcerpt
+    assert "120 tokens" in payload.logExcerpt
+    assert "60.0 tok/s" in payload.logExcerpt
+
+
+@pytest.mark.asyncio
+async def test_router_emits_heartbeat_for_ollama():
+    """Mesma mecânica para provider=ollama, com logExcerpt 'Ollama:' e o
+    modelo vindo do CMA_MODEL (router não conhece o model_id do field_values
+    no fluxo atual — ver router.py linha que usa `model`)."""
+    task = _make_task(operation_type="research")
+
+    mock_client = MagicMock()
+    mock_client.execute_task = AsyncMock(return_value=ExecutionResult(
+        success=True,
+        content="ok",
+        tool_calls=[],
+        turn_count=2,
+        tokens_input=20,
+        tokens_output=80,
+        execution_time_seconds=1.5,
+        tokens_per_second=53.33,
+    ))
+
+    sb = _make_supabase_for_provider("ollama")
+
+    with patch(
+        "src.managed_agents.router.get_agent_client",
+        return_value=mock_client,
+    ), patch("src.api._emit_heartbeat_internal", new=AsyncMock()) as mock_emit:
+        await route_task_execution(
+            task=task,
+            force_mode="managed_agent",
+            supabase_client=sb,
+            ws_manager=None,
+        )
+
+    assert mock_emit.call_count == 1
+    payload = mock_emit.call_args.args[0]
+    assert payload.tokensUsed == 100
+    assert payload.inputTokens == 20
+    assert payload.outputTokens == 80
+    assert "Ollama" in payload.logExcerpt
+    assert "80 tokens" in payload.logExcerpt
+    assert "53.33 tok/s" in payload.logExcerpt
+
+
+@pytest.mark.asyncio
+async def test_router_emits_heartbeat_for_huggingface():
+    """provider=huggingface → logExcerpt 'HuggingFace:' + tokens corretos."""
+    task = _make_task(operation_type="research")
+
+    mock_client = MagicMock()
+    mock_client.execute_task = AsyncMock(return_value=ExecutionResult(
+        success=True,
+        content="ok",
+        tool_calls=[],
+        turn_count=1,
+        tokens_input=15,
+        tokens_output=45,
+        execution_time_seconds=0.9,
+        tokens_per_second=50.0,
+    ))
+
+    sb = _make_supabase_for_provider("huggingface")
+
+    with patch(
+        "src.managed_agents.router.get_agent_client",
+        return_value=mock_client,
+    ), patch("src.api._emit_heartbeat_internal", new=AsyncMock()) as mock_emit:
+        await route_task_execution(
+            task=task,
+            force_mode="managed_agent",
+            supabase_client=sb,
+            ws_manager=None,
+        )
+
+    assert mock_emit.call_count == 1
+    payload = mock_emit.call_args.args[0]
+    assert payload.tokensUsed == 60
+    assert payload.inputTokens == 15
+    assert payload.outputTokens == 45
+    assert "HuggingFace" in payload.logExcerpt
+    assert "45 tokens" in payload.logExcerpt
+    assert "50.0 tok/s" in payload.logExcerpt
+
+
+@pytest.mark.asyncio
+async def test_router_heartbeat_status_error_when_failed():
+    """Status do heartbeat reflete result.success: 'idle' em sucesso, 'error'
+    em falha."""
+    task = _make_task()
+
+    mock_client = MagicMock()
+    mock_client.execute_task = AsyncMock(return_value=ExecutionResult(
+        success=False,
+        content="",
+        tool_calls=[],
+        turn_count=1,
+        tokens_input=5,
+        tokens_output=0,
+        execution_time_seconds=0.3,
+        tokens_per_second=0.0,
+        error="boom",
+    ))
+
+    sb = _make_supabase_for_provider(None)
+
+    with patch(
+        "src.managed_agents.router.get_agent_client",
+        return_value=mock_client,
+    ), patch("src.api._emit_heartbeat_internal", new=AsyncMock()) as mock_emit:
+        await route_task_execution(
+            task=task,
+            force_mode="managed_agent",
+            supabase_client=sb,
+            ws_manager=None,
+        )
+
+    assert mock_emit.call_count == 1
+    assert mock_emit.call_args.args[0].status == "error"

@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from .agent_client_factory import get_agent_client
 from .decision_engine import should_use_managed_agent, RoutingDecision
 from .managed_agent_client import ManagedAgentClient, ExecutionResult
 from .session_bridge import SessionBridge
@@ -20,6 +21,61 @@ logger = logging.getLogger("ManagedAgents.Router")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+async def _emit_run_heartbeat(
+    *,
+    agent_id: str,
+    task_id: str,
+    provider: str,
+    model: str,
+    result: ExecutionResult,
+    supabase_client,
+    ws_manager_inst,
+) -> None:
+    """
+    Emite heartbeat sintético após uma execução CMA, alimentando o burn rate
+    e o painel de tokens. Só dispara para providers efetivamente suportados
+    (anthropic, ollama) — slots reservados (openai, google) ou desconhecidos
+    são ignorados.
+
+    Falha silenciosa: um problema na emissão de heartbeat não pode reverter
+    o resultado da task que já foi persistida.
+    """
+    if provider not in ("anthropic", "ollama", "huggingface"):
+        return
+    if not agent_id:
+        return
+    try:
+        # Import lazy para evitar circular import (api.py importa este módulo).
+        from src.api import _emit_heartbeat_internal, NewHeartbeatInput
+
+        provider_label = {
+            "ollama": "Ollama",
+            "anthropic": "Anthropic",
+            "huggingface": "HuggingFace",
+        }[provider]
+        log_excerpt = (
+            f"{provider_label}: {result.tokens_output} tokens em "
+            f"{result.tokens_per_second} tok/s"
+        )
+        payload = NewHeartbeatInput(
+            agentId=agent_id,
+            status="idle" if result.success else "error",
+            tokensUsed=result.tokens_input + result.tokens_output,
+            inputTokens=result.tokens_input,
+            outputTokens=result.tokens_output,
+            modelId=model,
+            logExcerpt=log_excerpt,
+            taskId=task_id,
+        )
+        await _emit_heartbeat_internal(
+            payload,
+            supabase_client=supabase_client,
+            ws_manager_inst=ws_manager_inst,
+        )
+    except Exception as e:
+        logger.warning("Router: emit heartbeat after CMA falhou: %s", e)
 
 
 async def route_task_execution(
@@ -105,8 +161,30 @@ async def route_task_execution(
         except Exception:
             pass
 
-    prompt = f"[{task.get('operation_type','other')}] {task['title']}\n\n{task.get('description','')}"
-    client = ManagedAgentClient(model=model)
+    agent_id_hint = f"\n\nAGENT_ID para read_hermes_inbox: {agent_id}" if agent_id else ""
+    prompt = f"[{task.get('operation_type','other')}] {task['title']}\n\n{task.get('description','')}{agent_id_hint}"
+
+    # Resolve o provider do adapter associado ao agente. Fallback retrocompat:
+    # agentes sem agent_adapter_configs usam Anthropic (comportamento antigo).
+    provider = "anthropic"
+    field_values: Dict[str, Any] = {}
+    if supabase_client and agent_id:
+        try:
+            res = (
+                supabase_client.table("agent_adapter_configs")
+                .select("field_values_json, adapter_catalog!inner(provider)")
+                .eq("agent_id", agent_id)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                row = res.data[0]
+                field_values = row.get("field_values_json") or {}
+                provider = (row.get("adapter_catalog") or {}).get("provider") or "anthropic"
+        except Exception as e:
+            logger.warning(f"Router: provider lookup falhou agent_id={agent_id}: {e}")
+
+    client = get_agent_client(provider, model=model, config=field_values)
     result: ExecutionResult = await client.execute_task(prompt, max_turns=3)
 
     # Persiste turns
@@ -180,6 +258,18 @@ async def route_task_execution(
             )
         except Exception:
             pass
+
+    # Heartbeat sintético: alimenta burn rate, painel de tokens e WS `heartbeat`.
+    # Função interna lida com providers não suportados e falha silenciosa.
+    await _emit_run_heartbeat(
+        agent_id=agent_id,
+        task_id=task_id,
+        provider=provider,
+        model=model,
+        result=result,
+        supabase_client=supabase_client,
+        ws_manager_inst=ws_manager,
+    )
 
     return {
         "executor_type": "managed_agent",

@@ -22,6 +22,8 @@ _OPERATION_TYPE_SCORES: Dict[str, int] = {
     "orchestration": 0,       # coordenação multi-step → harness
     "code_generation": 15,    # precisa de bash/file tools → harness
     "qa_testing": 35,         # pode precisar de execução → lean harness
+    "email_lead": 10,         # HermesReporter daemon handles natively; CMA path breaks with key issues
+    "freight-quotation": 80,  # extração de briefing + cotação → CMA
     "code_review": 65,        # análise pura → lean CMA
     "document_generation": 75,  # síntese estruturada → CMA
     "other": 60,              # padrão simples → lean CMA

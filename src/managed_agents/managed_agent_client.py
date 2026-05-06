@@ -9,6 +9,7 @@ Fluxo:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -27,6 +28,9 @@ class ExecutionResult:
     tokens_input: int = 0
     tokens_output: int = 0
     execution_time_seconds: float = 0.0
+    # Tokens de saída por segundo de inferência (eval-only, exclui dispatch de tools).
+    # Preenchido por OllamaAgentClient e ManagedAgentClient (Anthropic).
+    tokens_per_second: float = 0.0
     error: Optional[str] = None
 
 
@@ -44,7 +48,8 @@ class ManagedAgentClient:
             try:
                 import anthropic
                 self._client = anthropic.Anthropic(
-                    api_key=os.getenv("ANTHROPIC_API_KEY", "")
+                    api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+                    timeout=60.0,
                 )
             except ImportError:
                 raise RuntimeError("Pacote 'anthropic' não instalado. Execute: pip install anthropic")
@@ -71,19 +76,29 @@ class ManagedAgentClient:
         tool_calls_log: List[Dict[str, Any]] = []
         total_input = 0
         total_output = 0
+        # Acumula só o tempo de inferência (chamadas messages.create), excluindo
+        # dispatch_tool_call. Usado para calcular tokens_per_second.
+        total_eval_seconds = 0.0
         turn = 0
         final_content = ""
+
+        def _tps() -> float:
+            """Tokens de saída por segundo de inferência. Best-effort."""
+            return round(total_output / max(total_eval_seconds, 0.001), 2)
 
         try:
             while turn < max_turns:
                 turn += 1
-                response = client.messages.create(
+                eval_start = time.monotonic()
+                response = await asyncio.to_thread(
+                    client.messages.create,
                     model=self.model,
                     max_tokens=1024,
                     system=system,
                     tools=ANTHROPIC_TOOLS,
                     messages=messages,
                 )
+                total_eval_seconds += time.monotonic() - eval_start
 
                 total_input += response.usage.input_tokens
                 total_output += response.usage.output_tokens
@@ -129,6 +144,7 @@ class ManagedAgentClient:
                 tokens_input=total_input,
                 tokens_output=total_output,
                 execution_time_seconds=round(elapsed, 3),
+                tokens_per_second=_tps(),
                 error=str(e),
             )
 
@@ -145,4 +161,5 @@ class ManagedAgentClient:
             tokens_input=total_input,
             tokens_output=total_output,
             execution_time_seconds=round(elapsed, 3),
+            tokens_per_second=_tps(),
         )
