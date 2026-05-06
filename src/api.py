@@ -6454,6 +6454,23 @@ async def run_flow_orchestrator(request: Request):
                 yield f"data: {json.dumps(event_data)}\n\n"
                 await asyncio.sleep(0.5)
         yield "data: {\"node\": \"END\", \"message\": \"Fluxo Finalizado\"}\n\n"
-        
+
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants compartilhadas com src/api_routes/* (importadas lazy nos submodules)
+# ─────────────────────────────────────────────────────────────────────────────
+_ORACLE_AGENT_ID = "00000000-0000-0000-0000-000000000002"
+HERMES_REPORTER_AGENT_ID = "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routers extraídos para src/api_routes/<feature>.py (Step 8 split progressivo)
+# ─────────────────────────────────────────────────────────────────────────────
+from src.api_routes import prospects as _prospects_routes  # noqa: E402
+from src.api_routes import research_templates as _research_templates_routes  # noqa: E402
+
+app.include_router(_prospects_routes.router)
+app.include_router(_research_templates_routes.router)
 
