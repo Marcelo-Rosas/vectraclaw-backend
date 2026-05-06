@@ -3,7 +3,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Literal, Any, Dict, List
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, Field, root_validator, validator
 
 def to_camel(string: str) -> str:
     words = string.split('_')
@@ -62,11 +62,27 @@ class Agent(CamelModel):
             del d["updatedAt"]
 
         # Reverse-map DB-internal values to Zod enum values.
-        # create_agent previously mapped codex→cursor, shell/webhook→bot;
-        # existing rows in DB may have those values.
-        _adapter_reverse = {"cursor": "codex", "bot": "shell"}
+        # 'internal' (Oracle system agent) maps to claude_code in the Zod schema.
+        _adapter_reverse = {
+            "cursor": "codex",
+            "bot": "shell",
+            "claude": "claude_code",
+            "internal": "claude_code",
+        }
         if d.get("adapterType") in _adapter_reverse:
             d["adapterType"] = _adapter_reverse[d["adapterType"]]
+
+        # Zod expects string (not null) for optional text fields
+        if d.get("systemPrompt") is None:
+            d["systemPrompt"] = ""
+        if d.get("platformUrl") is None:
+            d["platformUrl"] = ""
+
+        # Ensure numeric types are correct (guards against DB returning strings)
+        d["tokenBudget"] = int(d.get("tokenBudget") or 0)
+        d["currentBurnRate"] = float(d.get("currentBurnRate") or 0)
+
+        # reportsToId: null is intentionally left nullable — 6th residual Zod issue lives in dashboard schema
 
         return d
 
@@ -94,17 +110,39 @@ class Task(CamelModel):
         "crm-fill-finalize",
         "crm-fill",
         "oracle-research",
+        "oracle-extract",
+        "oracle-report",
+        "oracle-rag",
+        "oracle-vision",
+        "oracle-summarize",
+        "dispatch-research",
+        "financial-audit",
+        "financial-bookkeeping",
+        "conciliacao-backlog",
         "other",
     ] = "other"
     budget_limit: int
     spent: float
     cost_usd: float = 0.0
     claimed_at: Optional[datetime] = None
+    workflow_step_id: Optional[str] = None
+    dependency_step_codes: List[str] = Field(default_factory=list)
+    successor_step_codes: List[str] = Field(default_factory=list)
+    is_critical_path: bool = False
+    output_json: Optional[Dict[str, Any]] = None
+    input_json: Optional[Dict[str, Any]] = None
+    approved_at: Optional[datetime] = None
+    approved_by_user_id: Optional[str] = None
     # CMA fields (VEC — Claude Managed Agents)
     executor_type: Literal["harness", "managed_agent", "auto"] = "auto"
     managed_agent_session_id: Optional[str] = None
     executor_selected_at: Optional[datetime] = None
     executor_rationale: Optional[str] = None
+    # Semana 2: avaliação de qualidade da execução.
+    evaluation_score: Optional[int] = None
+    evaluation_notes: Optional[str] = None
+    evaluated_by: Optional[Literal["agent", "human", "auto"]] = None
+    evaluated_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -121,10 +159,19 @@ class Task(CamelModel):
         return float(v)
 
     @validator('assigned_to_agent_id', 'parent_task_id', 'goal_id',
-               'managed_agent_session_id', 'executor_rationale', pre=True)
+               'managed_agent_session_id', 'executor_rationale', 'workflow_step_id',
+               'approved_by_user_id', 'evaluation_notes', 'evaluated_by', pre=True)
     def empty_to_none(cls, v):
         if v == "":
             return None
+        return v
+
+    @validator('dependency_step_codes', 'successor_step_codes', pre=True)
+    def coerce_step_code_lists(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x) for x in v if x is not None]
         return v
 
     def to_zod_dict(self):
@@ -139,6 +186,8 @@ class Task(CamelModel):
             ("claimed_at", "claimedAt"),
             ("created_at", "createdAt"),
             ("executor_selected_at", "executorSelectedAt"),
+            ("approved_at", "approvedAt"),
+            ("evaluated_at", "evaluatedAt"),
         ]:
             val = getattr(self, attr, None)
             if val:
@@ -149,6 +198,110 @@ class Task(CamelModel):
             del d["updatedAt"]
 
         return d
+
+
+class WorkflowStepRich(CamelModel):
+    """Rich workflow step (Workflow Builder / manual editor) → DB workflow_steps."""
+
+    step_code: str = ""
+    slug: Optional[str] = None
+    name: Optional[str] = None
+    nome: Optional[str] = None
+    descricao: Optional[str] = None
+    logic_pattern: Optional[str] = None
+    responsavel: Optional[str] = None
+    setor: Optional[str] = None
+    ferramentas: List[Any] = Field(default_factory=list)
+    sla_horas: Optional[int] = None
+    alertas: List[Any] = Field(default_factory=list)
+    proximo: List[str] = Field(default_factory=list)
+    suppliers: Optional[List[Dict[str, Any]]] = None
+    inputs: Optional[List[Dict[str, Any]]] = None
+    outputs: Optional[List[Dict[str, Any]]] = None
+    customers: Optional[List[Dict[str, Any]]] = None
+    decisions: Optional[List[Dict[str, Any]]] = None
+    five_w2h: Optional[Dict[str, Any]] = None
+    default_operation_type: Optional[str] = None
+    default_assigned_specialty_slug: Optional[str] = None
+
+    class Config:
+        alias_generator = to_camel
+        validate_by_name = True
+        extra = "ignore"
+
+    @root_validator(pre=True)
+    def _normalize_aliases(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(values, dict):
+            return values
+        if values.get("slaHoras") is not None and values.get("sla_horas") is None:
+            values["sla_horas"] = values["slaHoras"]
+        code = values.get("step_code") or values.get("stepCode") or values.get("slug")
+        if code:
+            values["step_code"] = str(code).strip()
+        return values
+
+    def resolved_name(self) -> str:
+        return (self.name or self.nome or self.step_code or "step").strip()
+
+    def resolved_sla_hours(self) -> int:
+        try:
+            return int(self.sla_horas) if self.sla_horas is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+
+class TaskBlueprint(CamelModel):
+    """Parent task payload for TaskFactory.materialize_workflow."""
+
+    title: str
+    description: str = ""
+    budget_limit: int = 0
+    goal_id: Optional[str] = None
+
+    class Config:
+        alias_generator = to_camel
+        validate_by_name = True
+        extra = "ignore"
+
+    @validator("goal_id", pre=True)
+    def _goal(cls, v):
+        if v == "":
+            return None
+        return v
+
+
+class MaterializedWorkflow(CamelModel):
+    parent: Task
+    subtasks: List[Task] = Field(default_factory=list)
+
+    class Config:
+        alias_generator = to_camel
+        validate_by_name = True
+
+
+# ─── Oracle models (Fase 2) ───────────────────────────────────────────────────
+
+class OracleMetadata(CamelModel):
+    model_used: str = ""
+    tokens: Dict[str, int] = {}
+    duration_ms: int = 0
+    tools_used: List[str] = []
+    interaction_id: Optional[str] = None
+
+
+class OracleInput(CamelModel):
+    prompt: str
+    documents: Optional[List[Dict[str, Any]]] = None
+    output_schema: Optional[Dict[str, Any]] = None
+    require_human_review: bool = False
+
+
+class OracleOutput(CamelModel):
+    report_markdown: Optional[str] = None
+    structured_data: Optional[Dict[str, Any]] = None
+    metadata: OracleMetadata = OracleMetadata()
+    citations: Optional[List[str]] = None
+    error_detail: Optional[Dict[str, Any]] = None
 
 class Goal(CamelModel):
     id: str
@@ -253,6 +406,7 @@ class AdapterFieldDefinition(CamelModel):
         "multiselect",
         "file_upload",
         "secret",
+        "url",
     ]
     is_required: bool
     options_json: Optional[dict] = None
@@ -353,6 +507,7 @@ class Routine(CamelModel):
     schedule: RoutineSchedule
     agent_id: Optional[str] = None
     metadata: Optional[dict] = None
+    prompt_template: Optional[str] = None
     next_run_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
     created_at: datetime
@@ -507,13 +662,15 @@ class AgentSpecialty(CamelModel):
     description: Optional[str] = None
     compatible_roles: List[str]
     system_prompt_template: Optional[str] = None
+    config_schema: Optional[List[Dict[str, Any]]] = None
     is_active: bool = True
 
     def to_zod_dict(self):
         d = self.dict(by_alias=True)
-        d.pop("isActive", None)
         if d.get("systemPromptTemplate") is None:
             d["systemPromptTemplate"] = ""
+        if d.get("description") is None:
+            d["description"] = ""
         return d
 
 
@@ -679,11 +836,21 @@ class Run(CamelModel):
     id: str
     company_id: str
     agent_id: Optional[str] = None
+    task_id: Optional[str] = None
     status: Optional[str] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
-    trigger: Optional[str] = None
-    metadata: Dict[str, Any] = {}
+    duration_ms: Optional[int] = None
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+
+    @validator('cost_usd', pre=True)
+    def coerce_cost(cls, v):
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
 
     def to_zod_dict(self):
         return self.dict(by_alias=True)
@@ -698,6 +865,77 @@ class RunTranscriptEntry(CamelModel):
     tool_input: Optional[Dict[str, Any]] = None
     tool_output: Optional[str] = None
     created_at: Optional[datetime] = None
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+
+# =====================================================================
+# Prospect Profiles (VEC-334)
+# =====================================================================
+
+class DecisionMaker(BaseModel):
+    nome: str
+    cargo: Optional[str] = None
+    email: Optional[str] = None
+    linkedin: Optional[str] = None
+    instagram: Optional[str] = None
+    fonte: Optional[str] = None
+
+
+class ProspectProfile(CamelModel):
+    id: str
+    company_id: str
+    nome_razao_social: Optional[str] = None
+    cnpj: Optional[str] = None
+    website: Optional[str] = None
+    setor: Optional[str] = None
+    endereco: Optional[Dict[str, Any]] = None
+    telefone: Optional[str] = None
+    email_contato: Optional[str] = None
+    decisores: Optional[List[Dict[str, Any]]] = None
+    source_task_id: Optional[str] = None
+    enriched_at: Optional[str] = None
+    raw_research: Optional[str] = None
+    artifacts: Optional[Dict[str, Any]] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    # Pesquisa Oracle (VEC-XXX)
+    tipo: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    instagram_handle: Optional[str] = None
+    extra_urls: Optional[List[Dict[str, Any]]] = None
+    cnpj_lookup_data: Optional[Dict[str, Any]] = None
+    qsa: Optional[List[Dict[str, Any]]] = None
+    research_template_id: Optional[str] = None
+    research_status: Optional[str] = None
+    research_progress: Optional[Dict[str, Any]] = None
+    research_cron_expr: Optional[str] = None
+    next_research_at: Optional[str] = None
+    last_research_at: Optional[str] = None
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        return d
+
+
+# =====================================================================
+# Research Templates (VEC-XXX) — prompts editáveis para oracle-research
+# =====================================================================
+
+class ResearchTemplate(CamelModel):
+    id: str
+    company_id: Optional[str] = None  # NULL = template global default
+    slug: str
+    name: str
+    description: Optional[str] = None
+    prompt_template: str
+    output_sections: List[str] = []
+    default_urls: List[str] = []
+    require_review: bool = True
+    active: bool = True
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
     def to_zod_dict(self):
         return self.dict(by_alias=True)
