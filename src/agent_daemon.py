@@ -270,6 +270,11 @@ class ResilientHarnessDaemon:
             result = hr_entry(task)
             return _json.dumps(result)
 
+        if op_type == "rag-ingest":
+            from src.agents.mnemos import entrypoint as mnemos_entry
+            result = mnemos_entry(task, self._get_supabase())
+            return _json.dumps(result)
+
         if op_type.startswith("oracle-"):
             from src.agents.oracle import execute_specialty
             result = asyncio.run(execute_specialty(task, self._get_supabase()))

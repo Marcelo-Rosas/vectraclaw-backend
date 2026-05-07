@@ -42,6 +42,7 @@ _SYS_LOCK_DIR = _SYS_BASE_DIR / ".daemon_locks"
 _DAEMON_AGENTS = [
     ("00000000-0000-0000-0000-000000000001", "Morpheus"),
     ("00000000-0000-0000-0000-000000000002", "Oracle"),
+    ("00000000-0000-0000-0000-000000000003", "Mnemos"),
     ("59b7a69e-cc53-4063-85f9-5dcc5619ac96", "Hermes"),
     ("c7de1b0f-7c74-42f1-9de4-7210349e668e", "Mercator"),
     ("80fd6d0e-53ab-4638-b6e9-05cbbd121092", "Plutus"),
