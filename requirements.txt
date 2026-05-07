@@ -12,3 +12,4 @@ google-genai>=1.0.0
 langgraph>=1.0.0
 langchain-core>=0.3.0
 networkx>=3.2
+openpyxl>=3.1
