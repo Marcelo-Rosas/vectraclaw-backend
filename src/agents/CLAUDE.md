@@ -16,6 +16,7 @@ Cada agente é despachado pelo `agent_daemon.py` quando uma `vectraclip.task` ch
 | Plutus | `80fd6d0e-53ab-4638-b6e9-05cbbd121092` | financeiro | `plutus.py` |
 | Hodos | `0d6e56cc-28b6-4382-96cd-1952b890d412` | qualp / rotas | `hodos.py` |
 | **Kronos** | `9c8d7e6f-5a4b-4321-9876-543210fedcba` | `scrape-backlog`, `entrypoint-backlog`, `conciliacao-backlog`, `audit`, `apply` | `kronos.py`, `kronos_scrape.py`, `kronos_apply.py` |
+| **Mnemos** | `00000000-0000-0000-0000-000000000003` | `rag-ingest` (RAG corpus curator) | `mnemos.py` |
 
 **SipocResearcher** é serviço (não agente próprio): `sipoc_researcher.py` é chamado via `/api/sipoc/research` (não tem AGENT_ID).
 
