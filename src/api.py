@@ -278,6 +278,16 @@ def _extract_vectraclip_claims(token: str) -> dict:
         return {}
 
 
+def validate_jwt(token: Optional[str]) -> None:
+    """Exige JWT válido (ou dev-token). Usado por rotas sensíveis (ex: /api/system/*)."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    if token == "dev-token":
+        return
+    if validate_supabase_jwt(token) is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
 def validate_jwt_company_id(token: str, url_company_id: str) -> None:
     """Lança HTTPException 403 se o JWT não tiver ou divergir do company_id da URL.
 
@@ -6475,6 +6485,7 @@ from src.api_routes import system as _system_routes  # noqa: E402
 from src.api_routes import kronos_rules as _kronos_rules_routes  # noqa: E402
 from src.api_routes import tasks_workflow as _tasks_workflow_routes  # noqa: E402
 from src.api_routes import companies_extras as _companies_extras_routes  # noqa: E402
+from src.api_routes import oracle_chat as _oracle_chat_routes  # noqa: E402
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -6483,4 +6494,5 @@ app.include_router(_system_routes.router)
 app.include_router(_kronos_rules_routes.router)
 app.include_router(_tasks_workflow_routes.router)
 app.include_router(_companies_extras_routes.router)
+app.include_router(_oracle_chat_routes.router)
 
