@@ -39,6 +39,43 @@ ANTHROPIC_TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "query_rag",
+        "description": (
+            "Consulta a memória corporativa (RAG) da company para encontrar trechos "
+            "relevantes em documentos internos (PDFs, planilhas, manuais, contratos). "
+            "Retorna os top-K trechos mais similares com filename + número da página "
+            "para citação. Use ANTES de responder ao usuário sempre que precisar de "
+            "contexto factual ou referência específica de docs internos."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "company_id": {
+                    "type": "string",
+                    "description": (
+                        "UUID da company (multi-tenant). Obrigatório. "
+                        "Veja COMPANY_ID injetado no prompt da task."
+                    ),
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Pergunta ou frase de busca em linguagem natural.",
+                },
+                "k": {
+                    "type": "integer",
+                    "description": "Top-K trechos (1-50, default 5).",
+                    "default": 5,
+                },
+                "min_score": {
+                    "type": "number",
+                    "description": "Score mínimo [0-1] para filtrar matches ruins (default 0.0).",
+                    "default": 0.0,
+                },
+            },
+            "required": ["company_id", "query"],
+        },
+    },
+    {
         "name": "calculate_cbm",
         "description": (
             "Calcula o Cubo Metragem (CBM) de uma carga com base nas dimensões "
@@ -114,6 +151,59 @@ def _read_hermes_inbox(payload_json: str) -> str:
         return json.dumps({"success": False, "error": str(e)})
 
 
+def _query_rag(payload_json: str) -> str:
+    """Query top-k chunks da memória corporativa via pgvector. Retorna JSON.
+
+    Agente CMA passa company_id (injetado no prompt), query, k, min_score.
+    Multi-tenant garantido pelo p_company_id no RPC match_rag_chunks.
+    """
+    try:
+        import asyncio as _asyncio
+        data = json.loads(payload_json)
+        company_id = (data.get("company_id") or "").strip()
+        query = (data.get("query") or "").strip()
+        k = int(data.get("k", 5))
+        min_score = float(data.get("min_score", 0.0))
+
+        if not company_id:
+            return json.dumps({"success": False, "error": "company_id obrigatório"})
+        if not query:
+            return json.dumps({"success": False, "error": "query obrigatória"})
+
+        from src.api import supabase
+        if not supabase:
+            return json.dumps({"success": False, "error": "Supabase não disponível"})
+
+        from src.services.rag.retriever import query_top_k
+
+        results = _asyncio.run(query_top_k(
+            query,
+            company_id=company_id,
+            k=k,
+            min_score=min_score,
+            supabase_client=supabase,
+        ))
+
+        return json.dumps({
+            "success": True,
+            "query": query,
+            "matches": [
+                {
+                    "id": r.id,
+                    "document_id": r.document_id,
+                    "filename": r.document_filename,
+                    "page": r.page_number,
+                    "score": round(r.score, 4),
+                    "content": r.content,
+                }
+                for r in results
+            ],
+            "total": len(results),
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
 def _load_tools() -> None:
     global _TOOL_MAP
     if _TOOL_MAP:
@@ -123,12 +213,16 @@ def _load_tools() -> None:
 
         _TOOL_MAP = {
             "read_hermes_inbox": _read_hermes_inbox,
+            "query_rag": _query_rag,
             "calculate_cbm": calculate_cbm,
             "extract_bl_pl": extract_bl_pl,
         }
     except ImportError as e:
         logger.warning(f"m3_tools import failed: {e} — tool dispatch disabled")
-        _TOOL_MAP = {"read_hermes_inbox": _read_hermes_inbox}
+        _TOOL_MAP = {
+            "read_hermes_inbox": _read_hermes_inbox,
+            "query_rag": _query_rag,
+        }
 
 
 def dispatch_tool_call(tool_name: str, tool_input: Dict[str, Any]) -> str:

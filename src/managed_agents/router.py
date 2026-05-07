@@ -162,7 +162,12 @@ async def route_task_execution(
             pass
 
     agent_id_hint = f"\n\nAGENT_ID para read_hermes_inbox: {agent_id}" if agent_id else ""
-    prompt = f"[{task.get('operation_type','other')}] {task['title']}\n\n{task.get('description','')}{agent_id_hint}"
+    company_id_for_hint = task.get("company_id") or ""
+    company_hint = (
+        f"\nCOMPANY_ID para query_rag (consulta da memória corporativa): {company_id_for_hint}"
+        if company_id_for_hint else ""
+    )
+    prompt = f"[{task.get('operation_type','other')}] {task['title']}\n\n{task.get('description','')}{agent_id_hint}{company_hint}"
 
     # Resolve o provider do adapter associado ao agente. Fallback retrocompat:
     # agentes sem agent_adapter_configs usam Anthropic (comportamento antigo).
