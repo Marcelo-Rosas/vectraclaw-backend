@@ -74,6 +74,9 @@ def _build_supabase_mock(
     storage_obj.upload.return_value = MagicMock()
     storage_obj.remove.return_value = MagicMock()
     sb.storage.from_.return_value = storage_obj
+    # Mock list_buckets para que _ensure_rag_bucket_exists encontre o bucket
+    bucket_mock = MagicMock(); bucket_mock.name = "rag-documents"
+    sb.storage.list_buckets.return_value = [bucket_mock]
 
     # rpc (para query)
     sb.rpc.return_value.execute.return_value = MagicMock(data=[])

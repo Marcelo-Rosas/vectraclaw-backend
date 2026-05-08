@@ -23,14 +23,16 @@ Tool query_rag em m3_tools.py expõe query para o CMA (PR 5/5).
 from __future__ import annotations
 
 import hashlib
+import json as _json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Response, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 logger = logging.getLogger("api.rag")
 router = APIRouter(tags=["rag"])
@@ -57,8 +59,100 @@ def _detect_mime(ext: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bucket auto-provisioning
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rag_auto_provision_enabled() -> bool:
+    """RAG_AUTO_PROVISION=true habilita criação automática de bucket no /upload."""
+    return os.getenv("RAG_AUTO_PROVISION", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ensure_rag_bucket_exists(supabase, bucket: str) -> bool:
+    """Verifica se o bucket existe; se não, cria (idempotente) sob env RAG_AUTO_PROVISION.
+
+    Retorna True se o bucket existe (já existia ou acabou de ser criado).
+    Retorna False se não existe e auto-provision está desligado — caller decide
+    como reportar (404/503 com mensagem instrutiva).
+    """
+    try:
+        existing = supabase.storage.list_buckets()
+        # supabase-py 2.x retorna list de objects com .name
+        names = {(b.name if hasattr(b, "name") else b.get("name")) for b in existing}
+        if bucket in names:
+            return True
+    except Exception as e:
+        logger.warning("rag.bucket: list_buckets falhou (%s) — tentando criar mesmo assim", e)
+
+    if not _rag_auto_provision_enabled():
+        logger.info(
+            "rag.bucket: '%s' não existe e RAG_AUTO_PROVISION=false. Crie via dashboard.",
+            bucket,
+        )
+        return False
+
+    try:
+        supabase.storage.create_bucket(bucket, options={"public": False})
+        logger.info("rag.bucket: '%s' criado (auto-provision)", bucket)
+        return True
+    except Exception as e:
+        # Pode falhar com "already exists" se outra request criou simultaneamente
+        msg = str(e).lower()
+        if "already" in msg or "exists" in msg or "duplicate" in msg:
+            return True
+        logger.error("rag.bucket: create_bucket falhou: %s", e)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Models
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Closed enums alinhados a docs/PRD-RAG-categorization (Step 11)
+RagCategoria = Literal["manual", "procedimento", "contrato", "tabela", "email", "outro"]
+RagDepartamento = Literal["operacao", "comercial", "financeiro", "rh", "juridico", "ti"]
+RagConfidencialidade = Literal["publica", "interna", "restrita"]
+
+
+class RagUploadMetadata(BaseModel):
+    """Categorização opcional anexada ao upload. Persiste em rag_documents.metadata."""
+    categoria: Optional[RagCategoria] = None
+    tags: List[str] = Field(default_factory=list, max_length=20)
+    departamento: Optional[RagDepartamento] = None
+    confidencialidade: Optional[RagConfidencialidade] = None
+    data_referencia: Optional[str] = None  # 'YYYY-MM'
+    vinculo_processo_id: Optional[str] = None  # uuid
+
+    @field_validator("data_referencia")
+    @classmethod
+    def _validate_data_referencia(cls, v):
+        if v is None or v == "":
+            return None
+        if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", v):
+            raise ValueError("data_referencia deve seguir 'YYYY-MM' (ex: 2026-05)")
+        return v
+
+    @field_validator("vinculo_processo_id")
+    @classmethod
+    def _validate_uuid(cls, v):
+        if v is None or v == "":
+            return None
+        if not re.match(r"^[0-9a-fA-F-]{36}$", v):
+            raise ValueError("vinculo_processo_id deve ser UUID")
+        return v
+
+    @field_validator("tags")
+    @classmethod
+    def _normalize_tags(cls, v):
+        # Trim + dedupe + lowercase, descarta vazias
+        seen = set()
+        out = []
+        for t in v:
+            t2 = (t or "").strip().lower()
+            if t2 and t2 not in seen:
+                seen.add(t2)
+                out.append(t2)
+        return out
+
 
 class RagQueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
@@ -103,11 +197,16 @@ async def upload_rag_document(
     request: Request,
     company_id: str,
     arquivo: UploadFile = File(...),
+    metadata: Optional[str] = Form(None),
 ):
     """Upload de documento + dispara ingestão assíncrona via Mnemos.
 
     Idempotência: re-upload do mesmo arquivo (sha256 igual) retorna a row
     existente — não duplica em rag_documents nem cria task duplicada.
+
+    Metadata (Form field opcional, JSON string): categoria, tags,
+    departamento, confidencialidade, data_referencia, vinculo_processo_id.
+    Validado via RagUploadMetadata; persiste em `rag_documents.metadata`.
     """
     from src.api import supabase, validate_jwt_company_id
     from src.agents.mnemos import MNEMOS_AGENT_ID
@@ -115,6 +214,17 @@ async def upload_rag_document(
     validate_jwt_company_id(request.state.token, company_id)
     if not supabase:
         raise HTTPException(503, "supabase_required")
+
+    # Parse + valida metadata se fornecido
+    metadata_dict: Dict[str, Any] = {}
+    if metadata:
+        try:
+            raw = _json.loads(metadata)
+            metadata_dict = RagUploadMetadata(**raw).model_dump(exclude_none=True)
+        except _json.JSONDecodeError as e:
+            raise HTTPException(422, f"metadata: JSON inválido — {e}")
+        except ValidationError as e:
+            raise HTTPException(422, f"metadata: {e.errors()}")
 
     filename = arquivo.filename or "unnamed"
     ext = _detect_ext(filename)
@@ -133,6 +243,14 @@ async def upload_rag_document(
     storage_path = f"{company_id}/{sha256}{ext}"
     mime_type = _detect_mime(ext)
     bucket = os.getenv("RAG_STORAGE_BUCKET", _RAG_DEFAULT_BUCKET)
+
+    # Garante que o bucket existe (auto-provision se RAG_AUTO_PROVISION=true)
+    if not _ensure_rag_bucket_exists(supabase, bucket):
+        raise HTTPException(
+            503,
+            f"Bucket Storage '{bucket}' não existe. Crie via dashboard ou "
+            f"defina RAG_AUTO_PROVISION=true no env.",
+        )
 
     # Idempotência: já existe?
     existing = (
@@ -173,7 +291,7 @@ async def upload_rag_document(
 
     # Insert rag_documents (status='uploaded')
     now_iso = datetime.now(timezone.utc).isoformat()
-    insert_doc_row = {
+    insert_doc_row: Dict[str, Any] = {
         "company_id": company_id,
         "filename": filename,
         "storage_path": storage_path,
@@ -183,6 +301,8 @@ async def upload_rag_document(
         "status": "uploaded",
         "uploaded_at": now_iso,
     }
+    if metadata_dict:
+        insert_doc_row["metadata"] = metadata_dict
     try:
         doc_res = supabase.table("rag_documents").insert(insert_doc_row).execute()
         if not doc_res.data:
