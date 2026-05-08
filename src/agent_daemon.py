@@ -30,6 +30,10 @@ class ResilientHarnessDaemon:
         self._supabase = None
         self._agent_config: Dict[str, Any] = {}  # carregado no startup
         self._lock_file: Optional[Path] = None
+        # VEC-377 — idle heartbeat tick: garante visibilidade de "Live" no dashboard
+        # mesmo quando daemon está polando sem tasks. Configurável via env.
+        self._idle_heartbeat_interval = int(os.getenv("DAEMON_IDLE_HEARTBEAT_SECONDS", "30"))
+        self._last_heartbeat_at: Optional[datetime] = None
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
@@ -754,6 +758,54 @@ class ResilientHarnessDaemon:
             logger.error("dispatch_research failed: %s", e)
             return {"output_json": {"error_detail": {"code": "insert_failed", "message": str(e)}}, "cost_usd": 0.0}
 
+    def _emit_idle_heartbeat(self) -> None:
+        """VEC-377 — emite heartbeat 'idle' periódico durante polling sem task.
+
+        Rate-limited por self._idle_heartbeat_interval (default 30s).
+        Beneficia visibilidade do daemon no dashboard ("Live" + burn rate)
+        mesmo sem processar tasks. Falha silenciosa: erro de heartbeat
+        nunca derruba o polling loop.
+        """
+        if not self.agent_id:
+            return
+        now = datetime.now(timezone.utc)
+        if self._last_heartbeat_at is not None:
+            elapsed = (now - self._last_heartbeat_at).total_seconds()
+            if elapsed < self._idle_heartbeat_interval:
+                return  # rate-limited
+
+        client = self._get_supabase()
+        if not client:
+            return
+        try:
+            # company_id derivado do agente (cache em _agent_config se disponível)
+            company_id = self._agent_config.get("company_id")
+            if not company_id:
+                ag = client.table("agents").select("company_id").eq("id", self.agent_id).maybe_single().execute()
+                if ag.data:
+                    company_id = ag.data.get("company_id")
+                    self._agent_config["company_id"] = company_id
+
+            row = {
+                "agent_id": self.agent_id,
+                "status": "idle",
+                "tokens_used": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0,
+                "log_excerpt": "daemon polling, sem tasks pendentes",
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+            }
+            if company_id:
+                row["company_id"] = company_id
+
+            client.table("heartbeats").insert(row).execute()
+            self._last_heartbeat_at = now
+        except Exception as e:
+            # Não polui logs com warning a cada 30s; só debug.
+            logger.debug("idle heartbeat skipped: %s", e)
+
     def run_forever(self):
         if not self._acquire_lock():
             sys.exit(1)
@@ -798,6 +850,8 @@ class ResilientHarnessDaemon:
 
                     self.check_and_trigger_routines()
                     self._poll_research_tasks()
+                    # VEC-377 — emite heartbeat idle periodicamente (rate-limited)
+                    self._emit_idle_heartbeat()
                     time.sleep(self.polling_interval)
 
                 except KeyboardInterrupt:
