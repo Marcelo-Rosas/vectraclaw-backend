@@ -291,6 +291,11 @@ class ResilientHarnessDaemon:
             result = self._dispatch_research(task)
             return _json.dumps(result)
 
+        if op_type == "rag-ingest":
+            from src.agents.mnemos import entrypoint as mnemos_entry
+            result = mnemos_entry(task, self._get_supabase())
+            return _json.dumps(result)
+
         # Default: forward to claude -p
         prompt = f"[{op_type}] {task.get('title', '')}\n\n{task.get('description', '')}"
         logger.info("claude -p prompt: %s", prompt[:120])
