@@ -4165,14 +4165,41 @@ class TaskDispatchInput(BaseModel):
         extra = "ignore"
 
 
+def _default_execution_config_payload(agent_id: str, company_id: Optional[str]) -> Dict[str, Any]:
+    """Default REALTIME ativo para agentes sem row em agent_execution_configs.
+    Formato espelha AgentExecutionConfig.to_zod_dict() (camelCase, ISO Z).
+    O `id` começa com 'default-' como sentinela — frontend só lê os campos
+    de config, então não precisa distinguir, mas a marcação é útil em logs."""
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "id": f"default-{agent_id}",
+        "companyId": company_id or "",
+        "agentId": agent_id,
+        "executionMode": "REALTIME",
+        "triggerConfig": {},
+        "functionUrl": None,
+        "authSecretRef": None,
+        "authHeaderName": None,
+        "isActive": True,
+        "createdAt": now_iso,
+        "updatedAt": now_iso,
+    }
+
+
 @app.get("/api/agents/{agent_id}/execution-config")
 @app.get("/agents/{agent_id}/execution-config")
 async def get_agent_execution_config(request: Request, agent_id: str):
+    """Retorna a config de execução do agent. Quando a row ainda não existe,
+    devolve um default REALTIME ativo em vez de 404 — frontend renderiza
+    o form em estado limpo e o save subsequente cria a row. Migration
+    20260510120000 já fez backfill dos agentes sistema (Mnemos, Morpheus,
+    HermesReporter, Kronos), mas o default protege contra agentes futuros
+    criados fora de _persist_agent_atomic (seeds, manual inserts)."""
     if not supabase:
         row = next((r for r in MOCK_AGENT_EXECUTION_CONFIGS if r.get("agentId") == agent_id), None)
-        if not row:
-            raise HTTPException(status_code=404, detail="agent_execution_config_not_found")
-        return row
+        if row:
+            return row
+        return _default_execution_config_payload(agent_id, company_id=None)
 
     try:
         caller_company = _resolve_company_id(request)
@@ -4185,7 +4212,7 @@ async def get_agent_execution_config(request: Request, agent_id: str):
             .execute()
         )
         if not res.data:
-            raise HTTPException(status_code=404, detail="agent_execution_config_not_found")
+            return _default_execution_config_payload(agent_id, company_id=caller_company)
         row = res.data[0]
         if caller_company and row.get("company_id") and row.get("company_id") != caller_company:
             raise HTTPException(status_code=403, detail="cross_company_forbidden")
