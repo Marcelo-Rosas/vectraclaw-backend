@@ -279,6 +279,14 @@ class ResilientHarnessDaemon:
             result = mnemos_entry(task, self._get_supabase())
             return _json.dumps(result)
 
+        # VEC-388 PR1 - Athena (9o daemon, PMOia Heldman/PMBOK)
+        # Branch DEVE vir antes de oracle- para garantir matching exato
+        # mesmo que algum prefixo futuro coincida.
+        if op_type.startswith("athena-"):
+            from src.agents.athena import execute_specialty as athena_execute
+            result = asyncio.run(athena_execute(task, self._get_supabase()))
+            return _json.dumps(result)
+
         if op_type.startswith("oracle-"):
             from src.agents.oracle import execute_specialty
             result = asyncio.run(execute_specialty(task, self._get_supabase()))

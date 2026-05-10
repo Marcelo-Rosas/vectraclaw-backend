@@ -17,6 +17,7 @@ Cada agente é despachado pelo `agent_daemon.py` quando uma `vectraclip.task` ch
 | Hodos | `0d6e56cc-28b6-4382-96cd-1952b890d412` | qualp / rotas | `hodos.py` |
 | **Kronos** | `9c8d7e6f-5a4b-4321-9876-543210fedcba` | `scrape-backlog`, `entrypoint-backlog`, `conciliacao-backlog`, `audit`, `apply` | `kronos.py`, `kronos_scrape.py`, `kronos_apply.py` |
 | **Mnemos** | `00000000-0000-0000-0000-000000000003` | `rag-ingest` (RAG corpus curator) | `mnemos.py` |
+| **Athena** | `ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d` | `athena-classify`, `athena-charter`, `athena-stakeholder-map`, `athena-risk-register`, `athena-evm`, `athena-rag-ingest`, `athena-audit`, `athena-recommend`, `athena-prioritize` | `athena.py`, `athena_schemas.py` (PR2: `src/services/athena_rag.py`) |
 
 **SipocResearcher** é serviço (não agente próprio): `sipoc_researcher.py` é chamado via `/api/sipoc/research` (não tem AGENT_ID).
 
