@@ -119,6 +119,7 @@ class Task(CamelModel):
         "financial-audit",
         "financial-bookkeeping",
         "conciliacao-backlog",
+        "rag-ingest",
         "other",
     ] = "other"
     budget_limit: int
