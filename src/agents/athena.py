@@ -1894,9 +1894,461 @@ async def _handle_rag_ingest(prompt: str, input_data: Dict[str, Any]) -> Dict[st
     }
 
 
-async def _handle_prioritize_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """VEC-390: ranking ponderado entre múltiplos goals usando weighted_scoring."""
-    return _stub_output("athena-prioritize", input_data.get("_task_id", ""))
+_PRIORITIZE_DEFAULT_CRITERIA = [
+    {
+        "key": "potencial_lucro",
+        "label": "Potencial de Lucro",
+        "weight": 0.30,
+        "scoring_hints": [
+            "1 = ROI estimado < R$ 5k/ano",
+            "5 = ROI estimado > R$ 100k/ano",
+        ],
+    },
+    {
+        "key": "urgencia_estrategica",
+        "label": "Urgência Estratégica",
+        "weight": 0.25,
+        "scoring_hints": [
+            "1 = sem deadline ou janela > 12 meses",
+            "5 = deadline < 3 meses ou risco regulatório iminente",
+        ],
+    },
+    {
+        "key": "alinhamento_portfolio",
+        "label": "Alinhamento Portfólio",
+        "weight": 0.25,
+        "scoring_hints": [
+            "1 = não conecta com strategic_priorities",
+            "5 = entrega direta de prioridade estratégica top-3",
+        ],
+    },
+    {
+        "key": "viabilidade_recursos",
+        "label": "Viabilidade de Recursos",
+        "weight": 0.20,
+        "scoring_hints": [
+            "1 = equipe/agentes saturados, impacta projetos in_progress",
+            "5 = recursos prontos, sem conflito",
+        ],
+    },
+]
+
+
+def _resolve_prioritization_criteria(
+    company_context: Dict[str, Any],
+) -> tuple[list, int]:
+    """Resolve critérios de priorização: usa companies.context_json se válido,
+    senão fallback hardcoded default. Retorna (criteria_list, version).
+
+    Validações para usar DB criteria:
+    - lista não-vazia
+    - cada item tem key, label, weight
+    - soma de weights = 1.0 (tolerância 0.01)
+    """
+    raw = (company_context or {}).get("prioritization_criteria") or {}
+    db_criteria = raw.get("criteria")
+    if not isinstance(db_criteria, list) or len(db_criteria) < 2:
+        return [dict(c) for c in _PRIORITIZE_DEFAULT_CRITERIA], 0
+
+    try:
+        total_w = sum(float(c.get("weight", 0)) for c in db_criteria)
+        if abs(total_w - 1.0) > 0.01:
+            logger.warning(
+                "athena-prioritize: DB criteria weights sum=%.4f (esperado 1.0). "
+                "Usando default fallback.", total_w
+            )
+            return [dict(c) for c in _PRIORITIZE_DEFAULT_CRITERIA], 0
+        # Normaliza pra schema esperado (drop campos extras)
+        cleaned = []
+        for c in db_criteria:
+            cleaned.append({
+                "key": c.get("key"),
+                "label": c.get("label"),
+                "weight": float(c.get("weight")),
+                "scoring_hints": list(c.get("scoring_hints") or []),
+            })
+        version = int(raw.get("version") or 0)
+        return cleaned, version
+    except Exception as exc:
+        logger.warning("athena-prioritize: erro ao parsear DB criteria (%s). Usando fallback.", exc)
+        return [dict(c) for c in _PRIORITIZE_DEFAULT_CRITERIA], 0
+
+
+def _compute_weighted_score(
+    ratings_by_criterion: Dict[str, int],
+    criteria: list,
+) -> tuple[float, list]:
+    """Calcula score ponderado para um goal a partir de ratings 1-5 por critério.
+
+    Função PURA. Retorna (total_score, breakdown_list) onde breakdown contém
+    weighted_contribution = rating × weight por critério.
+    """
+    breakdown = []
+    total = 0.0
+    for c in criteria:
+        key = c["key"]
+        rating = int(ratings_by_criterion.get(key, 0))
+        if rating < 1 or rating > 5:
+            raise ValueError(f"rating de '{key}' fora do range 1-5: {rating}")
+        weight = float(c["weight"])
+        wc = round(rating * weight, 4)
+        total += wc
+        breakdown.append({
+            "criterion_key": key,
+            "rating": rating,
+            "weight": weight,
+            "weighted_contribution": wc,
+            # rationale será preenchido pelo handler com texto do Gemini
+        })
+    return round(total, 4), breakdown
+
+
+async def _handle_prioritize(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-406 (real, output-only): ranking ponderado entre múltiplos goals
+    (Heldman cap.4 weighted scoring).
+
+    Pipeline:
+      1. Lê goal_ids[] do input_data (2-10 goals da mesma company)
+      2. SELECT goals + valida kind=project + conf>=0.7 + mesma company
+      3. SELECT companies.context_json.prioritization_criteria
+         (fallback default 4 critérios se ausente/inválido)
+      4. Gemini pontua cada goal × critério (rating 1-5 + rationale curta)
+      5. Python calcula score ponderado e ordena ranking
+      6. Gemini gera narrative_md + recomendações
+      7. Pydantic PrioritizeOutput strict valida
+
+    Args:
+        input_data: dict com `_supabase`, `_task_id`, `_company_id`,
+                    `goal_ids` (List[str]), opcional `scope_note`.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    import json as _json
+
+    from src.agents.athena_schemas import PrioritizeOutput, ValidationBlock
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+    goal_ids = input_data.get("goal_ids") or []
+    scope_note = input_data.get("scope_note") or ""
+
+    if supabase is None:
+        return _prioritize_error_output(task_id, started_at, "missing_supabase",
+                                        "Cliente Supabase não disponível")
+    if not isinstance(goal_ids, list) or len(goal_ids) < 2 or len(goal_ids) > 10:
+        return _prioritize_error_output(
+            task_id, started_at, "invalid_goal_ids",
+            f"input.goal_ids deve ter 2-10 entradas. Recebido: {len(goal_ids) if isinstance(goal_ids, list) else type(goal_ids).__name__}",
+        )
+
+    # 1) SELECT goals
+    try:
+        goals_res = (
+            supabase.table("goals")
+            .select("id,company_id,title,metric,target,kind,confidence,business_case_strength,pmoia_metadata")
+            .in_("id", goal_ids)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("athena-prioritize select goals failed task=%s: %s", task_id, exc)
+        return _prioritize_error_output(task_id, started_at, "goals_select_failed", str(exc))
+
+    goals = goals_res.data or []
+    if len(goals) != len(goal_ids):
+        missing = set(goal_ids) - {g["id"] for g in goals}
+        return _prioritize_error_output(
+            task_id, started_at, "goals_missing",
+            f"Goals não encontrados: {sorted(missing)}",
+        )
+
+    # Cross-tenant guard
+    companies_in_set = {str(g.get("company_id")) for g in goals}
+    if len(companies_in_set) > 1:
+        return _prioritize_error_output(
+            task_id, started_at, "multi_company_goals",
+            f"Goals de múltiplas companies não permitido: {companies_in_set}",
+        )
+    if company_id and companies_in_set != {str(company_id)}:
+        return _prioritize_error_output(
+            task_id, started_at, "company_mismatch",
+            f"goals company_id != task company_id ({companies_in_set} != {company_id})",
+        )
+
+    # Defense-in-depth: todos goals precisam estar classificados como project
+    bad_goals = []
+    for g in goals:
+        if g.get("kind") != "project":
+            bad_goals.append(f"{g['id']}(kind={g.get('kind')!r})")
+            continue
+        try:
+            if g.get("confidence") is None or float(g["confidence"]) < 0.7:
+                bad_goals.append(f"{g['id']}(conf={g.get('confidence')})")
+        except (TypeError, ValueError):
+            bad_goals.append(f"{g['id']}(conf_invalid)")
+    if bad_goals:
+        return _prioritize_error_output(
+            task_id, started_at, "goals_not_classified",
+            f"athena-prioritize exige todos os goals kind=project + conf>=0.7. Inválidos: {bad_goals}",
+        )
+
+    # 2) Critérios (DB ou fallback)
+    goals_company_id = next(iter(companies_in_set))
+    company_context = _get_company_context(supabase, goals_company_id)
+    criteria, criteria_version = _resolve_prioritization_criteria(company_context)
+
+    # 3) Gemini pontua cada goal × critério
+    user_prompt = _build_prioritize_prompt(goals, criteria, scope_note)
+    try:
+        text, llm_meta = await gemini_generate(
+            ATHENA_DEFAULT_MODEL,
+            user_prompt,
+            system_instruction=_PRIORITIZE_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("athena-prioritize gemini call failed task=%s", task_id)
+        return _prioritize_error_output(task_id, started_at, "gemini_call_failed", str(exc))
+
+    try:
+        gemini_payload = _json.loads(text)
+    except Exception as exc:
+        return _prioritize_error_output(
+            task_id, started_at, "gemini_invalid_json",
+            f"JSON inválido: {exc}. Raw[:200]={text[:200]!r}",
+        )
+
+    # 4) Python calcula scores (anti-hallucination — Gemini só dá ratings)
+    gemini_scores = gemini_payload.get("scores_by_goal") or {}
+    if not isinstance(gemini_scores, dict):
+        return _prioritize_error_output(
+            task_id, started_at, "gemini_missing_scores",
+            f"Gemini retornou scores_by_goal inválido: type={type(gemini_scores).__name__}",
+        )
+
+    ranking = []
+    for g in goals:
+        gid = str(g["id"])
+        gscore_block = gemini_scores.get(gid)
+        if not isinstance(gscore_block, dict):
+            return _prioritize_error_output(
+                task_id, started_at, "missing_scores_for_goal",
+                f"Gemini não retornou scores_by_goal['{gid}']. Disponíveis: {list(gemini_scores.keys())}",
+            )
+        ratings = gscore_block.get("ratings") or {}
+        rationales = gscore_block.get("rationales") or {}
+        try:
+            total, breakdown_partial = _compute_weighted_score(ratings, criteria)
+        except Exception as exc:
+            return _prioritize_error_output(
+                task_id, started_at, "compute_failed",
+                f"Erro ao calcular score do goal {gid}: {exc}",
+            )
+        # Preenche rationale por critério
+        for item in breakdown_partial:
+            item["rationale"] = (rationales.get(item["criterion_key"])
+                                  or "Avaliação automática Athena").strip()
+            if len(item["rationale"]) < 10:
+                item["rationale"] = item["rationale"] + " (Athena PMOia weighted scoring)"
+        ranking.append({
+            "goal_id": gid,
+            "goal_title": g.get("title") or "(sem título)",
+            "total_score": total,
+            "breakdown": breakdown_partial,
+        })
+
+    # 5) Ordena DESC e atribui rank sequencial
+    ranking.sort(key=lambda r: r["total_score"], reverse=True)
+    for i, r in enumerate(ranking, start=1):
+        r["rank"] = i
+
+    # 6) Monta envelope
+    completed_at = _dt.now(_tz.utc).isoformat()
+    envelope = {
+        "handler_name": "athena-prioritize",
+        "execution_id": task_id,
+        "execution_started_at": started_at,
+        "execution_completed_at": completed_at,
+        "inputs_used": {
+            "goal_ids": [str(g) for g in goal_ids],
+            "goals_count": len(goals),
+            "weights_used": {c["key"]: c["weight"] for c in criteria},
+            "criteria_version": criteria_version,
+            "scope_note": scope_note,
+        },
+        "tools_techniques_applied": ["expert_judgment", "weighted_scoring"],
+        "outputs": {
+            "ranking": ranking,
+            "narrative_md": gemini_payload.get("narrative_md", ""),
+            "execution_recommendations": gemini_payload.get("execution_recommendations", []),
+            "score_gaps": gemini_payload.get("score_gaps", {
+                "largest_gap": "Análise de gap não disponível",
+                "tightest_competition": "Análise de empate não disponível",
+            }),
+            "criteria_used": criteria,
+            "criteria_version": criteria_version,
+        },
+        "validation": ValidationBlock(
+            all_required_inputs_present=True,
+            confidence=0.9,
+            warnings=[],
+            needs_human_review=False,
+        ).model_dump(),
+        "citations": [],
+    }
+
+    try:
+        PrioritizeOutput.model_validate(envelope)
+    except Exception as exc:
+        logger.exception("athena-prioritize pydantic validation failed task=%s", task_id)
+        return _prioritize_error_output(
+            task_id, started_at, "pydantic_validation_failed",
+            f"{exc}. ranking_count={len(ranking)}",
+        )
+
+    # 7) Cost
+    tokens = {
+        "input": int(llm_meta.get("input_token_count") or 0),
+        "output": int(llm_meta.get("output_token_count") or 0),
+    }
+    tokens["total"] = tokens["input"] + tokens["output"]
+    envelope["metadata"] = {"tokens": tokens}
+    cost_usd = _calc_cost(tokens)
+
+    logger.info(
+        "athena-prioritize done task=%s goals=%d criteria=%d top=%s(%.2f) tokens=%d cost=%.6f",
+        task_id, len(goals), len(criteria),
+        ranking[0]["goal_id"][:8], ranking[0]["total_score"],
+        tokens["total"], cost_usd,
+    )
+
+    return {
+        "output_json": envelope,
+        "cost_usd": cost_usd,
+        "status_override": "done",
+    }
+
+
+def _prioritize_error_output(
+    task_id: str, started_at: str, code: str, message: str,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-prioritize",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "status": "error",
+                "code": code,
+                "message": message,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": False,
+                "confidence": 0.0,
+                "warnings": [code],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "blocked",
+    }
+
+
+_PRIORITIZE_SYSTEM_PROMPT = """Você é Athena, PMOia da Vectra Cargo, especialista em PMBOK 5ª (Kim Heldman, cap.4 — modelos de seleção de projetos por pontuação ponderada).
+
+Sua tarefa: pontuar cada GOAL contra cada CRITÉRIO em escala 1-5 e fornecer rationale curta por (goal × critério). **NÃO calcule scores ponderados** — Python faz isso a partir dos seus ratings. Sua função é avaliar 1-5.
+
+REGRAS HARD:
+1. rating ∈ {1, 2, 3, 4, 5} (inteiro). Qualquer outro valor é REJEITADO.
+2. Para CADA goal, pontue TODOS os critérios fornecidos. Omitir critério = REJEITADO.
+3. rationale por (goal × critério) ≥10 chars, concreta. Cite fato do goal (ex: deadline, ROI estimado).
+4. narrative_md ≥100 chars com 2-4 parágrafos cobrindo: contexto do batch, top-3 e por que, riscos do desempate.
+5. execution_recommendations ≥1: passos acionáveis (ex: "Iniciar charter do Goal #1 imediatamente", "Goal #2 pode rodar em paralelo se RH ok").
+6. score_gaps.largest_gap + score_gaps.tightest_competition: descrição textual de onde o ranking é claro vs ambíguo.
+
+FORMATO DE SAÍDA — apenas JSON, sem markdown:
+{
+  "scores_by_goal": {
+    "<goal_uuid>": {
+      "ratings": {
+        "<criterion_key_1>": <1-5>,
+        "<criterion_key_2>": <1-5>,
+        ...
+      },
+      "rationales": {
+        "<criterion_key_1>": "<≥10 chars>",
+        "<criterion_key_2>": "<≥10 chars>",
+        ...
+      }
+    },
+    "<goal_uuid_2>": { ... }
+  },
+  "narrative_md": "## Ranking Analysis\\n\\n...",
+  "execution_recommendations": ["...", "..."],
+  "score_gaps": {
+    "largest_gap": "rank 1 → rank 2 com diferença de X",
+    "tightest_competition": "rank N e N+1 quase empatados"
+  }
+}"""
+
+
+def _build_prioritize_prompt(
+    goals: list,
+    criteria: list,
+    scope_note: str,
+) -> str:
+    import json as _json
+
+    goals_block = []
+    for g in goals:
+        pmoia = g.get("pmoia_metadata") or {}
+        rationale = pmoia.get("classification_rationale") or "(não disponível)"
+        goals_block.append({
+            "goal_id": g["id"],
+            "title": g.get("title"),
+            "metric": g.get("metric"),
+            "target": g.get("target"),
+            "kind": g.get("kind"),
+            "confidence": g.get("confidence"),
+            "business_case_strength": g.get("business_case_strength"),
+            "classification_rationale": rationale,
+        })
+
+    criteria_block = [
+        {
+            "key": c["key"],
+            "label": c["label"],
+            "weight": c["weight"],
+            "scoring_hints": c.get("scoring_hints", []),
+        }
+        for c in criteria
+    ]
+
+    return f"""SCOPE
+=====
+{scope_note or '(sem escopo extra)'}
+
+GOALS A RANKEAR ({len(goals)} entradas)
+========================================
+{_json.dumps(goals_block, ensure_ascii=False, indent=2)}
+
+CRITÉRIOS DE PONTUAÇÃO (com weights — Python calcula score final)
+==================================================================
+{_json.dumps(criteria_block, ensure_ascii=False, indent=2)}
+
+INSTRUÇÃO
+=========
+Para CADA goal, pontue CADA critério em 1-5 com rationale concreta (cite fato do goal).
+Use as scoring_hints como guia. NÃO calcule total_score — Python faz isso.
+Retorne APENAS o JSON conforme schema do system prompt. Sem markdown wrapper."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1918,7 +2370,7 @@ _SPECIALTY_DISPATCH = {
     "athena-audit":            _handle_audit_stub,
     "athena-recommend":        _handle_recommend_stub,
     # VEC-390 (Prioritizer — mandato 3)
-    "athena-prioritize":       _handle_prioritize_stub,
+    "athena-prioritize":       _handle_prioritize,
 }
 
 
