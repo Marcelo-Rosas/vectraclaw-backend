@@ -478,6 +478,50 @@ class PrioritizeOutput(HandlerOutputBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# AUDIT (athena-audit) — VEC-407 (slice 1/3 do VEC-389)
+# Output-only. Read-only sobre vectraclip.agents + agent_specialty_configs.
+# ════════════════════════════════════════════════════════════════════════════
+AgentGrade = Literal["stub", "ok", "good", "excellent"]
+CoverageRecommendationKind = Literal[
+    "hire_new_agent", "add_specialty", "rewrite_system_prompt", "consolidate_agents"
+]
+CoverageSeverity = Literal["low", "medium", "high", "critical"]
+
+
+class AgentScorecard(BaseModel):
+    agent_id: str = Field(min_length=10)
+    agent_name: str = Field(min_length=2)
+    quality_score: int = Field(ge=0, le=4)
+    prompt_length: int = Field(ge=0)
+    specialty_count: int = Field(ge=0)
+    is_system: bool
+    flags: List[str] = Field(default_factory=list)
+    grade: AgentGrade
+
+
+class CoverageGap(BaseModel):
+    domain: str = Field(min_length=2)
+    description: str = Field(min_length=20)
+    recommendation_kind: CoverageRecommendationKind
+    affected_goal_kinds: List[str] = Field(default_factory=list)
+    severity: CoverageSeverity
+
+
+class AuditOutputs(BaseModel):
+    agent_scorecards: List[AgentScorecard] = Field(min_length=1)
+    coverage_gaps: List[CoverageGap] = Field(default_factory=list)
+    recommendations_textual: List[str] = Field(default_factory=list)
+    audit_summary_md: str = Field(min_length=200)
+    total_agents: int = Field(ge=1)
+    agents_below_threshold: int = Field(ge=0)
+
+
+class AuditOutput(HandlerOutputBase):
+    handler_name: Literal["athena-audit"] = "athena-audit"
+    outputs: AuditOutputs  # type: ignore[assignment]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # CLASSIFY (athena-classify) — gate de entrada
 # ════════════════════════════════════════════════════════════════════════════
 GoalKind = Literal["project", "operation", "undecided"]
@@ -628,7 +672,7 @@ SCHEMA_BY_OPERATION_TYPE: Dict[str, type[HandlerOutputBase]] = {
     "athena-risk-register":    RiskRegisterOutput,
     "athena-evm":              EVMOutput,
     "athena-rag-ingest":       HandlerOutputBase,
-    "athena-audit":            HandlerOutputBase,
+    "athena-audit":            AuditOutput,
     "athena-recommend":        HandlerOutputBase,
     "athena-prioritize":       PrioritizeOutput,
 }
