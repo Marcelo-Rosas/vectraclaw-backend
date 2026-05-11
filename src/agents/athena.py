@@ -96,9 +96,336 @@ def _stub_output(operation_type: str, task_id: str = "") -> Dict[str, Any]:
 # Cada um vai ganhar implementação real nos PRs subsequentes
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _handle_classify_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """PR3: classifica goal como project vs operation + SMART breakdown + business_case."""
-    return _stub_output("athena-classify", input_data.get("_task_id", ""))
+async def _handle_classify(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-399 (real): classifica goal como project vs operation + SMART breakdown
+    + business_case_strength + organizational_calibration via Gemini.
+
+    Pipeline:
+      1. SELECT goal de vectraclip.goals (lê title/metric/target/current/parent)
+      2. SELECT companies.context_json (contexto organizacional)
+      3. RAG athena_chunks: top-4 chunks Heldman sobre 'project vs operation'
+      4. Gemini structured output (response_mime_type=application/json)
+      5. Pydantic validation via athena_schemas.ClassifyOutput
+      6. UPDATE goals SET kind/confidence/business_case_strength/pmoia_metadata/
+         classified_at (SOMENTE essas 5 colunas — title/metric/target imutáveis)
+      7. Retorna envelope I/T/O PMBOK
+
+    Sem encadeamento automático para athena-charter (PR4) — handler real ainda
+    não existe; field `next_handler` no output sinaliza intenção apenas.
+
+    Args:
+        prompt: ignorado (handler dirigido por goal_id, não por prompt livre).
+        input_data: dict com `_supabase`, `_task_id`, `_company_id`, `goal_id`.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    import json as _json
+
+    from src.agents.athena_schemas import ClassifyOutput, ValidationBlock
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+    goal_id = input_data.get("goal_id")
+
+    # ─── Pré-validação de inputs obrigatórios ─────────────────────────────
+    if not goal_id:
+        return _classify_error_output(
+            task_id, started_at, "missing_goal_id",
+            "input_json.goal_id é obrigatório para athena-classify",
+        )
+    if supabase is None:
+        return _classify_error_output(
+            task_id, started_at, "missing_supabase",
+            "Cliente Supabase não disponível (esperado via input_data['_supabase'])",
+        )
+
+    # ─── 1) Carrega goal ──────────────────────────────────────────────────
+    try:
+        goal_res = (
+            supabase.table("goals")
+            .select("id,company_id,parent_goal_id,title,metric,target,current,kind,confidence,business_case_strength")
+            .eq("id", goal_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("athena-classify select goal failed task=%s goal=%s", task_id, goal_id)
+        return _classify_error_output(
+            task_id, started_at, "goal_select_failed", str(exc),
+        )
+    if not goal_res.data:
+        return _classify_error_output(
+            task_id, started_at, "goal_not_found",
+            f"vectraclip.goals not found: id={goal_id}",
+        )
+    goal = goal_res.data[0]
+    # Defense-in-depth: confirma multi-tenancy (handler não classifica goal de outra company)
+    if company_id and str(goal.get("company_id")) != str(company_id):
+        return _classify_error_output(
+            task_id, started_at, "company_mismatch",
+            f"goal.company_id ({goal.get('company_id')}) != task.company_id ({company_id})",
+        )
+
+    # ─── 2) Contexto organizacional ───────────────────────────────────────
+    company_context = _get_company_context(supabase, goal.get("company_id"))
+
+    # ─── 3) RAG corpus Athena (best-effort, degrada graceful se vazio) ────
+    rag_chunks: list = []
+    rag_citations: list = []
+    try:
+        from src.services.athena_rag import query_top_k as _athena_query
+        rag_results = await _athena_query(
+            "PMBOK distinguir projeto temporário de operação contínua. SMART. business case.",
+            company_id=goal.get("company_id"),
+            k=4,
+            min_score=0.3,
+            supabase_client=supabase,
+        )
+        for r in rag_results:
+            rag_chunks.append(
+                f"[chunk {r.chunk_index} | score {r.score:.2f} | {r.document_filename or '?'}]\n{r.content[:1500]}"
+            )
+            rag_citations.append({
+                "chunk_id": r.id,
+                "page": r.page_number,
+                "source": r.document_filename,
+                "topic": "PMBOK classify",
+            })
+    except Exception as exc:
+        # RAG falha não bloqueia classificação — apenas reduz qualidade.
+        logger.warning("athena-classify RAG indisponível (degradando): %s", exc)
+
+    # ─── 4) Gemini structured output ──────────────────────────────────────
+    system_instruction = _CLASSIFY_SYSTEM_PROMPT
+    user_prompt = _build_classify_prompt(goal, company_context, rag_chunks)
+
+    try:
+        text, metadata = await gemini_generate(
+            ATHENA_DEFAULT_MODEL,
+            user_prompt,
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("athena-classify gemini call failed task=%s", task_id)
+        return _classify_error_output(
+            task_id, started_at, "gemini_call_failed", str(exc),
+        )
+
+    try:
+        gemini_payload = _json.loads(text)
+    except Exception as exc:
+        return _classify_error_output(
+            task_id, started_at, "gemini_invalid_json",
+            f"Gemini não retornou JSON válido: {exc}. Raw[:200]={text[:200]!r}",
+        )
+
+    # ─── 5) Monta envelope I/T/O + Pydantic validation ────────────────────
+    completed_at = _dt.now(_tz.utc).isoformat()
+    tools_applied = ["expert_judgment", "smart_filter", "business_case_validation"]
+    if rag_chunks:
+        tools_applied.append("rag_retrieval")
+
+    envelope = {
+        "handler_name": "athena-classify",
+        "execution_id": task_id,
+        "execution_started_at": started_at,
+        "execution_completed_at": completed_at,
+        "inputs_used": {
+            "goal_id": goal_id,
+            "goal_title": goal.get("title"),
+            "company_context_keys": list((company_context or {}).keys()),
+            "rag_chunks_used": len(rag_chunks),
+        },
+        "tools_techniques_applied": tools_applied,
+        "outputs": gemini_payload,
+        "validation": ValidationBlock(
+            all_required_inputs_present=True,
+            confidence=float(gemini_payload.get("confidence", 0.0)),
+            warnings=[],
+            needs_human_review=False,
+        ).model_dump(),
+        "citations": rag_citations,
+    }
+
+    try:
+        validated = ClassifyOutput.model_validate(envelope)
+    except Exception as exc:
+        logger.exception("athena-classify pydantic validation failed task=%s", task_id)
+        return _classify_error_output(
+            task_id, started_at, "pydantic_validation_failed",
+            f"{exc}. envelope.outputs={envelope.get('outputs')}",
+        )
+
+    outputs_validated = validated.outputs
+
+    # ─── 6) Persiste em goals (SÓ nas novas colunas; nunca title/metric/target) ─
+    try:
+        update_payload = {
+            "kind": outputs_validated.kind,
+            "confidence": float(outputs_validated.confidence),
+            "business_case_strength": outputs_validated.business_case_strength,
+            "pmoia_metadata": {
+                "smart_breakdown": outputs_validated.smart_breakdown.model_dump(),
+                "classification_rationale": outputs_validated.classification_rationale,
+                "organizational_calibration": outputs_validated.organizational_calibration,
+                "next_handler_suggested": outputs_validated.next_handler,
+                "classified_by_task_id": task_id,
+            },
+            "classified_at": completed_at,
+        }
+        supabase.table("goals").update(update_payload).eq("id", goal_id).execute()
+    except Exception as exc:
+        # UPDATE falhou — não bloqueia retorno do handler (output_json registra),
+        # mas marca needs_human_review para a UI alertar.
+        logger.error("athena-classify goals UPDATE failed (non-fatal): %s", exc)
+        envelope["validation"]["warnings"].append(f"goals_update_failed: {exc}")
+        envelope["validation"]["needs_human_review"] = True
+
+    # ─── 7) Cost (Gemini default rate; cota real virá em refator futuro) ──
+    tokens = {
+        "input": int(metadata.get("input_token_count") or 0),
+        "output": int(metadata.get("output_token_count") or 0),
+    }
+    tokens["total"] = tokens["input"] + tokens["output"]
+    envelope["metadata"] = {"tokens": tokens}
+    cost_usd = _calc_cost(tokens)
+
+    logger.info(
+        "athena-classify done task=%s goal=%s kind=%s confidence=%.2f case=%s tokens=%d cost=%.6f",
+        task_id, goal_id, outputs_validated.kind, outputs_validated.confidence,
+        outputs_validated.business_case_strength, tokens["total"], cost_usd,
+    )
+
+    return {
+        "output_json": envelope,
+        "cost_usd": cost_usd,
+        "status_override": "done",
+    }
+
+
+def _classify_error_output(
+    task_id: str, started_at: str, code: str, message: str,
+) -> Dict[str, Any]:
+    """Envelope I/T/O minimal para erros do handler classify. status=blocked."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-classify",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "status": "error",
+                "code": code,
+                "message": message,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": False,
+                "confidence": 0.0,
+                "warnings": [code],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "blocked",
+    }
+
+
+def _get_company_context(supabase: Any, company_id: Any) -> Dict[str, Any]:
+    """Best-effort: lê companies.context_json para enriquecer o prompt do classify.
+    Retorna {} se row não existir ou erro — degrada graceful."""
+    if not company_id or supabase is None:
+        return {}
+    try:
+        res = (
+            supabase.table("companies")
+            .select("context_json")
+            .eq("company_id", company_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            ctx = res.data[0].get("context_json") or {}
+            return ctx if isinstance(ctx, dict) else {}
+    except Exception as exc:
+        logger.warning("athena-classify company_context lookup failed: %s", exc)
+    return {}
+
+
+_CLASSIFY_SYSTEM_PROMPT = """Você é Athena, PMOia da Vectra Cargo, especialista em PMBOK 5ª edição (Kim Heldman).
+
+Sua tarefa: classificar uma meta organizacional como PROJETO (esforço temporário com começo, meio e fim definidos, produto único) ou OPERAÇÃO (atividade recorrente, contínua, sem entrega única). Quando a evidência é ambígua, retornar 'undecided' e explicar por quê.
+
+REGRAS HARD (não negociáveis):
+1. Se SMART está incompleto (faltam specific/measurable/achievable/relevant/timebound), confidence ≤ 0.6 e kind=undecided.
+2. Se business_case_strength=absent E kind=project, confidence ≤ 0.5 (sem business case não se aprova projeto pela rubrica PMBOK).
+3. classification_rationale tem no mínimo 50 caracteres e cita pelo menos UM critério PMBOK (temporariedade, unicidade, esforço progressivo, restrição tripla, etc).
+4. tools_techniques_applied no JSON de saída SEMPRE inclui 'expert_judgment'. Quando há RAG_CHUNKS, inclua também 'rag_retrieval'.
+
+FORMATO DE SAÍDA — apenas JSON, sem markdown, exatamente o schema:
+{
+  "kind": "project" | "operation" | "undecided",
+  "confidence": <float 0..1>,
+  "classification_rationale": "<min 50 chars, cita critério PMBOK>",
+  "smart_breakdown": {
+    "specific": "<min 20 chars>",
+    "measurable": "<min 10 chars>",
+    "achievable": "<min 10 chars>",
+    "relevant": "<min 10 chars>",
+    "timebound": "<min 10 chars>"
+  },
+  "business_case_strength": "strong" | "adequate" | "weak" | "absent",
+  "organizational_calibration": {
+    "context_used": "<resumo curto do contexto da company aplicado>",
+    "fit_score": <float 0..1>,
+    "notes": "<observações sobre alinhamento estratégico>"
+  },
+  "next_handler": "athena-charter" | null
+}
+
+Defina next_handler='athena-charter' apenas quando kind=project E confidence ≥ 0.7 E business_case_strength em (strong, adequate). Caso contrário, null."""
+
+
+def _build_classify_prompt(
+    goal: Dict[str, Any],
+    company_context: Dict[str, Any],
+    rag_chunks: list,
+) -> str:
+    """Renderiza o prompt do user para o athena-classify."""
+    import json as _json
+
+    rag_block = (
+        "\n\n--- TRECHOS DE HELDMAN/PMBOK (corpus Athena) ---\n"
+        + "\n\n".join(rag_chunks)
+        if rag_chunks else
+        "\n\n(Nenhum trecho do corpus Athena disponível para esta classificação — opere apenas com expert_judgment.)"
+    )
+
+    return f"""META A CLASSIFICAR
+==================
+Título: {goal.get('title')}
+Métrica: {goal.get('metric') or '(não definida)'}
+Alvo: {goal.get('target')}
+Atual: {goal.get('current')}
+Goal pai (UUID): {goal.get('parent_goal_id') or '(sem pai)'}
+
+CONTEXTO ORGANIZACIONAL (companies.context_json)
+================================================
+{_json.dumps(company_context, ensure_ascii=False, indent=2) if company_context else '(sem contexto registrado)'}
+{rag_block}
+
+INSTRUÇÃO
+=========
+Classifique a meta acima conforme PMBOK 5ª. Aplique as REGRAS HARD do system prompt.
+Retorne APENAS o JSON conforme schema. Sem markdown, sem texto antes/depois."""
 
 
 async def _handle_charter_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -229,7 +556,7 @@ async def _handle_prioritize_stub(prompt: str, input_data: Dict[str, Any]) -> Di
 # ─────────────────────────────────────────────────────────────────────────────
 _SPECIALTY_DISPATCH = {
     # VEC-388 (Pipeline PMI — mandato 1)
-    "athena-classify":         _handle_classify_stub,
+    "athena-classify":         _handle_classify,
     "athena-charter":          _handle_charter_stub,
     "athena-stakeholder-map":  _handle_stakeholder_map_stub,
     "athena-risk-register":    _handle_risk_register_stub,
