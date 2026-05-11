@@ -1087,9 +1087,375 @@ Aplique as REGRAS HARD do system prompt.
 Retorne APENAS o JSON conforme schema. Sem markdown, sem texto antes/depois."""
 
 
-async def _handle_risk_register_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """PR5: Risk Register com escala PMBOK 5ª (0.1-0.9 × 0.05-0.80) + secondary/residual/transfer."""
-    return _stub_output("athena-risk-register", input_data.get("_task_id", ""))
+async def _handle_risk_register(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-404 (real, output-only): gera Risk Register PMBOK 5ª no output_json.
+
+    Pipeline (mesmo padrão VEC-401/VEC-403):
+      1. SELECT goal (com kind/confidence/business_case já populados pelo classify)
+      2. Pré-validação: rejeita se goal.kind != 'project' ou confidence < 0.7
+      3. SELECT companies.context_json
+      4. RAG: top-4 chunks Heldman sobre RBS, riscos secundários, residuais, transfer
+      5. Gemini Flash structured output
+      6. Pydantic RiskRegisterOutput STRICT (escala PMBOK 5ª, consistência score=p*i,
+         cor=classification, strategy compatible com nature, transfer_details
+         obrigatório se strategy=transfer, ≥1 opportunity, ≥3 RBS categories)
+      7. Retorna envelope I/T/O sem persistência (não existe tabela risks)
+
+    Args:
+        prompt: ignorado.
+        input_data: dict com `_supabase`, `_task_id`, `_company_id`, `goal_id`.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    import json as _json
+
+    from src.agents.athena_schemas import RiskRegisterOutput, ValidationBlock
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+    goal_id = input_data.get("goal_id")
+
+    if not goal_id:
+        return _risk_register_error_output(
+            task_id, started_at, "missing_goal_id",
+            "input_json.goal_id é obrigatório para athena-risk-register",
+        )
+    if supabase is None:
+        return _risk_register_error_output(
+            task_id, started_at, "missing_supabase",
+            "Cliente Supabase não disponível",
+        )
+
+    # 1) SELECT goal
+    try:
+        goal_res = (
+            supabase.table("goals")
+            .select("id,company_id,title,metric,target,kind,confidence,business_case_strength,pmoia_metadata")
+            .eq("id", goal_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("athena-risk-register select goal failed task=%s goal=%s", task_id, goal_id)
+        return _risk_register_error_output(task_id, started_at, "goal_select_failed", str(exc))
+    if not goal_res.data:
+        return _risk_register_error_output(
+            task_id, started_at, "goal_not_found",
+            f"vectraclip.goals not found: id={goal_id}",
+        )
+    goal = goal_res.data[0]
+
+    if company_id and str(goal.get("company_id")) != str(company_id):
+        return _risk_register_error_output(
+            task_id, started_at, "company_mismatch",
+            f"goal.company_id != task.company_id",
+        )
+
+    # 2) Pré-validação
+    g_kind = goal.get("kind")
+    g_conf = goal.get("confidence")
+    if g_kind != "project":
+        return _risk_register_error_output(
+            task_id, started_at, "goal_not_classified_as_project",
+            f"athena-risk-register exige goal.kind='project'. Atual: kind={g_kind!r}",
+        )
+    try:
+        if g_conf is None or float(g_conf) < 0.7:
+            return _risk_register_error_output(
+                task_id, started_at, "low_classify_confidence",
+                f"athena-risk-register exige goal.confidence >= 0.7. Atual: {g_conf}",
+            )
+    except (TypeError, ValueError):
+        return _risk_register_error_output(
+            task_id, started_at, "invalid_confidence",
+            f"goal.confidence inválido: {g_conf!r}",
+        )
+
+    # 3) Contexto
+    company_context = _get_company_context(supabase, goal.get("company_id"))
+
+    # 4) RAG
+    rag_chunks: list = []
+    rag_citations: list = []
+    try:
+        from src.services.athena_rag import query_top_k as _athena_query
+        rag_results = await _athena_query(
+            "risk register RBS risk breakdown structure secondary residual transfer PMBOK Heldman",
+            company_id=goal.get("company_id"),
+            k=4,
+            min_score=0.3,
+            supabase_client=supabase,
+        )
+        for r in rag_results:
+            rag_chunks.append(
+                f"[chunk {r.chunk_index} | score {r.score:.2f} | {r.document_filename or '?'}]\n{r.content[:1500]}"
+            )
+            rag_citations.append({
+                "chunk_id": r.id,
+                "page": r.page_number,
+                "source": r.document_filename,
+                "topic": "PMBOK risk register",
+            })
+    except Exception as exc:
+        logger.warning("athena-risk-register RAG indisponível (degradando): %s", exc)
+
+    # 5) Gemini
+    user_prompt = _build_risk_register_prompt(goal, company_context, rag_chunks)
+    try:
+        text, metadata = await gemini_generate(
+            ATHENA_DEFAULT_MODEL,
+            user_prompt,
+            system_instruction=_RISK_REGISTER_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("athena-risk-register gemini call failed task=%s", task_id)
+        return _risk_register_error_output(task_id, started_at, "gemini_call_failed", str(exc))
+
+    try:
+        gemini_payload = _json.loads(text)
+    except Exception as exc:
+        return _risk_register_error_output(
+            task_id, started_at, "gemini_invalid_json",
+            f"Gemini não retornou JSON válido: {exc}. Raw[:200]={text[:200]!r}",
+        )
+
+    # 6) Pydantic STRICT
+    completed_at = _dt.now(_tz.utc).isoformat()
+    tools_applied = ["expert_judgment", "risk_analysis", "risk_breakdown_structure"]
+    if rag_chunks:
+        tools_applied.append("rag_retrieval")
+
+    envelope = {
+        "handler_name": "athena-risk-register",
+        "execution_id": task_id,
+        "execution_started_at": started_at,
+        "execution_completed_at": completed_at,
+        "inputs_used": {
+            "goal_id": goal_id,
+            "goal_title": goal.get("title"),
+            "rag_chunks_used": len(rag_chunks),
+        },
+        "tools_techniques_applied": tools_applied,
+        "outputs": gemini_payload,
+        "validation": ValidationBlock(
+            all_required_inputs_present=True,
+            confidence=float(gemini_payload.get("validation_confidence", g_conf or 0.7)),
+            warnings=[],
+            needs_human_review=False,
+        ).model_dump(),
+        "citations": rag_citations,
+    }
+
+    try:
+        RiskRegisterOutput.model_validate(envelope)
+    except Exception as exc:
+        logger.exception("athena-risk-register pydantic validation failed task=%s", task_id)
+        return _risk_register_error_output(
+            task_id, started_at, "pydantic_validation_failed",
+            f"{exc}. envelope.outputs={envelope.get('outputs')}",
+        )
+
+    # 7) Metadata + cost
+    tokens = {
+        "input": int(metadata.get("input_token_count") or 0),
+        "output": int(metadata.get("output_token_count") or 0),
+    }
+    tokens["total"] = tokens["input"] + tokens["output"]
+    envelope["metadata"] = {"tokens": tokens}
+    cost_usd = _calc_cost(tokens)
+
+    risks_count = len(gemini_payload.get("risks", []))
+    logger.info(
+        "athena-risk-register done task=%s goal=%s risks=%d tokens=%d cost=%.6f",
+        task_id, goal_id, risks_count, tokens["total"], cost_usd,
+    )
+
+    return {
+        "output_json": envelope,
+        "cost_usd": cost_usd,
+        "status_override": "done",
+    }
+
+
+def _risk_register_error_output(
+    task_id: str, started_at: str, code: str, message: str,
+) -> Dict[str, Any]:
+    """Envelope I/T/O minimal para erros do handler risk-register. status=blocked."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-risk-register",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "status": "error",
+                "code": code,
+                "message": message,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": False,
+                "confidence": 0.0,
+                "warnings": [code],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "blocked",
+    }
+
+
+_RISK_REGISTER_SYSTEM_PROMPT = """Você é Athena, PMOia da Vectra Cargo, especialista em PMBOK 5ª (Kim Heldman, cap.11 Risk Management).
+
+Sua tarefa: gerar Risk Register completo PMBOK 5ª para um projeto. Aplicar a ESCALA OFICIAL (não inventar números), classificar via probabilidade × impacto, atribuir cores semáforo, mapear estratégia compatível com a natureza (threat/opportunity), e SEMPRE incluir riscos secundários e residuais.
+
+REGRAS HARD (não negociáveis — Pydantic strict valida e rejeita):
+
+1. ESCALA DISCRETA OBRIGATÓRIA:
+   - probability ∈ {0.1, 0.3, 0.5, 0.7, 0.9}
+   - impact ∈ {0.05, 0.10, 0.20, 0.40, 0.80}
+   Qualquer outro valor é REJEITADO.
+
+2. SCORE = round(probability × impact, 4). Calcule corretamente. Ex: 0.7 × 0.40 = 0.2800.
+
+3. CLASSIFICATION derivada de SCORE (4 níveis):
+   - score ≤ 0.0900 → "Baixo"
+   - score ≤ 0.1900 → "Moderado"
+   - score ≤ 0.3500 → "Alto"
+   - score > 0.3500 → "Crítico"
+
+4. CLASSIFICATION_COLOR (emoji semáforo):
+   - Baixo → 🟢
+   - Moderado → 🟡
+   - Alto → 🟠
+   - Crítico → 🔴
+
+5. NATURE ∈ {threat, opportunity}. Heldman é categórico: riscos têm efeito positivo OU negativo. Risk Register sem nenhum opportunity = viés cognitivo → REJEITADO.
+
+6. STRATEGY compatível com NATURE:
+   - threat → eliminate | mitigate | transfer | accept_active | accept_passive
+   - opportunity → exploit | enhance | share | accept
+
+7. TRANSFER_DETAILS obrigatório quando strategy=transfer (sem instrumento financeiro real, "transfer" é só papel — anti-padrão Athena):
+   - transferred_to (≥5 chars), instrument (≥10 chars)
+   - cost_of_transfer_brl_per_unit, expected_loss_brl_without_transfer (ambos ≥0)
+   - net_savings_brl = expected_loss - cost (validado)
+   - counterparty_capacity_validated (bool), counterparty_validation_method (≥10 chars)
+
+8. SECONDARY_RISKS (lista, pode ser vazia): riscos que surgem como CONSEQUÊNCIA da response_plan. Mesma escala oficial.
+
+9. RESIDUAL_RISK (obrigatório por risco): risco remanescente após mitigation. Mesma escala + campo `acceptance` (≥10 chars explicando por que foi aceito).
+
+10. RBS_CATEGORY ∈ {External, Organizational, Project Management, Technical}. Risk Register precisa cobrir pelo menos 3 das 4 categorias — senão Pydantic REJEITA.
+
+11. RISKS DEVE TER ≥5 entradas total (Pydantic min_length=5).
+
+12. RISK_SUMMARY: agregados consistentes com risks[]. any_critical_breached=true se há classification=Crítico.
+
+13. tools_techniques_applied SEMPRE inclui 'expert_judgment', 'risk_analysis', 'risk_breakdown_structure'.
+
+FORMATO DE SAÍDA — apenas JSON, sem markdown:
+{
+  "risks": [
+    {
+      "id": "R-001",
+      "nature": "threat" | "opportunity",
+      "rbs_category": "External" | "Organizational" | "Project Management" | "Technical",
+      "rbs_subcategory": "...",
+      "description": "<≥20 chars>",
+      "probability": 0.1|0.3|0.5|0.7|0.9,
+      "impact": 0.05|0.10|0.20|0.40|0.80,
+      "score": <calculado>,
+      "classification": "Baixo|Moderado|Alto|Crítico",
+      "classification_color": "🟢|🟡|🟠|🔴",
+      "strategy": "<conforme nature>",
+      "response_plan": "<≥30 chars>",
+      "owner_position_id": null,
+      "trigger_indicators": ["..."],
+      "secondary_risks": [],
+      "residual_risk": {
+        "description": "<≥20 chars>",
+        "probability": <escala>, "impact": <escala>, "score": <calc>,
+        "classification": "...", "acceptance": "<≥10 chars>"
+      },
+      "transfer_details": null,
+      "contingency_reserve_brl": 0.0,
+      "review_frequency": "daily|weekly|biweekly|monthly|quarterly"
+    },
+    ... (pelo menos 5 ao todo, com ≥1 opportunity e ≥3 RBS categories)
+  ],
+  "rbs": {
+    "External": ["R-XXX", ...],
+    "Organizational": ["R-XXX", ...],
+    "Project Management": [...],
+    "Technical": [...]
+  },
+  "risk_summary": {
+    "total_risks": N,
+    "critical_count": ..., "high_count": ..., "moderate_count": ..., "low_count": ...,
+    "threats": ..., "opportunities": ...,
+    "highest_score_risk_id": "R-XXX",
+    "any_critical_breached": true|false
+  },
+  "team_health_assessment": null
+}"""
+
+
+def _build_risk_register_prompt(
+    goal: Dict[str, Any],
+    company_context: Dict[str, Any],
+    rag_chunks: list,
+) -> str:
+    import json as _json
+
+    pmoia = goal.get("pmoia_metadata") or {}
+    rationale = pmoia.get("classification_rationale") or "(não disponível)"
+
+    rag_block = (
+        "\n\n--- TRECHOS DE HELDMAN/PMBOK (corpus Athena) ---\n"
+        + "\n\n".join(rag_chunks)
+        if rag_chunks else
+        "\n\n(Nenhum trecho do corpus — opere com expert_judgment.)"
+    )
+
+    return f"""PROJETO COM CHARTER (kind=project)
+====================================
+Título: {goal.get('title')}
+Métrica: {goal.get('metric') or '(não definida)'}
+Alvo: {goal.get('target')}
+
+CLASSIFICAÇÃO PRÉVIA (athena-classify)
+======================================
+- confidence: {goal.get('confidence')}
+- business_case_strength: {goal.get('business_case_strength')}
+- rationale: {rationale}
+
+CONTEXTO ORGANIZACIONAL
+=======================
+{_json.dumps(company_context, ensure_ascii=False, indent=2) if company_context else '(sem contexto)'}
+{rag_block}
+
+INSTRUÇÃO
+=========
+Gere o Risk Register completo conforme PMBOK 5ª:
+- Identifique ≥5 riscos cobrindo ≥3 das 4 categorias RBS (External, Organizational, Project Management, Technical)
+- Pelo menos 1 risco de natureza 'opportunity' (Heldman explícito)
+- Use ESCALA DISCRETA OFICIAL para probability e impact
+- Calcule score, derive classification + emoji color
+- response_plan concreto + residual_risk obrigatório por linha
+- secondary_risks quando a response_plan introduz novos riscos
+- transfer_details obrigatório SE strategy=transfer (instrumento financeiro real)
+
+Aplique as 13 REGRAS HARD do system prompt.
+Retorne APENAS o JSON conforme schema. Sem markdown, sem texto antes/depois."""
 
 
 async def _handle_evm_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1208,7 +1574,7 @@ _SPECIALTY_DISPATCH = {
     "athena-classify":         _handle_classify,
     "athena-charter":          _handle_charter,
     "athena-stakeholder-map":  _handle_stakeholder_map,
-    "athena-risk-register":    _handle_risk_register_stub,
+    "athena-risk-register":    _handle_risk_register,
     "athena-evm":              _handle_evm_stub,
     "athena-rag-ingest":       _handle_rag_ingest,
     # VEC-389 (Coverage Manager — mandato 2)
