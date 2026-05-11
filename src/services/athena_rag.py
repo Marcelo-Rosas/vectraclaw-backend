@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.services.rag.embedder import OpenAIEmbedder
+from src.services.rag.embedder import FallbackEmbedder, GeminiEmbedder, OpenAIEmbedder
 from src.services.rag.models import ChunkResult
 
 logger = logging.getLogger("Athena.RAG")
@@ -138,7 +138,8 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
                     "page_count": extracted.page_count,
                 }
 
-            # 7. Embed (FallbackEmbedder: OpenAI primário, Gemini fallback)
+            # 7. Embed (VEC-397: Gemini primário, OpenAI fallback — cota OpenAI
+            # já estourou em prod no smoke VEC-394 2026-05-11)
             if embedder is None:
                 from src.services.rag.embedder import (
                     FallbackEmbedder,
@@ -146,8 +147,8 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
                     OpenAIEmbedder as _OpenAIEmbedder,
                 )
                 embedder = FallbackEmbedder(
-                    primary=_OpenAIEmbedder(),
-                    fallbacks=[GeminiEmbedder()],
+                    primary=GeminiEmbedder(),
+                    fallbacks=[_OpenAIEmbedder()],
                 )
 
             texts = [c.content for c in chunks]
@@ -240,7 +241,12 @@ async def query_top_k(
     if sb is None:
         raise RuntimeError("Supabase client indisponível em src.api.supabase")
 
-    emb = embedder or OpenAIEmbedder()
+    # VEC-397: default vira FallbackEmbedder (Gemini primário, OpenAI fallback).
+    # Antes era OpenAIEmbedder direto e qualquer 429 derrubava o /athena/query.
+    emb = embedder or FallbackEmbedder(
+        primary=GeminiEmbedder(),
+        fallbacks=[OpenAIEmbedder()],
+    )
     query_embedding = await emb.embed_one(query_text)
     if not query_embedding:
         return []

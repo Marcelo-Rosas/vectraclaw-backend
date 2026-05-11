@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from .embedder import OpenAIEmbedder
+from .embedder import FallbackEmbedder, GeminiEmbedder, OpenAIEmbedder
 from .models import ChunkResult
 
 logger = logging.getLogger("rag.retriever")
@@ -56,7 +56,12 @@ async def query_top_k(
     if sb is None:
         raise RuntimeError("Supabase client indisponível em src.api.supabase")
 
-    emb = embedder or OpenAIEmbedder()
+    # VEC-397: default vira FallbackEmbedder (Gemini primário, OpenAI fallback).
+    # Antes era OpenAIEmbedder direto e qualquer 429 derrubava o /rag/query.
+    emb = embedder or FallbackEmbedder(
+        primary=GeminiEmbedder(),
+        fallbacks=[OpenAIEmbedder()],
+    )
     query_embedding = await emb.embed_one(query_text)
     if not query_embedding:
         return []
