@@ -414,7 +414,49 @@ class RiskRegisterOutput(HandlerOutputBase):
     outputs: RiskRegisterOutputs  # type: ignore[assignment]
 
 
-# Charter, StakeholderMap, EVM, Audit, Recommend, Prioritize:
+# ════════════════════════════════════════════════════════════════════════════
+# CHARTER (athena-charter) — VEC-401 PR4a
+# Output-only (sem persistência em projects ainda — fica para PR4b).
+# ════════════════════════════════════════════════════════════════════════════
+SelectionModel = Literal[
+    "npv",                    # Net Present Value
+    "payback",                # Payback period
+    "weighted_scoring",       # Modelo de scoring ponderado
+    "sacred_cow",             # Projeto político/estratégico (sem ROI mensurável)
+    "discounted_cash_flow",   # DCF
+]
+
+
+class SmartGoal(BaseModel):
+    """Meta SMART concreta dentro do charter."""
+    goal: str = Field(min_length=20)
+    specific: str = Field(min_length=10)
+    measurable: str = Field(min_length=10)
+    achievable: str = Field(min_length=10)
+    relevant: str = Field(min_length=10)
+    timebound: str = Field(min_length=10)
+
+
+class CharterOutputs(BaseModel):
+    """Bloco 'outputs' do athena-charter — 5 elementos PMBOK + SMART + selection."""
+    charter_md: str = Field(min_length=200)
+    business_need: str = Field(min_length=50)
+    scope_description: str = Field(min_length=50)
+    strategic_alignment: str = Field(min_length=30)
+    human_resources_assessment: str = Field(min_length=30)
+    stakeholder_risk_tolerance: str = Field(min_length=30)
+    smart_goals: List[SmartGoal] = Field(min_length=1)
+    red_flags: List[str] = Field(default_factory=list)
+    selection_model: SelectionModel
+    next_steps: List[str] = Field(min_length=1)
+
+
+class CharterOutput(HandlerOutputBase):
+    handler_name: Literal["athena-charter"] = "athena-charter"
+    outputs: CharterOutputs  # type: ignore[assignment]
+
+
+# StakeholderMap, EVM, Audit, Recommend, Prioritize:
 # schemas detalhados nos PRs respectivos. Por ora, todos validam contra
 # HandlerOutputBase (versão genérica).
 
@@ -425,7 +467,7 @@ class RiskRegisterOutput(HandlerOutputBase):
 # ════════════════════════════════════════════════════════════════════════════
 SCHEMA_BY_OPERATION_TYPE: Dict[str, type[HandlerOutputBase]] = {
     "athena-classify":         ClassifyOutput,
-    "athena-charter":          HandlerOutputBase,
+    "athena-charter":          CharterOutput,
     "athena-stakeholder-map":  HandlerOutputBase,
     "athena-risk-register":    RiskRegisterOutput,
     "athena-evm":              HandlerOutputBase,
