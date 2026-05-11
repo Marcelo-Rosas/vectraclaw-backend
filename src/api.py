@@ -6514,6 +6514,7 @@ from src.api_routes import tasks_workflow as _tasks_workflow_routes  # noqa: E40
 from src.api_routes import companies_extras as _companies_extras_routes  # noqa: E402
 from src.api_routes import oracle_chat as _oracle_chat_routes  # noqa: E402
 from src.api_routes import rag as _rag_routes  # noqa: E402
+from src.api_routes import athena as _athena_routes  # noqa: E402
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -6524,4 +6525,5 @@ app.include_router(_tasks_workflow_routes.router)
 app.include_router(_companies_extras_routes.router)
 app.include_router(_oracle_chat_routes.router)
 app.include_router(_rag_routes.router)
+app.include_router(_athena_routes.router)
 
