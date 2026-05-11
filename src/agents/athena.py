@@ -1350,9 +1350,9 @@ REGRAS HARD (não negociáveis — Pydantic strict valida e rejeita):
    - net_savings_brl = expected_loss - cost (validado)
    - counterparty_capacity_validated (bool), counterparty_validation_method (≥10 chars)
 
-8. SECONDARY_RISKS (lista, pode ser vazia): riscos que surgem como CONSEQUÊNCIA da response_plan. Mesma escala oficial.
+8. SECONDARY_RISKS (lista, pode ser vazia): riscos que surgem como CONSEQUÊNCIA da response_plan. Mesma escala oficial. CADA ENTRADA TEM `id` OBRIGATÓRIO (use convenção R-XXX.SR-N — ex: R-001.SR-1).
 
-9. RESIDUAL_RISK (obrigatório por risco): risco remanescente após mitigation. Mesma escala + campo `acceptance` (≥10 chars explicando por que foi aceito).
+9. RESIDUAL_RISK (obrigatório por risco): risco remanescente após mitigation. Mesma escala + campo `acceptance` (≥10 chars explicando por que foi aceito). SEM CAMPO `id` no residual_risk (apenas description, probability, impact, score, classification, acceptance).
 
 10. RBS_CATEGORY ∈ {External, Organizational, Project Management, Technical}. Risk Register precisa cobrir pelo menos 3 das 4 categorias — senão Pydantic REJEITA.
 
@@ -1380,7 +1380,16 @@ FORMATO DE SAÍDA — apenas JSON, sem markdown:
       "response_plan": "<≥30 chars>",
       "owner_position_id": null,
       "trigger_indicators": ["..."],
-      "secondary_risks": [],
+      "secondary_risks": [
+        {
+          "id": "R-001.SR-1",
+          "description": "<≥20 chars descrevendo risco que surge da response_plan>",
+          "probability": 0.1|0.3|0.5|0.7|0.9,
+          "impact": 0.05|0.10|0.20|0.40|0.80,
+          "score": <prob × impact>,
+          "classification": "Baixo|Moderado|Alto|Crítico"
+        }
+      ],
       "residual_risk": {
         "description": "<≥20 chars>",
         "probability": <escala>, "impact": <escala>, "score": <calc>,
