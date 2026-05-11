@@ -131,9 +131,83 @@ async def _handle_recommend_stub(prompt: str, input_data: Dict[str, Any]) -> Dic
     return _stub_output("athena-recommend", input_data.get("_task_id", ""))
 
 
-async def _handle_rag_ingest_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """VEC-388 PR2: ingest de PDFs Heldman/PMBOK no corpus athena_documents/athena_chunks."""
-    return _stub_output("athena-rag-ingest", input_data.get("_task_id", ""))
+async def _handle_rag_ingest(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-394 (real): ingest de PDFs Heldman/PMBOK em athena_documents/athena_chunks.
+
+    Espelha o contrato Mnemos: lê `document_id` de input_data, baixa do
+    Storage bucket `athena-rag`, extrai → chunka → embeda → bulk insert.
+
+    Args:
+        prompt: ignorado (handler é dirigido por document_id, não por prompt).
+        input_data: dict com `_supabase`, `_task_id`, `document_id`, etc.
+
+    Returns:
+        Dict no contrato I/T/O PMBOK com `outputs.chunks_indexed`, mapeado
+        do retorno do `entrypoint` em `src/services/athena_rag.py`.
+    """
+    from src.services.athena_rag import entrypoint as _ingest_entry
+
+    supabase = input_data.get("_supabase")
+    task = {
+        "id": input_data.get("_task_id", ""),
+        "company_id": input_data.get("_company_id"),
+        "input_json": {
+            "document_id": input_data.get("document_id"),
+            "filename": input_data.get("filename"),
+            "sha256": input_data.get("sha256"),
+        },
+    }
+    result = _ingest_entry(task, supabase)
+
+    now = datetime.now(timezone.utc).isoformat()
+    if result.get("status") == "done":
+        chunks_indexed = result.get("chunks_inserted", 0)
+        outputs = {
+            "status": "indexed",
+            "chunks_indexed": chunks_indexed,
+            "page_count": result.get("page_count"),
+            "document_id": result.get("document_id"),
+        }
+        validation = {
+            "schema_version": ATHENA_SCHEMA_VERSION,
+            "all_required_inputs_present": True,
+            "confidence": 1.0 if chunks_indexed > 0 else 0.5,
+            "warnings": [] if chunks_indexed > 0 else ["documento vazio — 0 chunks"],
+            "needs_human_review": False,
+        }
+        status_override = "done"
+    else:
+        outputs = {
+            "status": "error",
+            "code": "ingest_failed",
+            "message": result.get("error", "unknown error"),
+            "document_id": result.get("document_id"),
+        }
+        validation = {
+            "schema_version": ATHENA_SCHEMA_VERSION,
+            "all_required_inputs_present": bool(input_data.get("document_id")),
+            "confidence": 0.0,
+            "warnings": [],
+            "needs_human_review": True,
+        }
+        status_override = "blocked"
+
+    return {
+        "output_json": {
+            "handler_name": "athena-rag-ingest",
+            "execution_id": task["id"],
+            "execution_started_at": now,
+            "execution_completed_at": now,
+            "inputs_used": {"document_id": input_data.get("document_id")},
+            "tools_techniques_applied": ["expert_judgment", "document_extraction", "chunking", "embedding"],
+            "outputs": outputs,
+            "validation": validation,
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": status_override,
+    }
 
 
 async def _handle_prioritize_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -155,7 +229,7 @@ _SPECIALTY_DISPATCH = {
     "athena-stakeholder-map":  _handle_stakeholder_map_stub,
     "athena-risk-register":    _handle_risk_register_stub,
     "athena-evm":              _handle_evm_stub,
-    "athena-rag-ingest":       _handle_rag_ingest_stub,
+    "athena-rag-ingest":       _handle_rag_ingest,
     # VEC-389 (Coverage Manager — mandato 2)
     "athena-audit":            _handle_audit_stub,
     "athena-recommend":        _handle_recommend_stub,
