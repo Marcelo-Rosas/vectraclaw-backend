@@ -204,14 +204,20 @@ class ResilientHarnessDaemon:
             return None
 
     def _claim_task(self, task_id: str) -> bool:
-        """Marca a task como in_progress atomicamente."""
+        """Marca a task como in_progress atomicamente e popula claimed_at (VEC-392).
+
+        Antes da VEC-392 só atualizava `status`, deixando `claimed_at` NULL —
+        afetava todos os 10 daemons. Frontend precisava derivar `claimedAt`
+        client-side pra mostrar 'reivindicado há X min'. Agora o backend popula.
+        """
         client = self._get_supabase()
         if not client:
             return False
         try:
+            now_iso = datetime.now(timezone.utc).isoformat()
             res = (
                 client.table("tasks")
-                .update({"status": "in_progress"})
+                .update({"status": "in_progress", "claimed_at": now_iso})
                 .eq("id", task_id)
                 .eq("status", "queued")  # guard: só transiciona se ainda queued
                 .execute()
