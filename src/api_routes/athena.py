@@ -437,3 +437,340 @@ async def delete_athena_document(request: Request, document_id: str):
     except Exception as e:
         logger.error("athena.delete_document failed: %s", e)
         raise HTTPException(500, str(e))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# VEC-408 sub-PR 3 — endpoints REST de approval de athena_recommendations
+# ════════════════════════════════════════════════════════════════════════════
+
+# Status válidos no DB (CHECK constraint criado no sub-PR 1)
+_REC_DB_STATUSES = {"pending", "approved", "applied", "rejected", "superseded"}
+_REC_VALID_KINDS = {
+    "hire_new_agent", "add_specialty", "rewrite_system_prompt",
+    "create_specialty", "consolidate_agents",
+}
+
+
+class AthenaRecommendationOut(BaseModel):
+    """Schema de resposta para athena_recommendations row."""
+    id: str
+    company_id: str
+    kind: str
+    status: str
+    target_agent_id: Optional[str] = None
+    target_specialty_id: Optional[str] = None
+    triggered_by_goal_id: Optional[str] = None
+    triggered_by_task_id: Optional[str] = None
+    title: str
+    rationale: str
+    proposed_changes_json: Dict[str, Any]
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    confidence: float
+    estimated_effort: str
+    reviewed_by_user_id: Optional[str] = None
+    reviewed_at: Optional[str] = None
+    review_notes: Optional[str] = None
+    applied_history_id: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class AthenaRecommendationPatchBody(BaseModel):
+    """Payload de PATCH /api/athena/recommendations/{id}.
+
+    Workflow:
+      - status='approved': humano aprovou; precisa aplicar manualmente o prompt
+      - status='rejected': humano rejeitou; review_notes obrigatório se confidence>=0.85
+      - status='superseded': recommendation mais nova substitui esta (raro, manual)
+    """
+    status: str = Field(pattern="^(approved|rejected|superseded)$")
+    review_notes: Optional[str] = None
+
+
+class AthenaRecommendationMarkAppliedBody(BaseModel):
+    """Payload de POST /api/athena/recommendations/{id}/mark-applied.
+
+    Humano marca após copiar manualmente o prompt da recommendation aprovada
+    e aplicar via /agents/:id/edit. applied_history_id é opcional — se vier,
+    linka pra row de agent_prompt_history criada pelo trigger.
+    """
+    applied_history_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@router.get("/api/athena/recommendations")
+@router.get("/athena/recommendations")
+async def list_athena_recommendations(
+    request: Request,
+    status: Optional[str] = Query(None),
+    target_agent_id: Optional[str] = Query(None),
+    kind: Optional[str] = Query(None),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Lista recommendations da company. RLS filtra cross-tenant automaticamente.
+
+    Filtros opcionais via query string:
+    - status: pending|approved|applied|rejected|superseded
+    - target_agent_id: UUID
+    - kind: hire_new_agent|add_specialty|rewrite_system_prompt|create_specialty|consolidate_agents
+
+    Ordenação: created_at DESC (mais recentes primeiro).
+    """
+    from src.api import supabase, get_authenticated_client
+
+    if not supabase:
+        return []
+    if status and status not in _REC_DB_STATUSES:
+        raise HTTPException(
+            422,
+            f"status inválido. Esperado: {sorted(_REC_DB_STATUSES)}",
+        )
+    if kind and kind not in _REC_VALID_KINDS:
+        raise HTTPException(
+            422,
+            f"kind inválido. Esperado: {sorted(_REC_VALID_KINDS)}",
+        )
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        q = (
+            client.table("athena_recommendations")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if status:
+            q = q.eq("status", status)
+        if target_agent_id:
+            q = q.eq("target_agent_id", target_agent_id)
+        if kind:
+            q = q.eq("kind", kind)
+        res = q.execute()
+        return [AthenaRecommendationOut(**row).model_dump() for row in (res.data or [])]
+    except Exception as e:
+        logger.error("athena.list_recommendations failed: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@router.get("/api/athena/recommendations/{recommendation_id}")
+@router.get("/athena/recommendations/{recommendation_id}")
+async def get_athena_recommendation(request: Request, recommendation_id: str):
+    """Get single recommendation. RLS valida company_id."""
+    from src.api import supabase, get_authenticated_client
+
+    if not supabase:
+        raise HTTPException(404, "recommendation_not_found")
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("athena_recommendations")
+            .select("*")
+            .eq("id", recommendation_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(404, "recommendation_not_found")
+        return AthenaRecommendationOut(**res.data[0]).model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("athena.get_recommendation failed: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@router.patch("/api/athena/recommendations/{recommendation_id}")
+@router.patch("/athena/recommendations/{recommendation_id}")
+async def patch_athena_recommendation(
+    request: Request,
+    recommendation_id: str,
+    body: AthenaRecommendationPatchBody,
+):
+    """Approve/reject/supersede recommendation.
+
+    Workflow validations:
+    - Só permite transições legais a partir do status atual:
+      pending → approved | rejected | superseded
+      approved → rejected | superseded | (mark-applied via outro endpoint)
+      applied → (terminal — não muda mais)
+      rejected → superseded
+      superseded → (terminal)
+    - status='rejected' com confidence>=0.85 exige review_notes (proteção contra
+      rejeição leviana de recommendation de alta confiança)
+    - Set automático: reviewed_at=now(), reviewed_by_user_id do JWT sub
+    """
+    from src.api import supabase, get_authenticated_client
+    from datetime import datetime as _dt, timezone as _tz
+
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+
+        # 1) Pega estado atual (RLS valida acesso cross-tenant)
+        existing = (
+            client.table("athena_recommendations")
+            .select("id,status,confidence,target_agent_id,kind")
+            .eq("id", recommendation_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(404, "recommendation_not_found")
+        current = existing.data[0]
+        current_status = current["status"]
+        new_status = body.status
+
+        # 2) Valida transição
+        legal_transitions = {
+            "pending":    {"approved", "rejected", "superseded"},
+            "approved":   {"rejected", "superseded"},
+            "applied":    set(),  # terminal
+            "rejected":   {"superseded"},
+            "superseded": set(),  # terminal
+        }
+        if new_status not in legal_transitions.get(current_status, set()):
+            raise HTTPException(
+                409,
+                f"transição ilegal {current_status} → {new_status}. "
+                f"Legais a partir de '{current_status}': {sorted(legal_transitions.get(current_status, set()))}",
+            )
+
+        # 3) Validação: rejeição de alta confiança exige review_notes
+        if new_status == "rejected" and float(current.get("confidence") or 0) >= 0.85:
+            if not body.review_notes or len(body.review_notes.strip()) < 10:
+                raise HTTPException(
+                    422,
+                    "review_notes obrigatório (≥10 chars) para rejeitar recommendation "
+                    "com confidence >= 0.85",
+                )
+
+        # 4) Extrai user_id do JWT (sub claim)
+        from src.api import _extract_vectraclip_claims
+        import base64
+        import json as _json2
+        try:
+            token = request.state.token
+            payload_b64 = token.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            jwt_claims = _json2.loads(base64.b64decode(payload_b64))
+            reviewer_id = jwt_claims.get("sub")
+        except Exception:
+            reviewer_id = None
+
+        # 5) Update
+        update_payload: Dict[str, Any] = {
+            "status": new_status,
+            "reviewed_at": _dt.now(_tz.utc).isoformat(),
+            "reviewed_by_user_id": reviewer_id,
+        }
+        if body.review_notes:
+            update_payload["review_notes"] = body.review_notes
+
+        res = (
+            client.table("athena_recommendations")
+            .update(update_payload)
+            .eq("id", recommendation_id)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(500, "update returned empty")
+        return AthenaRecommendationOut(**res.data[0]).model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("athena.patch_recommendation failed: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@router.post("/api/athena/recommendations/{recommendation_id}/mark-applied")
+@router.post("/athena/recommendations/{recommendation_id}/mark-applied")
+async def mark_recommendation_applied(
+    request: Request,
+    recommendation_id: str,
+    body: AthenaRecommendationMarkAppliedBody,
+):
+    """Marca recommendation aprovada como aplicada manualmente.
+
+    Workflow:
+    1. Recommendation precisa estar em status='approved' (PATCH approve antes)
+    2. Humano copia o proposed_prompt e aplica via /agents/{id}/edit (trigger
+       agent_prompt_history grava snapshot automaticamente)
+    3. Chama este endpoint passando opcionalmente applied_history_id (UUID do
+       history row criado pelo trigger)
+    4. status vira 'applied', applied_history_id linkado
+
+    Validação:
+    - status atual precisa ser 'approved' (pending → mark-applied = ilegal,
+      precisa aprovar antes)
+    - applied_history_id, se fornecido, precisa existir em
+      agent_prompt_history e referenciar o mesmo target_agent_id
+    """
+    from src.api import supabase, get_authenticated_client
+
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        existing = (
+            client.table("athena_recommendations")
+            .select("id,status,target_agent_id")
+            .eq("id", recommendation_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(404, "recommendation_not_found")
+        current = existing.data[0]
+
+        if current["status"] != "approved":
+            raise HTTPException(
+                409,
+                f"mark-applied só permitido em status='approved'. Atual: '{current['status']}'. "
+                f"Faça PATCH com status='approved' antes.",
+            )
+
+        # Validação opcional: applied_history_id consistente com target_agent_id
+        if body.applied_history_id:
+            hist = (
+                client.table("agent_prompt_history")
+                .select("id,agent_id")
+                .eq("id", body.applied_history_id)
+                .limit(1)
+                .execute()
+            )
+            if not hist.data:
+                raise HTTPException(
+                    422,
+                    f"applied_history_id={body.applied_history_id} não existe em agent_prompt_history",
+                )
+            if str(hist.data[0].get("agent_id")) != str(current.get("target_agent_id")):
+                raise HTTPException(
+                    409,
+                    "applied_history_id referencia agent diferente do target_agent_id da recommendation",
+                )
+
+        update_payload: Dict[str, Any] = {"status": "applied"}
+        if body.applied_history_id:
+            update_payload["applied_history_id"] = body.applied_history_id
+        if body.notes:
+            update_payload["review_notes"] = (
+                (current.get("review_notes") or "") + f"\n[mark-applied] {body.notes}"
+            ).strip()
+
+        res = (
+            client.table("athena_recommendations")
+            .update(update_payload)
+            .eq("id", recommendation_id)
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(500, "update returned empty")
+        return AthenaRecommendationOut(**res.data[0]).model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("athena.mark_applied failed: %s", e)
+        raise HTTPException(500, str(e))
