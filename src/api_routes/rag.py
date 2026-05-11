@@ -37,8 +37,12 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 logger = logging.getLogger("api.rag")
 router = APIRouter(tags=["rag"])
 
-# Extensões aceitas pelo extractor (espelha src/services/rag/extractor.py)
-_RAG_ALLOWED_EXT = {".pdf", ".txt", ".html", ".htm", ".json", ".xlsx", ".xls"}
+# Extensões aceitas pelo extractor (espelha src/services/rag/extractor.py).
+# `.xls` (formato BIFF antigo) NÃO é suportado: openpyxl só lê `.xlsx`. Aceitar
+# `.xls` resultava em upload OK + status='failed' downstream — pior UX que
+# rejeitar no upload com mensagem clara. Suporte real exigiria adicionar
+# `xlrd` ao requirements e handler dedicado em extractor.py.
+_RAG_ALLOWED_EXT = {".pdf", ".txt", ".html", ".htm", ".json", ".xlsx"}
 _RAG_DEFAULT_BUCKET = "rag-documents"
 
 
@@ -54,7 +58,6 @@ def _detect_mime(ext: str) -> str:
         ".htm":  "text/html",
         ".json": "application/json",
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".xls":  "application/vnd.ms-excel",
     }.get(ext, "application/octet-stream")
 
 
