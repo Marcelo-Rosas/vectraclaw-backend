@@ -27,8 +27,14 @@ logger = logging.getLogger("Athena")
 # NUNCA alterar — quebraria a FK em milhares de tasks futuras.
 ATHENA_AGENT_ID = "ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d"
 
-# Modelo Gemini default para Athena (handlers reais nos PRs 3-5 podem override por handler)
-ATHENA_DEFAULT_MODEL = "gemini-2.5-pro"
+# Modelo Gemini default para Athena.
+# VEC-399 smoke 2026-05-11: gemini-2.5-pro EXIGE thinking_config.thinking_budget>0
+# e o wrapper gemini_client.generate força thinking_budget=0 ("custo mínimo em chat"),
+# causando "Budget 0 is invalid. This model only works in thinking mode" no handler.
+# Workaround: usar gemini-2.5-flash (aceita budget=0) para todos handlers Athena por
+# enquanto. Fix robusto (parametrizar thinking_budget em gemini_client.generate)
+# fica para PR follow-up — afeta TODOS os agents, escopo separado.
+ATHENA_DEFAULT_MODEL = "gemini-2.5-flash"
 
 # Versão dos schemas Pydantic de output (para validation.schema_version)
 ATHENA_SCHEMA_VERSION = "v4.1"
