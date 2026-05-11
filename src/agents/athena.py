@@ -87,7 +87,7 @@ def _stub_output(operation_type: str, task_id: str = "") -> Dict[str, Any]:
             "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
         },
         "cost_usd": 0.0,
-        "status_override": "completed",
+        "status_override": "done",
     }
 
 
@@ -182,7 +182,7 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
             {
                 "output_json": dict,       # estrutura I/T/O do handler
                 "cost_usd": float,         # custo calculado
-                "status_override": str|None,  # "completed" | "failed" | None
+                "status_override": str|None,  # "done" | "blocked" | None (valores válidos do CHECK constraint tasks_status_check)
             }
     """
     op_type = task.get("operation_type", "")
@@ -224,7 +224,7 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
                 "citations": [],
             },
             "cost_usd": 0.0,
-            "status_override": "failed",
+            "status_override": "blocked",
         }
 
     # Enriquecimento do input com handles que os handlers reais (PR3+) vão precisar
@@ -262,7 +262,7 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
                 "citations": [],
             },
             "cost_usd": 0.0,
-            "status_override": "failed",
+            "status_override": "blocked",
         }
 
     # Log de sucesso (mesmo padrão do Oracle)
@@ -281,5 +281,5 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
     return {
         "output_json": output_json,
         "cost_usd": cost_usd,
-        "status_override": result.get("status_override", "completed"),
+        "status_override": result.get("status_override", "done"),
     }
