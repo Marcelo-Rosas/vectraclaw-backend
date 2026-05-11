@@ -395,6 +395,89 @@ class EVMOutput(HandlerOutputBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# PRIORITIZE (athena-prioritize) — VEC-406 (slice 2/3 do VEC-390)
+# Output-only. Python calcula score ponderado; Gemini pontua e narra.
+# ════════════════════════════════════════════════════════════════════════════
+class PrioritizationCriterion(BaseModel):
+    """Critério ponderado para ranking (Heldman cap.4 weighted scoring)."""
+    key: str = Field(min_length=2)
+    label: str = Field(min_length=2)
+    weight: float = Field(ge=0.0, le=1.0)
+    scoring_hints: List[str] = Field(default_factory=list)
+
+
+class GoalScore(BaseModel):
+    """Pontuação de 1 critério para 1 goal — calculado pelo Python a partir
+    do rating do Gemini."""
+    criterion_key: str = Field(min_length=2)
+    rating: int = Field(ge=1, le=5)
+    weight: float = Field(ge=0.0, le=1.0)
+    weighted_contribution: float = Field(ge=0.0)
+    rationale: str = Field(min_length=10)
+
+
+class RankedGoal(BaseModel):
+    rank: int = Field(ge=1)
+    goal_id: str = Field(min_length=10)
+    goal_title: str = Field(min_length=2)
+    total_score: float = Field(ge=0.0)
+    breakdown: List[GoalScore] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def total_matches_breakdown(self) -> "RankedGoal":
+        expected = round(sum(s.weighted_contribution for s in self.breakdown), 4)
+        if abs(self.total_score - expected) > 0.01:
+            raise ValueError(
+                f"total_score {self.total_score} ≠ sum(weighted_contribution) "
+                f"(esperado {expected})"
+            )
+        return self
+
+
+class ScoreGapsAnalysis(BaseModel):
+    largest_gap: str = Field(min_length=10)
+    tightest_competition: str = Field(min_length=10)
+
+
+class PrioritizeOutputs(BaseModel):
+    ranking: List[RankedGoal] = Field(min_length=2, max_length=10)
+    narrative_md: str = Field(min_length=100)
+    execution_recommendations: List[str] = Field(min_length=1)
+    score_gaps: ScoreGapsAnalysis
+    criteria_used: List[PrioritizationCriterion] = Field(min_length=2, max_length=8)
+    criteria_version: int = Field(default=0, ge=0)  # 0 = default hardcoded fallback
+
+    @model_validator(mode="after")
+    def weights_sum_to_one(self) -> "PrioritizeOutputs":
+        s = round(sum(c.weight for c in self.criteria_used), 4)
+        if abs(s - 1.0) > 0.01:
+            raise ValueError(
+                f"Soma dos weights dos critérios = {s}, esperado 1.0 (±0.01)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def ranking_ordered_desc(self) -> "PrioritizeOutputs":
+        scores = [r.total_score for r in self.ranking]
+        if scores != sorted(scores, reverse=True):
+            raise ValueError(
+                f"ranking deve estar ordenado por total_score DESC. Recebido: {scores}"
+            )
+        # Ranks consecutivos começando em 1
+        ranks = [r.rank for r in self.ranking]
+        if ranks != list(range(1, len(ranks) + 1)):
+            raise ValueError(
+                f"rank deve ser sequencial 1..N. Recebido: {ranks}"
+            )
+        return self
+
+
+class PrioritizeOutput(HandlerOutputBase):
+    handler_name: Literal["athena-prioritize"] = "athena-prioritize"
+    outputs: PrioritizeOutputs  # type: ignore[assignment]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # CLASSIFY (athena-classify) — gate de entrada
 # ════════════════════════════════════════════════════════════════════════════
 GoalKind = Literal["project", "operation", "undecided"]
@@ -547,7 +630,7 @@ SCHEMA_BY_OPERATION_TYPE: Dict[str, type[HandlerOutputBase]] = {
     "athena-rag-ingest":       HandlerOutputBase,
     "athena-audit":            HandlerOutputBase,
     "athena-recommend":        HandlerOutputBase,
-    "athena-prioritize":       HandlerOutputBase,
+    "athena-prioritize":       PrioritizeOutput,
 }
 
 
