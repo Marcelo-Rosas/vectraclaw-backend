@@ -2162,9 +2162,577 @@ Aplique as REGRAS HARD do system prompt.
 Retorne APENAS o JSON. Sem markdown wrapper, sem texto antes/depois."""
 
 
-async def _handle_recommend_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """VEC-389 PR3: cria athena_recommendations status=pending (sem auto-apply)."""
-    return _stub_output("athena-recommend", input_data.get("_task_id", ""))
+_RECOMMEND_VALID_KINDS = {
+    "hire_new_agent", "add_specialty", "rewrite_system_prompt",
+    "create_specialty", "consolidate_agents",
+}
+
+
+def _validate_proposed_changes_by_kind(kind: str, payload: Dict[str, Any]) -> Optional[str]:
+    """Valida estrutura do proposed_changes_json conforme kind.
+    Retorna None se OK, ou string de erro descrevendo o gap.
+    """
+    if not isinstance(payload, dict):
+        return f"proposed_changes_json deve ser dict, recebeu {type(payload).__name__}"
+
+    if kind == "hire_new_agent":
+        required = ["name", "role", "system_prompt"]
+    elif kind == "add_specialty":
+        required = ["agent_id", "specialty_id", "prompt_addendum"]
+    elif kind == "rewrite_system_prompt":
+        required = ["agent_id", "proposed_prompt"]
+    elif kind == "create_specialty":
+        required = ["name", "slug", "description"]
+    elif kind == "consolidate_agents":
+        required = ["source_agent_ids", "merged_prompt"]
+    else:
+        return f"kind '{kind}' não tem schema de validação registrado"
+
+    missing = [k for k in required if not payload.get(k)]
+    if missing:
+        return f"proposed_changes_json para kind={kind} faltando: {missing}"
+
+    if kind == "rewrite_system_prompt":
+        if len(str(payload.get("proposed_prompt", ""))) < 100:
+            return "proposed_prompt deve ter >=100 chars (anti-stub)"
+    if kind == "consolidate_agents":
+        sids = payload.get("source_agent_ids")
+        if not isinstance(sids, list) or len(sids) < 2:
+            return "source_agent_ids deve ser list com >=2 UUIDs"
+
+    return None
+
+
+async def _handle_recommend(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-408 sub-PR 2 (real): cria athena_recommendations status='pending'.
+
+    Pipeline:
+      1. Valida kind + target_agent_id (obrigatório se kind != hire_new_agent)
+      2. Guardrails HARD (rejected_at_source, sem chamar Gemini):
+         - target == ATHENA_AGENT_ID
+         - target.is_system == True
+      3. Idempotência: SELECT pending existente WHERE target_agent_id+kind
+         → retorna pointer (status='idempotent_existing') sem chamar Gemini
+      4. SELECT goal (se goal_id) + target agent (se target_agent_id)
+      5. RAG corpus Athena com query específica por kind (best-effort)
+      6. Gemini Flash gera title + rationale + proposed_changes_json +
+         confidence + estimated_effort + citations
+      7. Valida proposed_changes_json pelo kind (Python)
+      8. INSERT em vectraclip.athena_recommendations status='pending'
+      9. Pydantic RecommendOutput valida envelope
+      10. Retorna envelope com recommendation_id
+
+    NUNCA auto-aplica. Aprovação manual via UI (sub-PR 3 + frontend).
+
+    Args:
+        input_data: dict com `_supabase`, `_task_id`, `_company_id`,
+                    `kind` (obrigatório), `target_agent_id` (cond.),
+                    `goal_id` (opcional), `triggered_by_task_id` (opcional).
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    import json as _json
+
+    from src.agents.athena_schemas import RecommendOutput, ValidationBlock
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+    kind = (input_data.get("kind") or "").strip()
+    target_agent_id = input_data.get("target_agent_id")
+    goal_id = input_data.get("goal_id")
+    triggered_by_task_id = input_data.get("triggered_by_task_id") or task_id
+
+    if supabase is None:
+        return _recommend_error_output(task_id, started_at, "missing_supabase",
+                                       "Cliente Supabase não disponível", kind=kind)
+    if not company_id:
+        return _recommend_error_output(task_id, started_at, "missing_company_id",
+                                       "task.company_id é obrigatório", kind=kind)
+    if kind not in _RECOMMEND_VALID_KINDS:
+        return _recommend_error_output(
+            task_id, started_at, "invalid_kind",
+            f"kind '{kind}' inválido. Esperado um de: {sorted(_RECOMMEND_VALID_KINDS)}",
+            kind=kind,
+        )
+    if kind != "hire_new_agent" and not target_agent_id:
+        return _recommend_error_output(
+            task_id, started_at, "missing_target_agent",
+            f"input.target_agent_id é obrigatório para kind={kind}", kind=kind,
+        )
+
+    # ─── 1) Guardrails HARD (sem chamar Gemini) ────────────────────────────
+    target_agent: Optional[Dict[str, Any]] = None
+    if target_agent_id:
+        if str(target_agent_id) == ATHENA_AGENT_ID:
+            return _recommend_rejected_envelope(
+                task_id, started_at, kind, target_agent_id, None,
+                "rejected_at_source: Athena nunca modifica a si mesma",
+            )
+        try:
+            ta_res = (
+                supabase.table("agents")
+                .select("id,name,role,system_prompt,is_system,company_id")
+                .eq("id", target_agent_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as exc:
+            return _recommend_error_output(
+                task_id, started_at, "target_agent_select_failed",
+                str(exc), kind=kind,
+            )
+        if not ta_res.data:
+            return _recommend_error_output(
+                task_id, started_at, "target_agent_not_found",
+                f"target_agent_id={target_agent_id} não existe", kind=kind,
+            )
+        target_agent = ta_res.data[0]
+        if str(target_agent.get("company_id")) != str(company_id):
+            return _recommend_error_output(
+                task_id, started_at, "company_mismatch",
+                "target_agent_id pertence a outra company", kind=kind,
+            )
+        if target_agent.get("is_system"):
+            return _recommend_rejected_envelope(
+                task_id, started_at, kind, target_agent_id,
+                target_agent.get("name"),
+                "rejected_at_source: Athena não modifica agentes is_system=true",
+            )
+
+    # ─── 2) Idempotência (soft guard — UNIQUE PARTIAL é hard guard) ────────
+    if target_agent_id and kind != "hire_new_agent":
+        try:
+            existing = (
+                supabase.table("athena_recommendations")
+                .select("id,title,confidence,created_at")
+                .eq("target_agent_id", target_agent_id)
+                .eq("kind", kind)
+                .eq("status", "pending")
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                exist = existing.data[0]
+                return _recommend_idempotent_envelope(
+                    task_id, started_at, kind, target_agent_id,
+                    (target_agent or {}).get("name") if target_agent else None,
+                    exist["id"], exist.get("title", ""),
+                    float(exist.get("confidence") or 0.0),
+                )
+        except Exception as exc:
+            logger.warning("athena-recommend idempotency lookup failed (non-fatal): %s", exc)
+
+    # ─── 3) Contexto: goal + companies.context_json + RAG ──────────────────
+    goal_block: Dict[str, Any] = {}
+    if goal_id:
+        try:
+            g_res = (
+                supabase.table("goals")
+                .select("id,title,metric,target,kind,confidence,business_case_strength,pmoia_metadata")
+                .eq("id", goal_id)
+                .limit(1)
+                .execute()
+            )
+            if g_res.data:
+                goal_block = g_res.data[0]
+        except Exception as exc:
+            logger.warning("athena-recommend goal lookup non-fatal: %s", exc)
+
+    company_context = _get_company_context(supabase, company_id)
+
+    rag_chunks: list = []
+    rag_citations: list = []
+    try:
+        from src.services.athena_rag import query_top_k as _athena_query
+        rag_query = _build_recommend_rag_query(kind)
+        rag_results = await _athena_query(
+            rag_query, company_id=company_id, k=4, min_score=0.3,
+            supabase_client=supabase,
+        )
+        for r in rag_results:
+            rag_chunks.append(
+                f"[chunk {r.chunk_index} | score {r.score:.2f}]\n{r.content[:1500]}"
+            )
+            rag_citations.append({
+                "chunk_id": r.id,
+                "page": r.page_number,
+                "source": r.document_filename,
+                "text_excerpt": (r.content[:200] + "...") if r.content else None,
+            })
+    except Exception as exc:
+        logger.warning("athena-recommend RAG indisponível (degradando): %s", exc)
+
+    # ─── 4) Gemini structured output ───────────────────────────────────────
+    user_prompt = _build_recommend_prompt(
+        kind, goal_block, target_agent, company_context, rag_chunks,
+    )
+    try:
+        text, llm_meta = await gemini_generate(
+            ATHENA_DEFAULT_MODEL,
+            user_prompt,
+            system_instruction=_RECOMMEND_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("athena-recommend gemini call failed task=%s", task_id)
+        return _recommend_error_output(task_id, started_at, "gemini_call_failed",
+                                       str(exc), kind=kind)
+    try:
+        gp = _json.loads(text)
+    except Exception as exc:
+        return _recommend_error_output(
+            task_id, started_at, "gemini_invalid_json",
+            f"JSON inválido: {exc}. Raw[:200]={text[:200]!r}", kind=kind,
+        )
+
+    # ─── 5) Valida proposed_changes_json pelo kind ─────────────────────────
+    proposed = gp.get("proposed_changes_json") or {}
+    val_err = _validate_proposed_changes_by_kind(kind, proposed)
+    if val_err:
+        return _recommend_error_output(
+            task_id, started_at, "proposed_changes_invalid", val_err, kind=kind,
+        )
+
+    # ─── 6) INSERT em athena_recommendations ───────────────────────────────
+    try:
+        confidence = float(gp.get("confidence", 0.7))
+        confidence = max(0.0, min(1.0, confidence))
+        effort = gp.get("estimated_effort", "M")
+        if effort not in ("S", "M", "L", "XL"):
+            effort = "M"
+
+        rec_row = {
+            "company_id": company_id,
+            "triggered_by_goal_id": goal_id,
+            "triggered_by_task_id": triggered_by_task_id,
+            "kind": kind,
+            "target_agent_id": target_agent_id,
+            "title": gp.get("title", f"Recomendação {kind}")[:500],
+            "rationale": gp.get("rationale", "Rationale ausente — revisar manualmente."),
+            "proposed_changes_json": proposed,
+            "citations": rag_citations,
+            "confidence": confidence,
+            "estimated_effort": effort,
+            "status": "pending",
+        }
+        ins = supabase.table("athena_recommendations").insert(rec_row).execute()
+        if not ins.data:
+            return _recommend_error_output(
+                task_id, started_at, "insert_returned_empty",
+                "INSERT em athena_recommendations retornou data vazia", kind=kind,
+            )
+        rec_id = ins.data[0]["id"]
+    except Exception as exc:
+        # UNIQUE PARTIAL pode pegar (race condition entre soft guard e INSERT)
+        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+            return _recommend_error_output(
+                task_id, started_at, "race_unique_partial",
+                f"UNIQUE PARTIAL bloqueou INSERT (race condition idempotência): {exc}",
+                kind=kind,
+            )
+        logger.exception("athena-recommend INSERT failed task=%s", task_id)
+        return _recommend_error_output(task_id, started_at, "insert_failed",
+                                       str(exc), kind=kind)
+
+    # ─── 7) Monta envelope final + valida Pydantic ─────────────────────────
+    completed_at = _dt.now(_tz.utc).isoformat()
+    tools = ["expert_judgment", "gap_analysis"]
+    if rag_chunks:
+        tools.append("rag_retrieval")
+
+    envelope = {
+        "handler_name": "athena-recommend",
+        "execution_id": task_id,
+        "execution_started_at": started_at,
+        "execution_completed_at": completed_at,
+        "inputs_used": {
+            "kind": kind,
+            "target_agent_id": target_agent_id,
+            "goal_id": goal_id,
+            "rag_chunks_used": len(rag_chunks),
+        },
+        "tools_techniques_applied": tools,
+        "outputs": {
+            "recommendation_id": rec_id,
+            "status": "pending",
+            "kind": kind,
+            "target_agent_id": target_agent_id,
+            "target_agent_name": (target_agent or {}).get("name") if target_agent else None,
+            "title": rec_row["title"],
+            "rationale": rec_row["rationale"],
+            "proposed_changes_json": proposed,
+            "confidence": confidence,
+            "estimated_effort": effort,
+            "citations": rag_citations,
+            "rejected_reason": None,
+        },
+        "validation": ValidationBlock(
+            all_required_inputs_present=True,
+            confidence=confidence,
+            warnings=[],
+            needs_human_review=True,  # recommendation SEMPRE precisa review humano
+        ).model_dump(),
+        "citations": rag_citations,
+    }
+
+    try:
+        RecommendOutput.model_validate(envelope)
+    except Exception as exc:
+        logger.exception("athena-recommend pydantic validation failed task=%s", task_id)
+        # Pydantic falhou DEPOIS do INSERT — não vamos reverter; só sinalizar review
+        envelope["validation"]["needs_human_review"] = True
+        envelope["validation"]["warnings"] = [f"pydantic_validation_failed: {exc}"]
+
+    # 8) Cost + WS broadcast (não-fatal)
+    tokens = {
+        "input": int(llm_meta.get("input_token_count") or 0),
+        "output": int(llm_meta.get("output_token_count") or 0),
+    }
+    tokens["total"] = tokens["input"] + tokens["output"]
+    envelope["metadata"] = {"tokens": tokens}
+    cost_usd = _calc_cost(tokens)
+
+    try:
+        from src.ws_manager import manager as _ws
+        await _ws.broadcast_company(company_id, {
+            "type": "athena_recommendation_created",
+            "recommendation_id": rec_id,
+            "target_agent_id": target_agent_id,
+            "kind": kind,
+            "confidence": confidence,
+        })
+    except Exception as exc:
+        logger.debug("athena-recommend WS broadcast non-fatal: %s", exc)
+
+    logger.info(
+        "athena-recommend done task=%s kind=%s target=%s rec=%s conf=%.2f effort=%s tokens=%d",
+        task_id, kind, target_agent_id, rec_id, confidence, effort, tokens["total"],
+    )
+
+    return {
+        "output_json": envelope,
+        "cost_usd": cost_usd,
+        "status_override": "done",
+    }
+
+
+def _recommend_error_output(
+    task_id: str, started_at: str, code: str, message: str, kind: str = "",
+) -> Dict[str, Any]:
+    """Erro técnico — status=blocked. NÃO insere em DB."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-recommend",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {"kind": kind},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "status": "error",
+                "code": code,
+                "message": message,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": False,
+                "confidence": 0.0,
+                "warnings": [code],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "blocked",
+    }
+
+
+def _recommend_rejected_envelope(
+    task_id: str, started_at: str, kind: str,
+    target_agent_id: Optional[str], target_agent_name: Optional[str],
+    reason: str,
+) -> Dict[str, Any]:
+    """Guardrail bloqueou (is_system ou Athena) — status=done com rejected_at_source.
+    NÃO insere em DB. UI deve mostrar como recommendation morta, não como erro."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-recommend",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {"kind": kind, "target_agent_id": target_agent_id},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "recommendation_id": None,
+                "status": "rejected_at_source",
+                "kind": kind,
+                "target_agent_id": target_agent_id,
+                "target_agent_name": target_agent_name,
+                "title": "Guardrail Athena: target protegido",
+                "rationale": reason,
+                "proposed_changes_json": {},
+                "confidence": 1.0,
+                "estimated_effort": "S",
+                "citations": [],
+                "rejected_reason": reason,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": True,
+                "confidence": 1.0,
+                "warnings": [reason],
+                "needs_human_review": False,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "done",
+    }
+
+
+def _recommend_idempotent_envelope(
+    task_id: str, started_at: str, kind: str,
+    target_agent_id: str, target_agent_name: Optional[str],
+    existing_rec_id: str, existing_title: str, existing_confidence: float,
+) -> Dict[str, Any]:
+    """Idempotência: já existe pending pra mesmo (target, kind).
+    Retorna pointer pro existente. NÃO chama Gemini, NÃO insere."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-recommend",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {"kind": kind, "target_agent_id": target_agent_id},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "recommendation_id": existing_rec_id,
+                "status": "idempotent_existing",
+                "kind": kind,
+                "target_agent_id": target_agent_id,
+                "target_agent_name": target_agent_name,
+                "title": existing_title,
+                "rationale": "Recommendation pending pré-existente para mesmo (target_agent, kind). Aprovar/rejeitar a existente.",
+                "proposed_changes_json": {},
+                "confidence": existing_confidence,
+                "estimated_effort": "S",
+                "citations": [],
+                "rejected_reason": None,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": True,
+                "confidence": 1.0,
+                "warnings": ["idempotent_existing"],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "done",
+    }
+
+
+def _build_recommend_rag_query(kind: str) -> str:
+    """Query RAG específica por kind (chunks Heldman relevantes)."""
+    return {
+        "hire_new_agent":         "papel gerente projetos PMO contratação skills competências PMBOK cap 1 cap 5",
+        "add_specialty":          "gerenciamento recursos humanos habilidades técnicas matriz competências",
+        "rewrite_system_prompt":  "papel PM habilidades comunicação técnicas Heldman cap 5",
+        "create_specialty":       "EAP definição responsabilidades domínio conhecimento PMBOK",
+        "consolidate_agents":     "consolidação responsabilidades overlap projetos múltiplos agentes",
+    }.get(kind, "papel gerente projetos PMBOK habilidades competências")
+
+
+_RECOMMEND_SYSTEM_PROMPT = """Você é Athena, PMOia da Vectra Cargo, especialista em PMBOK 5ª (Kim Heldman cap.5 — papel do gerente de projetos). Aqui você atua como Agent Coverage Manager: propõe melhorias no quadro de agentes.
+
+Sua tarefa: gerar UMA recomendação concreta de melhoria — sem auto-aplicar. Humano vai revisar e aprovar manualmente.
+
+REGRAS HARD:
+1. proposed_changes_json deve ter estrutura específica conforme kind:
+   - hire_new_agent: {name, role, system_prompt (≥100 chars), specialties[]}
+   - add_specialty: {agent_id, specialty_id, prompt_addendum}
+   - rewrite_system_prompt: {agent_id, current_prompt, proposed_prompt (≥100 chars), diff_summary}
+   - create_specialty: {name, slug, description, prompt_template}
+   - consolidate_agents: {source_agent_ids (≥2), merged_prompt}
+2. rationale (≥20 chars) cita critério PMBOK ou diagnóstico do quadro.
+3. confidence ∈ [0,1]. Use 0.5-0.7 se há pouco contexto; 0.8-0.95 quando há evidência clara.
+4. estimated_effort ∈ {S, M, L, XL}.
+5. title concisa (≤80 chars).
+6. NÃO sugira mudanças em agentes que parecem ser system (Oracle, Mnemos, Morpheus) — o sistema filtra isso de qualquer jeito.
+
+FORMATO DE SAÍDA — apenas JSON, sem markdown wrapper:
+{
+  "title": "<≤80 chars>",
+  "rationale": "<≥20 chars com critério PMBOK>",
+  "proposed_changes_json": { <estrutura conforme kind acima> },
+  "confidence": <float 0..1>,
+  "estimated_effort": "S|M|L|XL"
+}"""
+
+
+def _build_recommend_prompt(
+    kind: str,
+    goal: Dict[str, Any],
+    target_agent: Optional[Dict[str, Any]],
+    company_context: Dict[str, Any],
+    rag_chunks: list,
+) -> str:
+    import json as _json
+    target_block = "(sem target — kind=hire_new_agent)"
+    if target_agent:
+        target_block = _json.dumps({
+            "agent_id": target_agent.get("id"),
+            "name": target_agent.get("name"),
+            "role": target_agent.get("role"),
+            "current_system_prompt": (target_agent.get("system_prompt") or "")[:2000],
+            "current_prompt_length": len(target_agent.get("system_prompt") or ""),
+            "is_system": target_agent.get("is_system"),
+        }, ensure_ascii=False, indent=2)
+
+    goal_block = "(sem goal vinculado)"
+    if goal:
+        goal_block = _json.dumps({
+            "goal_id": goal.get("id"),
+            "title": goal.get("title"),
+            "kind": goal.get("kind"),
+            "confidence": goal.get("confidence"),
+        }, ensure_ascii=False, indent=2)
+
+    rag_block = (
+        "\n\n--- HELDMAN/PMBOK chunks ---\n" + "\n\n".join(rag_chunks)
+        if rag_chunks else
+        "\n\n(Sem chunks RAG — opere com expert_judgment.)"
+    )
+
+    return f"""KIND: {kind}
+
+GOAL DISPARADOR (se houver)
+===========================
+{goal_block}
+
+TARGET AGENT (se aplicável)
+===========================
+{target_block}
+
+COMPANY CONTEXT
+===============
+{_json.dumps(company_context, ensure_ascii=False, indent=2) if company_context else '(sem context)'}
+{rag_block}
+
+INSTRUÇÃO
+=========
+Gere UMA recomendação concreta para o kind={kind}, seguindo as REGRAS HARD do system prompt.
+Aplique a estrutura específica de proposed_changes_json para esse kind.
+Retorne APENAS o JSON. Sem markdown wrapper, sem texto antes/depois."""
 
 
 async def _handle_rag_ingest(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -2725,7 +3293,7 @@ _SPECIALTY_DISPATCH = {
     "athena-rag-ingest":       _handle_rag_ingest,
     # VEC-389 (Coverage Manager — mandato 2)
     "athena-audit":            _handle_audit,
-    "athena-recommend":        _handle_recommend_stub,
+    "athena-recommend":        _handle_recommend,
     # VEC-390 (Prioritizer — mandato 3)
     "athena-prioritize":       _handle_prioritize,
 }

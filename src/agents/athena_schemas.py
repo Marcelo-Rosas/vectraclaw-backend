@@ -522,6 +522,61 @@ class AuditOutput(HandlerOutputBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# RECOMMEND (athena-recommend) — VEC-408 (slices 2+3 do VEC-389)
+# Output-only no envelope; o INSERT em athena_recommendations é side-effect
+# do handler (não da Pydantic — Pydantic só valida o envelope I/T/O).
+# ════════════════════════════════════════════════════════════════════════════
+RecommendationKind = Literal[
+    "hire_new_agent",
+    "add_specialty",
+    "rewrite_system_prompt",
+    "create_specialty",
+    "consolidate_agents",
+]
+
+RecommendationStatus = Literal[
+    "pending", "approved", "applied", "rejected", "superseded",
+    # status especial retornado SOMENTE no envelope quando guardrail bloqueia
+    # antes do INSERT (não vai pra DB):
+    "rejected_at_source",
+    # quando idempotência detecta já existente:
+    "idempotent_existing",
+]
+
+EstimatedEffort = Literal["S", "M", "L", "XL"]
+
+
+class RecommendationCitation(BaseModel):
+    chunk_id: Optional[str] = None
+    page: Optional[int] = None
+    source: Optional[str] = None
+    text_excerpt: Optional[str] = None
+
+
+class RecommendOutputs(BaseModel):
+    """Envelope dos outputs do handler athena-recommend.
+    Nota: o INSERT em vectraclip.athena_recommendations é side-effect; este
+    schema valida apenas o output_json retornado na task."""
+    recommendation_id: Optional[str] = None  # NULL quando rejected_at_source
+    status: RecommendationStatus
+    kind: RecommendationKind
+    target_agent_id: Optional[str] = None  # NULL quando kind=hire_new_agent
+    target_agent_name: Optional[str] = None
+    title: str = Field(min_length=5)
+    rationale: str = Field(min_length=20)
+    proposed_changes_json: Dict[str, Any]
+    confidence: float = Field(ge=0.0, le=1.0)
+    estimated_effort: EstimatedEffort
+    citations: List[RecommendationCitation] = Field(default_factory=list)
+    rejected_reason: Optional[str] = None  # populado quando status=rejected_at_source
+
+
+class RecommendOutput(HandlerOutputBase):
+    handler_name: Literal["athena-recommend"] = "athena-recommend"
+    outputs: RecommendOutputs  # type: ignore[assignment]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # CLASSIFY (athena-classify) — gate de entrada
 # ════════════════════════════════════════════════════════════════════════════
 GoalKind = Literal["project", "operation", "undecided"]
@@ -673,7 +728,7 @@ SCHEMA_BY_OPERATION_TYPE: Dict[str, type[HandlerOutputBase]] = {
     "athena-evm":              EVMOutput,
     "athena-rag-ingest":       HandlerOutputBase,
     "athena-audit":            AuditOutput,
-    "athena-recommend":        HandlerOutputBase,
+    "athena-recommend":        RecommendOutput,
     "athena-prioritize":       PrioritizeOutput,
 }
 
