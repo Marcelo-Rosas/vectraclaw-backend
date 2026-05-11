@@ -377,6 +377,24 @@ class EVMMetrics(BaseModel):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# EVM (athena-evm) — VEC-405 PR5b
+# Output-only. Python calcula determinístico; Gemini gera apenas narrativa.
+# ════════════════════════════════════════════════════════════════════════════
+class EVMOutputs(BaseModel):
+    """Bloco 'outputs' do athena-evm — métricas determinísticas + narrativa Gemini."""
+    metrics: EVMMetrics
+    narrative_md: str = Field(min_length=100)
+    executive_summary_md: str = Field(min_length=50)
+    alerts: List[str] = Field(default_factory=list)
+    interpretation_period: str = Field(min_length=4)  # ex: "2026-Q1" ou "2026-05-11"
+
+
+class EVMOutput(HandlerOutputBase):
+    handler_name: Literal["athena-evm"] = "athena-evm"
+    outputs: EVMOutputs  # type: ignore[assignment]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # CLASSIFY (athena-classify) — gate de entrada
 # ════════════════════════════════════════════════════════════════════════════
 GoalKind = Literal["project", "operation", "undecided"]
@@ -525,7 +543,7 @@ SCHEMA_BY_OPERATION_TYPE: Dict[str, type[HandlerOutputBase]] = {
     "athena-charter":          CharterOutput,
     "athena-stakeholder-map":  StakeholderMapOutput,
     "athena-risk-register":    RiskRegisterOutput,
-    "athena-evm":              HandlerOutputBase,
+    "athena-evm":              EVMOutput,
     "athena-rag-ingest":       HandlerOutputBase,
     "athena-audit":            HandlerOutputBase,
     "athena-recommend":        HandlerOutputBase,
