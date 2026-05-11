@@ -761,9 +761,330 @@ Aplique as REGRAS HARD do system prompt.
 Retorne APENAS o JSON conforme schema. Sem markdown encapsulado, sem texto antes/depois."""
 
 
-async def _handle_stakeholder_map_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """PR4: matriz Power × Interest + team_health_assessment + communication_plan."""
-    return _stub_output("athena-stakeholder-map", input_data.get("_task_id", ""))
+async def _handle_stakeholder_map(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-403 (real, output-only): gera mapa de stakeholders PMBOK no output_json.
+
+    Pipeline (mesmo padrão VEC-401):
+      1. SELECT goal (com kind/confidence/business_case já populados pelo classify)
+      2. Pré-validação: rejeita se goal.kind != 'project' ou confidence < 0.7
+      3. SELECT companies.context_json
+      4. RAG: top-4 chunks Heldman sobre stakeholder register + Power×Interest grid
+      5. Gemini Flash structured output
+      6. Pydantic validation via StakeholderMapOutput
+      7. Retorna envelope I/T/O sem tocar em tabelas (não existe tabela stakeholders)
+
+    Args:
+        prompt: ignorado.
+        input_data: dict com `_supabase`, `_task_id`, `_company_id`, `goal_id`,
+                    e opcionalmente `stakeholders_hint` (lista pré-conhecida).
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    import json as _json
+
+    from src.agents.athena_schemas import StakeholderMapOutput, ValidationBlock
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+    goal_id = input_data.get("goal_id")
+    stakeholders_hint = input_data.get("stakeholders_hint") or []
+
+    if not goal_id:
+        return _stakeholder_map_error_output(
+            task_id, started_at, "missing_goal_id",
+            "input_json.goal_id é obrigatório para athena-stakeholder-map",
+        )
+    if supabase is None:
+        return _stakeholder_map_error_output(
+            task_id, started_at, "missing_supabase",
+            "Cliente Supabase não disponível",
+        )
+
+    # 1) SELECT goal
+    try:
+        goal_res = (
+            supabase.table("goals")
+            .select("id,company_id,title,metric,target,kind,confidence,business_case_strength,pmoia_metadata")
+            .eq("id", goal_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("athena-stakeholder-map select goal failed task=%s goal=%s", task_id, goal_id)
+        return _stakeholder_map_error_output(task_id, started_at, "goal_select_failed", str(exc))
+    if not goal_res.data:
+        return _stakeholder_map_error_output(
+            task_id, started_at, "goal_not_found",
+            f"vectraclip.goals not found: id={goal_id}",
+        )
+    goal = goal_res.data[0]
+
+    if company_id and str(goal.get("company_id")) != str(company_id):
+        return _stakeholder_map_error_output(
+            task_id, started_at, "company_mismatch",
+            f"goal.company_id != task.company_id",
+        )
+
+    # 2) Pré-validação
+    g_kind = goal.get("kind")
+    g_conf = goal.get("confidence")
+    if g_kind != "project":
+        return _stakeholder_map_error_output(
+            task_id, started_at, "goal_not_classified_as_project",
+            f"athena-stakeholder-map exige goal.kind='project'. Atual: kind={g_kind!r}",
+        )
+    try:
+        if g_conf is None or float(g_conf) < 0.7:
+            return _stakeholder_map_error_output(
+                task_id, started_at, "low_classify_confidence",
+                f"athena-stakeholder-map exige goal.confidence >= 0.7. Atual: {g_conf}",
+            )
+    except (TypeError, ValueError):
+        return _stakeholder_map_error_output(
+            task_id, started_at, "invalid_confidence",
+            f"goal.confidence inválido: {g_conf!r}",
+        )
+
+    # 3) Contexto organizacional
+    company_context = _get_company_context(supabase, goal.get("company_id"))
+
+    # 4) RAG corpus Athena
+    rag_chunks: list = []
+    rag_citations: list = []
+    try:
+        from src.services.athena_rag import query_top_k as _athena_query
+        rag_results = await _athena_query(
+            "stakeholder register Power Interest grid Heldman communication plan team health",
+            company_id=goal.get("company_id"),
+            k=4,
+            min_score=0.3,
+            supabase_client=supabase,
+        )
+        for r in rag_results:
+            rag_chunks.append(
+                f"[chunk {r.chunk_index} | score {r.score:.2f} | {r.document_filename or '?'}]\n{r.content[:1500]}"
+            )
+            rag_citations.append({
+                "chunk_id": r.id,
+                "page": r.page_number,
+                "source": r.document_filename,
+                "topic": "PMBOK stakeholder map",
+            })
+    except Exception as exc:
+        logger.warning("athena-stakeholder-map RAG indisponível (degradando): %s", exc)
+
+    # 5) Gemini
+    user_prompt = _build_stakeholder_map_prompt(goal, company_context, rag_chunks, stakeholders_hint)
+    try:
+        text, metadata = await gemini_generate(
+            ATHENA_DEFAULT_MODEL,
+            user_prompt,
+            system_instruction=_STAKEHOLDER_MAP_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("athena-stakeholder-map gemini call failed task=%s", task_id)
+        return _stakeholder_map_error_output(task_id, started_at, "gemini_call_failed", str(exc))
+
+    try:
+        gemini_payload = _json.loads(text)
+    except Exception as exc:
+        return _stakeholder_map_error_output(
+            task_id, started_at, "gemini_invalid_json",
+            f"Gemini não retornou JSON válido: {exc}. Raw[:200]={text[:200]!r}",
+        )
+
+    # 6) Pydantic
+    completed_at = _dt.now(_tz.utc).isoformat()
+    tools_applied = ["expert_judgment", "stakeholder_analysis", "power_interest_grid"]
+    if rag_chunks:
+        tools_applied.append("rag_retrieval")
+
+    envelope = {
+        "handler_name": "athena-stakeholder-map",
+        "execution_id": task_id,
+        "execution_started_at": started_at,
+        "execution_completed_at": completed_at,
+        "inputs_used": {
+            "goal_id": goal_id,
+            "goal_title": goal.get("title"),
+            "stakeholders_hint_count": len(stakeholders_hint),
+            "rag_chunks_used": len(rag_chunks),
+        },
+        "tools_techniques_applied": tools_applied,
+        "outputs": gemini_payload,
+        "validation": ValidationBlock(
+            all_required_inputs_present=True,
+            confidence=float(gemini_payload.get("validation_confidence", g_conf or 0.7)),
+            warnings=[],
+            needs_human_review=False,
+        ).model_dump(),
+        "citations": rag_citations,
+    }
+
+    try:
+        StakeholderMapOutput.model_validate(envelope)
+    except Exception as exc:
+        logger.exception("athena-stakeholder-map pydantic validation failed task=%s", task_id)
+        return _stakeholder_map_error_output(
+            task_id, started_at, "pydantic_validation_failed",
+            f"{exc}. envelope.outputs={envelope.get('outputs')}",
+        )
+
+    # 7) Metadata + cost
+    tokens = {
+        "input": int(metadata.get("input_token_count") or 0),
+        "output": int(metadata.get("output_token_count") or 0),
+    }
+    tokens["total"] = tokens["input"] + tokens["output"]
+    envelope["metadata"] = {"tokens": tokens}
+    cost_usd = _calc_cost(tokens)
+
+    logger.info(
+        "athena-stakeholder-map done task=%s goal=%s stakeholders=%d tokens=%d cost=%.6f",
+        task_id, goal_id, len(gemini_payload.get("stakeholders", [])),
+        tokens["total"], cost_usd,
+    )
+
+    return {
+        "output_json": envelope,
+        "cost_usd": cost_usd,
+        "status_override": "done",
+    }
+
+
+def _stakeholder_map_error_output(
+    task_id: str, started_at: str, code: str, message: str,
+) -> Dict[str, Any]:
+    """Envelope I/T/O minimal para erros do handler stakeholder-map. status=blocked."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-stakeholder-map",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "status": "error",
+                "code": code,
+                "message": message,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": False,
+                "confidence": 0.0,
+                "warnings": [code],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "blocked",
+    }
+
+
+_STAKEHOLDER_MAP_SYSTEM_PROMPT = """Você é Athena, PMOia da Vectra Cargo, especialista em PMBOK 5ª (Kim Heldman, cap.13 Stakeholder Management).
+
+Sua tarefa: gerar o Stakeholder Map de um projeto já com Charter, identificando todos os atores relevantes, classificando-os na matriz Power × Interest, e propondo communication_plan + team_health_assessment.
+
+REGRAS HARD:
+1. stakeholders DEVE ter pelo menos 1 entrada com nome real ou role (ex: "Diretor de TI", "Sponsor", "Líder Comercial"). NUNCA usar placeholders genéricos como "Stakeholder 1".
+2. Cada stakeholder tem influence ∈ [0,1] e interest ∈ [0,1]. Pelo menos 1 com influence≥0.7 (sponsor) e 1 com interest≥0.7 (operacional).
+3. matrix_power_interest DEVE classificar TODOS os stakeholders em UM dos 4 quadrantes:
+   - high_power_high_interest (Manage Closely): influence≥0.5 E interest≥0.5
+   - high_power_low_interest (Keep Satisfied): influence≥0.5 E interest<0.5
+   - low_power_high_interest (Keep Informed): influence<0.5 E interest≥0.5
+   - low_power_low_interest (Monitor): influence<0.5 E interest<0.5
+4. communication_plan DEVE ter 1 entrada por stakeholder em "Manage Closely" e "Keep Satisfied" no mínimo. Frequência alinhada com criticality (Manage Closely=semanal/diário; Keep Satisfied=quinzenal/mensal).
+5. team_health_assessment: maturity_level usando CMMI-like (initial/managed/defined/quantitatively_managed/optimizing). gaps e recommendations devem ser concretos para o contexto do goal.
+6. risk_alerts: liste explicitamente sinais como "Sponsor desengajado", "Stakeholders críticos não identificados", "Conflito Power×Interest entre 2 sponsors". Lista vazia [] se nenhum.
+7. tools_techniques_applied SEMPRE inclui 'expert_judgment', 'stakeholder_analysis', 'power_interest_grid'. Quando há RAG, incluir 'rag_retrieval'.
+
+FORMATO DE SAÍDA — apenas JSON, sem markdown:
+{
+  "stakeholders": [
+    {"name": "...", "role": "...", "influence": 0.8, "interest": 0.9, "expectations": "..."},
+    ...
+  ],
+  "matrix_power_interest": {
+    "high_power_high_interest": ["<nome1>", ...],
+    "high_power_low_interest": [],
+    "low_power_high_interest": [],
+    "low_power_low_interest": []
+  },
+  "communication_plan": [
+    {"stakeholder_name": "...", "channel": "email|whatsapp|1on1|reuniao|report|dashboard|outro",
+     "frequency": "realtime|diario|semanal|quinzenal|mensal|trimestral|on_demand",
+     "message_focus": "..."},
+    ...
+  ],
+  "team_health_assessment": {
+    "maturity_level": "initial|managed|defined|quantitatively_managed|optimizing",
+    "gaps_identified": ["..."],
+    "recommendations": ["..."]
+  },
+  "risk_alerts": ["..."]
+}"""
+
+
+def _build_stakeholder_map_prompt(
+    goal: Dict[str, Any],
+    company_context: Dict[str, Any],
+    rag_chunks: list,
+    stakeholders_hint: list,
+) -> str:
+    import json as _json
+
+    pmoia = goal.get("pmoia_metadata") or {}
+    rationale = pmoia.get("classification_rationale") or "(não disponível)"
+
+    hint_block = (
+        "\n\nSTAKEHOLDERS PRÉ-IDENTIFICADOS (input):\n" + _json.dumps(stakeholders_hint, ensure_ascii=False, indent=2)
+        if stakeholders_hint else
+        "\n\n(Sem stakeholders pré-identificados — deduza a partir do contexto do projeto e da company.)"
+    )
+
+    rag_block = (
+        "\n\n--- TRECHOS DE HELDMAN/PMBOK (corpus Athena) ---\n"
+        + "\n\n".join(rag_chunks)
+        if rag_chunks else
+        "\n\n(Nenhum trecho do corpus Athena — opere com expert_judgment.)"
+    )
+
+    return f"""PROJETO COM CHARTER (kind=project)
+====================================
+Título: {goal.get('title')}
+Métrica: {goal.get('metric') or '(não definida)'}
+Alvo: {goal.get('target')}
+
+CLASSIFICAÇÃO PRÉVIA (athena-classify)
+======================================
+- confidence: {goal.get('confidence')}
+- business_case_strength: {goal.get('business_case_strength')}
+- rationale: {rationale}
+
+CONTEXTO ORGANIZACIONAL (companies.context_json)
+================================================
+{_json.dumps(company_context, ensure_ascii=False, indent=2) if company_context else '(sem contexto registrado)'}
+{hint_block}
+{rag_block}
+
+INSTRUÇÃO
+=========
+Gere o Stakeholder Map completo conforme PMBOK 5ª:
+- Identifique stakeholders concretos (mínimo 3-5 papéis distintos)
+- Classifique cada um na matriz Power × Interest
+- Proponha communication_plan focado em criticality
+- Avalie team_health (maturity + gaps + recommendations)
+- Sinalize risk_alerts explícitos
+
+Aplique as REGRAS HARD do system prompt.
+Retorne APENAS o JSON conforme schema. Sem markdown, sem texto antes/depois."""
 
 
 async def _handle_risk_register_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -886,7 +1207,7 @@ _SPECIALTY_DISPATCH = {
     # VEC-388 (Pipeline PMI — mandato 1)
     "athena-classify":         _handle_classify,
     "athena-charter":          _handle_charter,
-    "athena-stakeholder-map":  _handle_stakeholder_map_stub,
+    "athena-stakeholder-map":  _handle_stakeholder_map,
     "athena-risk-register":    _handle_risk_register_stub,
     "athena-evm":              _handle_evm_stub,
     "athena-rag-ingest":       _handle_rag_ingest,

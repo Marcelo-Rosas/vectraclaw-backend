@@ -456,7 +456,62 @@ class CharterOutput(HandlerOutputBase):
     outputs: CharterOutputs  # type: ignore[assignment]
 
 
-# StakeholderMap, EVM, Audit, Recommend, Prioritize:
+# ════════════════════════════════════════════════════════════════════════════
+# STAKEHOLDER MAP (athena-stakeholder-map) — VEC-403 PR4c
+# Output-only. Sem persistência (tabela `stakeholders` não existe).
+# ════════════════════════════════════════════════════════════════════════════
+class Stakeholder(BaseModel):
+    """Stakeholder identificado no projeto."""
+    name: str = Field(min_length=2)
+    role: str = Field(min_length=2)
+    influence: float = Field(ge=0.0, le=1.0)
+    interest: float = Field(ge=0.0, le=1.0)
+    expectations: str = Field(min_length=15)
+
+
+class PowerInterestQuadrant(BaseModel):
+    """Matriz Power × Interest (Heldman cap.13). Cada lista contém nomes de stakeholders.
+    high_power_high_interest = Manage Closely (gestão estreita)
+    high_power_low_interest  = Keep Satisfied (manter satisfeito)
+    low_power_high_interest  = Keep Informed (manter informado)
+    low_power_low_interest   = Monitor (apenas monitorar)
+    """
+    high_power_high_interest: List[str] = Field(default_factory=list)
+    high_power_low_interest: List[str] = Field(default_factory=list)
+    low_power_high_interest: List[str] = Field(default_factory=list)
+    low_power_low_interest: List[str] = Field(default_factory=list)
+
+
+class CommunicationEntry(BaseModel):
+    """Entrada do communication plan PMBOK."""
+    stakeholder_name: str = Field(min_length=2)
+    channel: Literal["email", "whatsapp", "1on1", "reuniao", "report", "dashboard", "outro"]
+    frequency: Literal["realtime", "diario", "semanal", "quinzenal", "mensal", "trimestral", "on_demand"]
+    message_focus: str = Field(min_length=15)
+
+
+class TeamHealthAssessment(BaseModel):
+    """Avaliação de saúde do time / capacidade humana — input para charter HR assessment futuro."""
+    maturity_level: Literal["initial", "managed", "defined", "quantitatively_managed", "optimizing"]
+    gaps_identified: List[str] = Field(default_factory=list)
+    recommendations: List[str] = Field(min_length=1)
+
+
+class StakeholderMapOutputs(BaseModel):
+    """Bloco 'outputs' do athena-stakeholder-map."""
+    stakeholders: List[Stakeholder] = Field(min_length=1)
+    matrix_power_interest: PowerInterestQuadrant
+    communication_plan: List[CommunicationEntry] = Field(min_length=1)
+    team_health_assessment: TeamHealthAssessment
+    risk_alerts: List[str] = Field(default_factory=list)
+
+
+class StakeholderMapOutput(HandlerOutputBase):
+    handler_name: Literal["athena-stakeholder-map"] = "athena-stakeholder-map"
+    outputs: StakeholderMapOutputs  # type: ignore[assignment]
+
+
+# EVM, Audit, Recommend, Prioritize:
 # schemas detalhados nos PRs respectivos. Por ora, todos validam contra
 # HandlerOutputBase (versão genérica).
 
@@ -468,7 +523,7 @@ class CharterOutput(HandlerOutputBase):
 SCHEMA_BY_OPERATION_TYPE: Dict[str, type[HandlerOutputBase]] = {
     "athena-classify":         ClassifyOutput,
     "athena-charter":          CharterOutput,
-    "athena-stakeholder-map":  HandlerOutputBase,
+    "athena-stakeholder-map":  StakeholderMapOutput,
     "athena-risk-register":    RiskRegisterOutput,
     "athena-evm":              HandlerOutputBase,
     "athena-rag-ingest":       HandlerOutputBase,
