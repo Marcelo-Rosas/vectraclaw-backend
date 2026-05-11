@@ -1467,9 +1467,337 @@ Aplique as 13 REGRAS HARD do system prompt.
 Retorne APENAS o JSON conforme schema. Sem markdown, sem texto antes/depois."""
 
 
-async def _handle_evm_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """PR5: EVM (Python calcula, Gemini narra) com VAC + TCPI + golden numbers."""
-    return _stub_output("athena-evm", input_data.get("_task_id", ""))
+def _compute_evm(schedule: list, bac: Optional[float] = None) -> Dict[str, Any]:
+    """Calcula métricas EVM PMBOK 5ª de forma determinística.
+
+    Função PURA — sem efeitos colaterais, testável isolada.
+
+    Args:
+        schedule: list of dicts com keys planned_value, actual_cost, percent_complete.
+        bac: Budget At Completion. Se None, usa sum(planned_value) do schedule.
+
+    Returns:
+        dict com pv, ev, ac, bac, sv, cv, spi, cpi, eac, etc, vac, tcpi_bac, tcpi_eac.
+        Todos arredondados a 4 casas. Razões (spi/cpi) None quando denominador=0.
+
+    PMBOK fórmulas:
+        PV   = sum(planned_value)
+        EV   = sum(planned_value × percent_complete/100)
+        AC   = sum(actual_cost)
+        SV   = EV − PV
+        CV   = EV − AC
+        SPI  = EV/PV       (None se PV=0)
+        CPI  = EV/AC       (None se AC=0)
+        EAC  = BAC × AC/EV (None se EV=0)
+        ETC  = EAC − AC    (None se EAC None)
+        VAC  = BAC − EAC   (None se EAC None)
+        TCPI_BAC = (BAC − EV) / (BAC − AC)   (None se BAC=AC)
+        TCPI_EAC = (BAC − EV) / (EAC − AC)   (None se EAC None ou EAC=AC)
+    """
+    pv = round(sum(float(t.get("planned_value", 0) or 0) for t in schedule), 4)
+    ev = round(sum(
+        float(t.get("planned_value", 0) or 0)
+        * float(t.get("percent_complete", 0) or 0) / 100.0
+        for t in schedule
+    ), 4)
+    ac = round(sum(float(t.get("actual_cost", 0) or 0) for t in schedule), 4)
+
+    bac_final = float(bac) if bac is not None else pv
+    sv = round(ev - pv, 4)
+    cv = round(ev - ac, 4)
+    spi = round(ev / pv, 4) if pv > 0 else None
+    cpi = round(ev / ac, 4) if ac > 0 else None
+    # EAC fórmula PMBOK equivalente: BAC × AC/EV (evita drift por arredondar CPI)
+    eac = round(bac_final * ac / ev, 4) if ev > 0 else None
+    etc = round(eac - ac, 4) if eac is not None else None
+    vac = round(bac_final - eac, 4) if eac is not None else None
+    tcpi_bac = round((bac_final - ev) / (bac_final - ac), 4) if bac_final != ac else None
+    tcpi_eac = round((bac_final - ev) / (eac - ac), 4) if (eac is not None and eac != ac) else None
+
+    return {
+        "pv": pv, "ev": ev, "ac": ac, "bac": bac_final,
+        "sv": sv, "cv": cv,
+        "spi": spi, "cpi": cpi,
+        "eac": eac, "etc": etc, "vac": vac,
+        "tcpi_bac": tcpi_bac, "tcpi_eac": tcpi_eac,
+    }
+
+
+def _evm_alert_signals(metrics: Dict[str, Any]) -> list:
+    """Gera alertas determinísticos a partir das métricas. Gemini NÃO inventa esses."""
+    alerts = []
+    if metrics["cpi"] is not None and metrics["cpi"] < 1.0:
+        alerts.append(f"⚠️ CPI={metrics['cpi']:.3f} < 1.0 — projeto gastando mais que o planejado")
+    if metrics["spi"] is not None and metrics["spi"] < 1.0:
+        alerts.append(f"⚠️ SPI={metrics['spi']:.3f} < 1.0 — projeto atrasado vs cronograma")
+    if metrics["vac"] is not None and metrics["vac"] < 0:
+        alerts.append(f"🔴 VAC={metrics['vac']:.2f} negativo — projeto estourará o orçamento ao fim")
+    if metrics["cpi"] is not None and metrics["cpi"] < 0.8:
+        alerts.append(f"🔴 CPI={metrics['cpi']:.3f} crítico — escalar imediatamente para Steering")
+    return alerts
+
+
+async def _handle_evm(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-405 (real, output-only): EVM PMBOK 5ª — Python calcula, Gemini narra.
+
+    Design diferente dos outros handlers Athena:
+    - Métricas (PV/EV/AC/SV/CV/SPI/CPI/EAC/ETC/VAC/TCPI) calculadas determinísticamente
+      em Python via _compute_evm — função pura testável.
+    - Gemini recebe APENAS os números já calculados e produz:
+      * narrative_md: interpretação humana do estado do projeto
+      * executive_summary_md: resumo executivo curto
+      * alerts: lista textual adicional (alertas determinísticos já vêm do Python)
+    - Pydantic EVMMetrics rejeita output do Gemini se ele "alucinar" e mudar valores
+      (drift ≤ 0.01 em valores, ≤ 0.001 em ratios — validators in athena_schemas).
+
+    Args:
+        prompt: ignorado.
+        input_data: dict com `_supabase`, `_task_id`, `_company_id`, `goal_id`,
+                    `schedule` (List[Dict] com planned_value/actual_cost/percent_complete),
+                    `bac` (opcional), `interpretation_period` (opcional).
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    import json as _json
+
+    from src.agents.athena_schemas import EVMOutput, ValidationBlock
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+    goal_id = input_data.get("goal_id")
+    schedule = input_data.get("schedule") or []
+    bac_input = input_data.get("bac")
+    interpretation_period = input_data.get("interpretation_period") or _dt.now(_tz.utc).strftime("%Y-%m-%d")
+
+    if not goal_id:
+        return _evm_error_output(task_id, started_at, "missing_goal_id",
+                                 "input_json.goal_id é obrigatório")
+    if supabase is None:
+        return _evm_error_output(task_id, started_at, "missing_supabase",
+                                 "Cliente Supabase não disponível")
+    if not isinstance(schedule, list) or not schedule:
+        return _evm_error_output(
+            task_id, started_at, "missing_schedule",
+            "input_json.schedule deve ser lista não-vazia de tasks com "
+            "{planned_value, actual_cost, percent_complete}",
+        )
+
+    # 1) SELECT goal
+    try:
+        goal_res = (
+            supabase.table("goals")
+            .select("id,company_id,title,kind,confidence,pmoia_metadata")
+            .eq("id", goal_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("athena-evm select goal failed task=%s goal=%s", task_id, goal_id)
+        return _evm_error_output(task_id, started_at, "goal_select_failed", str(exc))
+    if not goal_res.data:
+        return _evm_error_output(task_id, started_at, "goal_not_found",
+                                 f"goals not found: {goal_id}")
+    goal = goal_res.data[0]
+
+    if company_id and str(goal.get("company_id")) != str(company_id):
+        return _evm_error_output(task_id, started_at, "company_mismatch",
+                                 "goal.company_id != task.company_id")
+
+    # 2) Pré-validação (mesmo guard dos outros handlers PMBOK)
+    if goal.get("kind") != "project":
+        return _evm_error_output(task_id, started_at, "goal_not_classified_as_project",
+                                 f"athena-evm exige goal.kind='project'. Atual: {goal.get('kind')!r}")
+    try:
+        if goal.get("confidence") is None or float(goal["confidence"]) < 0.7:
+            return _evm_error_output(task_id, started_at, "low_classify_confidence",
+                                     f"athena-evm exige confidence>=0.7. Atual: {goal.get('confidence')}")
+    except (TypeError, ValueError):
+        return _evm_error_output(task_id, started_at, "invalid_confidence",
+                                 f"confidence inválido: {goal.get('confidence')!r}")
+
+    # 3) CÁLCULO DETERMINÍSTICO (Python)
+    try:
+        metrics = _compute_evm(schedule, bac_input)
+    except Exception as exc:
+        logger.exception("athena-evm _compute_evm failed task=%s: %s", task_id, exc)
+        return _evm_error_output(task_id, started_at, "compute_failed", str(exc))
+
+    deterministic_alerts = _evm_alert_signals(metrics)
+
+    # 4) Gemini gera apenas narrativa (NÃO recalcula números)
+    user_prompt = _build_evm_prompt(goal, metrics, deterministic_alerts, interpretation_period)
+    try:
+        text, llm_meta = await gemini_generate(
+            ATHENA_DEFAULT_MODEL,
+            user_prompt,
+            system_instruction=_EVM_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("athena-evm gemini call failed task=%s", task_id)
+        return _evm_error_output(task_id, started_at, "gemini_call_failed", str(exc))
+
+    try:
+        gemini_payload = _json.loads(text)
+    except Exception as exc:
+        return _evm_error_output(
+            task_id, started_at, "gemini_invalid_json",
+            f"JSON inválido: {exc}. Raw[:200]={text[:200]!r}",
+        )
+
+    # 5) Monta envelope FORÇANDO os números calculados em Python.
+    #    Se o Gemini retornou números, eles são DESCARTADOS — só usamos a narrativa.
+    completed_at = _dt.now(_tz.utc).isoformat()
+    gemini_alerts = gemini_payload.get("alerts") or []
+    all_alerts = list(deterministic_alerts) + [
+        a for a in gemini_alerts if a not in deterministic_alerts
+    ]
+
+    envelope = {
+        "handler_name": "athena-evm",
+        "execution_id": task_id,
+        "execution_started_at": started_at,
+        "execution_completed_at": completed_at,
+        "inputs_used": {
+            "goal_id": goal_id,
+            "schedule_tasks": len(schedule),
+            "bac_input": bac_input,
+            "interpretation_period": interpretation_period,
+        },
+        "tools_techniques_applied": ["expert_judgment", "earned_value_analysis"],
+        "outputs": {
+            "metrics": metrics,  # Python — fonte de verdade
+            "narrative_md": gemini_payload.get("narrative_md", ""),
+            "executive_summary_md": gemini_payload.get("executive_summary_md", ""),
+            "alerts": all_alerts,
+            "interpretation_period": interpretation_period,
+        },
+        "validation": ValidationBlock(
+            all_required_inputs_present=True,
+            confidence=0.95,  # EVM é determinístico; alta confiança intrínseca
+            warnings=[],
+            needs_human_review=False,
+        ).model_dump(),
+        "citations": [],
+    }
+
+    try:
+        EVMOutput.model_validate(envelope)
+    except Exception as exc:
+        logger.exception("athena-evm pydantic validation failed task=%s: %s", task_id, exc)
+        return _evm_error_output(
+            task_id, started_at, "pydantic_validation_failed",
+            f"{exc}. metrics={metrics}",
+        )
+
+    # 6) Cost + metadata
+    tokens = {
+        "input": int(llm_meta.get("input_token_count") or 0),
+        "output": int(llm_meta.get("output_token_count") or 0),
+    }
+    tokens["total"] = tokens["input"] + tokens["output"]
+    envelope["metadata"] = {"tokens": tokens}
+    cost_usd = _calc_cost(tokens)
+
+    logger.info(
+        "athena-evm done task=%s goal=%s pv=%.2f ev=%.2f ac=%.2f cpi=%s spi=%s alerts=%d tokens=%d",
+        task_id, goal_id, metrics["pv"], metrics["ev"], metrics["ac"],
+        metrics["cpi"], metrics["spi"], len(all_alerts), tokens["total"],
+    )
+
+    return {
+        "output_json": envelope,
+        "cost_usd": cost_usd,
+        "status_override": "done",
+    }
+
+
+def _evm_error_output(
+    task_id: str, started_at: str, code: str, message: str,
+) -> Dict[str, Any]:
+    """Envelope I/T/O minimal para erros do athena-evm. status=blocked."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-evm",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "status": "error",
+                "code": code,
+                "message": message,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": False,
+                "confidence": 0.0,
+                "warnings": [code],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "blocked",
+    }
+
+
+_EVM_SYSTEM_PROMPT = """Você é Athena, PMOia da Vectra Cargo, especialista em PMBOK 5ª (Kim Heldman, cap.7 Cost Management — EVM).
+
+Sua tarefa: gerar NARRATIVA HUMANA a partir de métricas EVM JÁ CALCULADAS em Python. **NÃO recalcule números** — eles vêm prontos do sistema. Sua função é interpretar e contextualizar.
+
+REGRAS HARD:
+1. NÃO modifique os valores numéricos das métricas (pv, ev, ac, sv, cv, spi, cpi, eac, etc, vac, tcpi). Se você "achar" outro número, é alucinação — o sistema rejeita.
+2. narrative_md (≥100 chars): texto markdown com 3-5 parágrafos cobrindo:
+   - O estado geral (no rumo / atrasado / estourando custo / ambos)
+   - Comparação SPI vs CPI (atraso vs custo são problemas independentes)
+   - Projeção VAC (impacto financeiro ao fim)
+   - Recomendação acionável concreta
+3. executive_summary_md (≥50 chars): 1-2 frases para Steering. Use 🟢/🟡/🟠/🔴 conforme severidade.
+4. alerts: lista textual extra (NÃO repetir os alertas determinísticos já fornecidos). Pode ser vazia.
+
+FORMATO DE SAÍDA — apenas JSON:
+{
+  "narrative_md": "## Estado do Projeto\\n\\n...análise técnica...",
+  "executive_summary_md": "🟠 Projeto atrasado (SPI=0.45) E estourando custo (CPI=0.87). Decisão de Steering recomendada.",
+  "alerts": ["..."]
+}"""
+
+
+def _build_evm_prompt(
+    goal: Dict[str, Any],
+    metrics: Dict[str, Any],
+    deterministic_alerts: list,
+    interpretation_period: str,
+) -> str:
+    import json as _json
+
+    metrics_block = _json.dumps(metrics, ensure_ascii=False, indent=2)
+    alerts_block = "\n".join(f"- {a}" for a in deterministic_alerts) if deterministic_alerts else "(nenhum)"
+
+    return f"""PROJETO (kind=project)
+======================
+Título: {goal.get('title')}
+Período de referência: {interpretation_period}
+
+MÉTRICAS EVM JÁ CALCULADAS (NÃO altere os valores)
+==================================================
+{metrics_block}
+
+ALERTAS DETERMINÍSTICOS (já gerados pelo Python — NÃO repetir literalmente)
+===========================================================================
+{alerts_block}
+
+INSTRUÇÃO
+=========
+Gere a NARRATIVA conforme schema do system prompt. Use os valores ACIMA — não recalcule.
+Foco no significado: o que esses números dizem sobre o projeto? O que o Steering deveria fazer?
+Retorne APENAS o JSON. Sem markdown wrapper, sem texto antes/depois."""
 
 
 async def _handle_audit_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1584,7 +1912,7 @@ _SPECIALTY_DISPATCH = {
     "athena-charter":          _handle_charter,
     "athena-stakeholder-map":  _handle_stakeholder_map,
     "athena-risk-register":    _handle_risk_register,
-    "athena-evm":              _handle_evm_stub,
+    "athena-evm":              _handle_evm,
     "athena-rag-ingest":       _handle_rag_ingest,
     # VEC-389 (Coverage Manager — mandato 2)
     "athena-audit":            _handle_audit_stub,
