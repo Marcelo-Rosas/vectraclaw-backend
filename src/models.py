@@ -120,6 +120,16 @@ class Task(CamelModel):
         "financial-bookkeeping",
         "conciliacao-backlog",
         "rag-ingest",
+        # VEC-388 PR1: 9 novos operation types da Athena (PMOia Heldman/PMBOK)
+        "athena-classify",
+        "athena-charter",
+        "athena-stakeholder-map",
+        "athena-risk-register",
+        "athena-evm",
+        "athena-rag-ingest",
+        "athena-audit",
+        "athena-recommend",
+        "athena-prioritize",
         "other",
     ] = "other"
     budget_limit: int

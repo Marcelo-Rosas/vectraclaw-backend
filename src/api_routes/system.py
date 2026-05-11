@@ -49,6 +49,7 @@ _DAEMON_AGENTS = [
     ("0d6e56cc-28b6-4382-96cd-1952b890d412", "Hodos"),
     ("360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1", "HermesReporter"),
     ("9c8d7e6f-5a4b-4321-9876-543210fedcba", "Kronos"),
+    ("ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d", "Athena"),  # VEC-388 PR1
 ]
 
 
