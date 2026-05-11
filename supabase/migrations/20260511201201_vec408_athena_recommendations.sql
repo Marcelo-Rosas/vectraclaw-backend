@@ -81,7 +81,7 @@ COMMENT ON TABLE vectraclip.athena_recommendations IS
   'Recomendações Athena (mandato 2/VEC-389). status=pending até humano aprovar; nunca auto-aplica.';
 COMMENT ON COLUMN vectraclip.athena_recommendations.reviewed_by_user_id IS
   'FK para auth.users (Supabase Auth nativo). ON DELETE SET NULL.';
-COMMENT ON CONSTRAINT athena_recommendations_pending_idx ON vectraclip.athena_recommendations IS
+COMMENT ON INDEX vectraclip.athena_recommendations_pending_idx IS
   'Hot path: SELECT WHERE status=pending no painel UI.';
 
 
