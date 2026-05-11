@@ -9,7 +9,9 @@ Pipeline:
   3. Download do Supabase Storage (bucket rag-documents, path = {company_id}/{sha256}.{ext})
   4. extract_text → ExtractedDocument
   5. chunk_text → list[ChunkInput]
-  6. embedder.embed_batch (text-embedding-3-small, 1536 dim)
+  6. embedder.embed_batch (OpenAI text-embedding-3-small primário,
+     fallback Gemini gemini-embedding-001 se OpenAI retornar 429/401;
+     ambos em 1536 dim — schema vector(1536) intacto)
   7. Bulk insert em rag_chunks (trigger sync_chunk_company_id valida)
   8. status='indexed', indexed_at, page_count
   9. Erro: status='failed', error_detail (truncado a 500 chars)
@@ -138,9 +140,19 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
                 }
 
             # 7. Embed (async run inside sync entrypoint do daemon)
+            # Default: OpenAI primário; Gemini fallback se OpenAI dá 429/401
+            # (quota zerada ou key inválida). FallbackEmbedder.model é
+            # atualizado dinamicamente para refletir qual provider entregou.
             if embedder is None:
-                from src.services.rag.embedder import OpenAIEmbedder
-                embedder = OpenAIEmbedder()
+                from src.services.rag.embedder import (
+                    FallbackEmbedder,
+                    GeminiEmbedder,
+                    OpenAIEmbedder,
+                )
+                embedder = FallbackEmbedder(
+                    primary=OpenAIEmbedder(),
+                    fallbacks=[GeminiEmbedder()],
+                )
 
             texts = [c.content for c in chunks]
             embeddings = asyncio.run(embedder.embed_batch(texts))
