@@ -140,9 +140,10 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
                 }
 
             # 7. Embed (async run inside sync entrypoint do daemon)
-            # Default: OpenAI primário; Gemini fallback se OpenAI dá 429/401
-            # (quota zerada ou key inválida). FallbackEmbedder.model é
-            # atualizado dinamicamente para refletir qual provider entregou.
+            # VEC-397: Gemini é primário, OpenAI é fallback. Cota OpenAI já
+            # estourou em prod (smoke VEC-394 2026-05-11); Gemini key vital­
+            # mente disponível. FallbackEmbedder.model é atualizado dinami­
+            # camente para refletir qual provider entregou cada chunk.
             if embedder is None:
                 from src.services.rag.embedder import (
                     FallbackEmbedder,
@@ -150,8 +151,8 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
                     OpenAIEmbedder,
                 )
                 embedder = FallbackEmbedder(
-                    primary=OpenAIEmbedder(),
-                    fallbacks=[GeminiEmbedder()],
+                    primary=GeminiEmbedder(),
+                    fallbacks=[OpenAIEmbedder()],
                 )
 
             texts = [c.content for c in chunks]
