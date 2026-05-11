@@ -1800,9 +1800,366 @@ Foco no significado: o que esses números dizem sobre o projeto? O que o Steerin
 Retorne APENAS o JSON. Sem markdown wrapper, sem texto antes/depois."""
 
 
-async def _handle_audit_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """VEC-389 PR2: audita quadro de agentes (read-only, gera relatório)."""
-    return _stub_output("athena-audit", input_data.get("_task_id", ""))
+def _score_agent_quality(agent: Dict[str, Any], specialty_count: int) -> Dict[str, Any]:
+    """Calcula score 0-4 + grade + flags para um agente. Função PURA testável.
+
+    Critérios:
+      +1 se prompt_length >= 200
+      +1 se prompt_length >= 1000 (excelente cobertura)
+      +1 se specialty_count >= 1
+      +1 se name presente e não-vazio
+
+    Grade:
+      0-1 = stub
+      2   = ok
+      3   = good
+      4   = excellent
+    """
+    prompt = agent.get("system_prompt") or ""
+    prompt_len = len(prompt)
+    name = (agent.get("name") or "").strip()
+
+    score = 0
+    flags = []
+
+    if prompt_len >= 200:
+        score += 1
+    else:
+        flags.append(f"prompt_length={prompt_len} (< 200 chars; provável stub)")
+    if prompt_len >= 1000:
+        score += 1
+    if specialty_count >= 1:
+        score += 1
+    else:
+        flags.append("sem specialty associada — agente sem domínio explícito")
+    if name:
+        score += 1
+    else:
+        flags.append("agent.name vazio")
+
+    if score <= 1:
+        grade: str = "stub"
+    elif score == 2:
+        grade = "ok"
+    elif score == 3:
+        grade = "good"
+    else:
+        grade = "excellent"
+
+    return {
+        "quality_score": score,
+        "prompt_length": prompt_len,
+        "specialty_count": specialty_count,
+        "flags": flags,
+        "grade": grade,
+    }
+
+
+async def _handle_audit(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """VEC-407 (real, read-only): audita quadro de agentes da company e gera
+    relatório markdown no output_json.
+
+    Pipeline:
+      1. SELECT agents da company (filtra is_system conforme scope; sempre exclui Athena)
+      2. SELECT agent_specialty_configs por agent_id (count por agente)
+      3. _score_agent_quality em Python (PURA, determinística) por agente
+      4. RAG corpus Athena: chunks sobre "papel do PM, system prompts, skills" (best-effort)
+      5. Gemini gera coverage_gaps + recommendations textuais + audit_summary_md
+      6. Pydantic AuditOutput strict valida
+      7. Retorna envelope sem tocar em nenhuma tabela (read-only)
+
+    Args:
+        input_data: dict com `_supabase`, `_task_id`, `_company_id`,
+                    `scope` (default 'non_system'), opcional `agent_id`.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    import json as _json
+
+    from src.agents.athena_schemas import AuditOutput, ValidationBlock
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+    scope = (input_data.get("scope") or "non_system").strip()
+    specific_agent_id = input_data.get("agent_id")
+
+    if supabase is None:
+        return _audit_error_output(task_id, started_at, "missing_supabase",
+                                   "Cliente Supabase não disponível")
+    if not company_id:
+        return _audit_error_output(task_id, started_at, "missing_company_id",
+                                   "task.company_id é obrigatório para audit")
+    if scope not in ("all_agents", "non_system", "specific_agent"):
+        return _audit_error_output(
+            task_id, started_at, "invalid_scope",
+            f"scope inválido: {scope!r}. Esperado: all_agents|non_system|specific_agent",
+        )
+
+    # 1) SELECT agents (sempre exclui Athena pra não auditar a si mesma)
+    try:
+        q = (
+            supabase.table("agents")
+            .select("id,name,role,system_prompt,is_system")
+            .eq("company_id", company_id)
+            .neq("id", ATHENA_AGENT_ID)
+        )
+        if scope == "non_system":
+            q = q.eq("is_system", False)
+        elif scope == "specific_agent":
+            if not specific_agent_id:
+                return _audit_error_output(
+                    task_id, started_at, "missing_agent_id",
+                    "scope=specific_agent exige input.agent_id",
+                )
+            if str(specific_agent_id) == ATHENA_AGENT_ID:
+                return _audit_error_output(
+                    task_id, started_at, "self_audit_blocked",
+                    "Athena não audita a si mesma",
+                )
+            q = q.eq("id", specific_agent_id)
+        agents_res = q.execute()
+    except Exception as exc:
+        logger.exception("athena-audit select agents failed task=%s: %s", task_id, exc)
+        return _audit_error_output(task_id, started_at, "agents_select_failed", str(exc))
+
+    agents = agents_res.data or []
+    if not agents:
+        return _audit_error_output(
+            task_id, started_at, "no_agents_in_scope",
+            f"Nenhum agente encontrado para scope={scope} company={company_id}",
+        )
+
+    # 2) Conta specialties por agent_id (1 query, group em Python)
+    agent_ids = [a["id"] for a in agents]
+    specialty_count_by_agent: Dict[str, int] = {aid: 0 for aid in agent_ids}
+    try:
+        sp_res = (
+            supabase.table("agent_specialty_configs")
+            .select("agent_id")
+            .in_("agent_id", agent_ids)
+            .execute()
+        )
+        for row in (sp_res.data or []):
+            aid = str(row.get("agent_id") or "")
+            if aid in specialty_count_by_agent:
+                specialty_count_by_agent[aid] += 1
+    except Exception as exc:
+        # Não-fatal: continua audit sem specialty_count (será 0 pra todos)
+        logger.warning("athena-audit specialty count failed (non-fatal): %s", exc)
+
+    # 3) Score determinístico por agente
+    scorecards = []
+    for a in agents:
+        spec_count = specialty_count_by_agent.get(str(a["id"]), 0)
+        scoring = _score_agent_quality(a, spec_count)
+        scorecards.append({
+            "agent_id": str(a["id"]),
+            "agent_name": a.get("name") or "(sem nome)",
+            "quality_score": scoring["quality_score"],
+            "prompt_length": scoring["prompt_length"],
+            "specialty_count": scoring["specialty_count"],
+            "is_system": bool(a.get("is_system")),
+            "flags": scoring["flags"],
+            "grade": scoring["grade"],
+        })
+
+    agents_below_threshold = sum(1 for sc in scorecards if sc["grade"] in ("stub", "ok"))
+
+    # 4) RAG best-effort
+    rag_chunks: list = []
+    try:
+        from src.services.athena_rag import query_top_k as _athena_query
+        rag_results = await _athena_query(
+            "papel gerente de projetos habilidades competências system prompt agente PM",
+            company_id=company_id,
+            k=3,
+            min_score=0.3,
+            supabase_client=supabase,
+        )
+        for r in rag_results:
+            rag_chunks.append(
+                f"[chunk {r.chunk_index} | score {r.score:.2f}]\n{r.content[:1200]}"
+            )
+    except Exception as exc:
+        logger.warning("athena-audit RAG indisponível (degradando): %s", exc)
+
+    # 5) Gemini: gaps + recommendations + audit_summary_md
+    user_prompt = _build_audit_prompt(scorecards, rag_chunks, scope)
+    try:
+        text, llm_meta = await gemini_generate(
+            ATHENA_DEFAULT_MODEL,
+            user_prompt,
+            system_instruction=_AUDIT_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+        )
+    except Exception as exc:
+        logger.exception("athena-audit gemini call failed task=%s", task_id)
+        return _audit_error_output(task_id, started_at, "gemini_call_failed", str(exc))
+
+    try:
+        gemini_payload = _json.loads(text)
+    except Exception as exc:
+        return _audit_error_output(
+            task_id, started_at, "gemini_invalid_json",
+            f"JSON inválido: {exc}. Raw[:200]={text[:200]!r}",
+        )
+
+    # 6) Envelope (scorecards vem do Python; Gemini só preencheu gaps/recs/summary)
+    completed_at = _dt.now(_tz.utc).isoformat()
+    envelope = {
+        "handler_name": "athena-audit",
+        "execution_id": task_id,
+        "execution_started_at": started_at,
+        "execution_completed_at": completed_at,
+        "inputs_used": {
+            "scope": scope,
+            "specific_agent_id": specific_agent_id,
+            "total_agents_scanned": len(agents),
+            "rag_chunks_used": len(rag_chunks),
+        },
+        "tools_techniques_applied": ["expert_judgment", "gap_analysis", "prompt_quality_scoring"],
+        "outputs": {
+            "agent_scorecards": scorecards,
+            "coverage_gaps": gemini_payload.get("coverage_gaps", []),
+            "recommendations_textual": gemini_payload.get("recommendations_textual", []),
+            "audit_summary_md": gemini_payload.get("audit_summary_md", ""),
+            "total_agents": len(scorecards),
+            "agents_below_threshold": agents_below_threshold,
+        },
+        "validation": ValidationBlock(
+            all_required_inputs_present=True,
+            confidence=0.9,
+            warnings=[],
+            needs_human_review=False,
+        ).model_dump(),
+        "citations": [],
+    }
+
+    try:
+        AuditOutput.model_validate(envelope)
+    except Exception as exc:
+        logger.exception("athena-audit pydantic validation failed task=%s", task_id)
+        return _audit_error_output(
+            task_id, started_at, "pydantic_validation_failed",
+            f"{exc}. scorecards_count={len(scorecards)}",
+        )
+
+    # 7) Cost
+    tokens = {
+        "input": int(llm_meta.get("input_token_count") or 0),
+        "output": int(llm_meta.get("output_token_count") or 0),
+    }
+    tokens["total"] = tokens["input"] + tokens["output"]
+    envelope["metadata"] = {"tokens": tokens}
+    cost_usd = _calc_cost(tokens)
+
+    logger.info(
+        "athena-audit done task=%s scope=%s agents=%d below_threshold=%d tokens=%d",
+        task_id, scope, len(scorecards), agents_below_threshold, tokens["total"],
+    )
+
+    return {
+        "output_json": envelope,
+        "cost_usd": cost_usd,
+        "status_override": "done",
+    }
+
+
+def _audit_error_output(
+    task_id: str, started_at: str, code: str, message: str,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-audit",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": now,
+            "inputs_used": {},
+            "tools_techniques_applied": ["expert_judgment"],
+            "outputs": {
+                "status": "error",
+                "code": code,
+                "message": message,
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": False,
+                "confidence": 0.0,
+                "warnings": [code],
+                "needs_human_review": True,
+            },
+            "citations": [],
+            "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+        },
+        "cost_usd": 0.0,
+        "status_override": "blocked",
+    }
+
+
+_AUDIT_SYSTEM_PROMPT = """Você é Athena, PMOia da Vectra Cargo, especialista em PMBOK 5ª (Kim Heldman cap.5 — papel do gerente de projetos, habilidades e responsabilidades). Aqui você atua como Agent Coverage Manager: audita o quadro de daemons da company.
+
+Sua tarefa: a partir dos SCORECARDS já calculados em Python (você NÃO recalcula scores), gere:
+1. coverage_gaps — domínios/skills faltantes ou subatendidos no quadro atual
+2. recommendations_textual — sugestões textuais (PR futuro fará registro estruturado em athena_recommendations)
+3. audit_summary_md — relatório markdown completo (≥200 chars)
+
+REGRAS HARD:
+1. NÃO modifique os campos quality_score, grade, flags dos scorecards — eles vêm prontos.
+2. coverage_gaps DEVE conter pelo menos 1 entry se há agentes com grade='stub'.
+3. severity ∈ {low, medium, high, critical}. critical apenas se há gap em skill bloqueante (ex: financial em company com regulação fiscal pendente).
+4. recommendation_kind ∈ {hire_new_agent, add_specialty, rewrite_system_prompt, consolidate_agents}.
+5. audit_summary_md (≥200 chars) com 3-5 parágrafos:
+   - Estado geral do quadro (quantos stub, ok, good, excellent)
+   - Top-3 problemas priorizados por severidade
+   - Sugestão de próximo passo PMBOK
+
+FORMATO DE SAÍDA — apenas JSON, sem markdown wrapper:
+{
+  "coverage_gaps": [
+    {
+      "domain": "...",
+      "description": "<≥20 chars>",
+      "recommendation_kind": "hire_new_agent | add_specialty | rewrite_system_prompt | consolidate_agents",
+      "affected_goal_kinds": ["project", "operation"],
+      "severity": "low | medium | high | critical"
+    }
+  ],
+  "recommendations_textual": ["...", "..."],
+  "audit_summary_md": "## Audit do Quadro de Agentes\\n\\n..."
+}"""
+
+
+def _build_audit_prompt(scorecards: list, rag_chunks: list, scope: str) -> str:
+    import json as _json
+
+    rag_block = (
+        "\n\n--- TRECHOS DE HELDMAN/PMBOK ---\n" + "\n\n".join(rag_chunks)
+        if rag_chunks else
+        "\n\n(Nenhum trecho do corpus — opere com expert_judgment.)"
+    )
+
+    return f"""SCOPE DA AUDITORIA
+==================
+{scope}
+
+SCORECARDS JÁ CALCULADOS (NÃO recalcule)
+========================================
+{_json.dumps(scorecards, ensure_ascii=False, indent=2)}
+{rag_block}
+
+INSTRUÇÃO
+=========
+Use os scorecards acima como FATO (foram calculados em Python).
+Foque na análise qualitativa:
+- Onde há gaps de cobertura?
+- Quais agentes precisam de rewrite (grade=stub)?
+- Há sobreposição entre agentes que sugere consolidate?
+
+Aplique as REGRAS HARD do system prompt.
+Retorne APENAS o JSON. Sem markdown wrapper, sem texto antes/depois."""
 
 
 async def _handle_recommend_stub(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -2367,7 +2724,7 @@ _SPECIALTY_DISPATCH = {
     "athena-evm":              _handle_evm,
     "athena-rag-ingest":       _handle_rag_ingest,
     # VEC-389 (Coverage Manager — mandato 2)
-    "athena-audit":            _handle_audit_stub,
+    "athena-audit":            _handle_audit,
     "athena-recommend":        _handle_recommend_stub,
     # VEC-390 (Prioritizer — mandato 3)
     "athena-prioritize":       _handle_prioritize,
