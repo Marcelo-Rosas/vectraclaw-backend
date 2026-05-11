@@ -157,7 +157,12 @@ async def _handle_rag_ingest(prompt: str, input_data: Dict[str, Any]) -> Dict[st
             "sha256": input_data.get("sha256"),
         },
     }
-    result = _ingest_entry(task, supabase)
+    # entrypoint é sync e chama asyncio.run() internamente (paridade Mnemos).
+    # Como este handler é async (rodando dentro do event loop do agent_daemon),
+    # chamar asyncio.run() aninhado lança "cannot be called from a running event
+    # loop". Mnemos é despachado como função sync direto e não tem esse problema.
+    # Solução: rodar em thread separada via asyncio.to_thread (libera o loop).
+    result = await asyncio.to_thread(_ingest_entry, task, supabase)
 
     now = datetime.now(timezone.utc).isoformat()
     if result.get("status") == "done":
