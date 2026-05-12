@@ -247,10 +247,34 @@ async def _select_first_real_partition(combobox_locator) -> None:
         )
         return
     first = candidates[0]
-    await combobox_locator.select_option(value=first["value"])
+    await _set_select_value_robust(combobox_locator, first["value"])
     logger.info(
         "Instituição auto-selecionada (default): %s",
         first["text"],
+    )
+
+
+async def _set_select_value_robust(combobox_locator, value: str) -> None:
+    """Seleciona um `<option>` num `<select>` de forma robusta.
+
+    O Meu Planner usa daisyUI, que renderiza overlay custom em cima do
+    `<select>` nativo — Playwright reporta o elemento como "not visible".
+    Estratégia:
+    1. `select_option` com `force=True` (Playwright bypassa o visible check).
+    2. Se falhar, JS direto: set `value` + dispatch `change`/`input` events.
+    """
+    try:
+        await combobox_locator.select_option(value=value, force=True)
+        return
+    except Exception as exc:
+        logger.debug("select_option(force=True) falhou (%s) — fallback via JS", exc)
+    await combobox_locator.evaluate(
+        """(el, val) => {
+            el.value = val;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }""",
+        value,
     )
 
 
@@ -290,7 +314,7 @@ async def _do_import_flow(
     modal_select = page.locator(SELECTOR_INSTITUICAO_COMBOBOX).first
     if instituicao:
         try:
-            await modal_select.select_option(label=instituicao)
+            await modal_select.select_option(label=instituicao, force=True)
         except Exception as exc:
             logger.warning(
                 "não foi possível selecionar Instituição %r: %s — caindo no default",
