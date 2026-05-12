@@ -48,6 +48,12 @@ from src.agents.kronos_categorizer import (
     load_rules,
     match_rule,
 )
+from src.agents.kronos_pdf_enricher import (
+    build_pdf_lookup,
+    find_enriched_description,
+    parse_brl_amount_to_centavos,
+    parse_c6_pdf,
+)
 
 
 logger = logging.getLogger("KronosPlanner")
@@ -63,6 +69,8 @@ _DEFAULT_RULES_PATH = Path(__file__).parent / "kronos_category_rules.yaml"
 _CATEGORIA_CELL_INDEX = 3       # 0-indexed: Categoria
 _SUBCATEGORIA_CELL_INDEX = 4    # 0-indexed: Subcategoria
 _DESC_CELL_INDEX = 7            # 0-indexed: Descrição
+_DATA_EVENTO_CELL_INDEX = 1     # 0-indexed: Data do evento
+_VALOR_CELL_INDEX = 8           # 0-indexed: Valor
 _SELECT_CATEGORY = 'select[name="category"]'
 _SELECT_SUBCATEGORY = 'select[name="subcategory"]'
 _MAX_CATEGORIZE_LINES = 200
@@ -160,6 +168,10 @@ async def _run_planner_import_async(
     # VEC-423: carrega regras de categorização (best-effort — vazio é OK)
     rules = _load_categorization_rules()
 
+    # VEC-425: carrega PDF lookup pra enriquecer descrições genéricas (TRANSF
+    # ENVIADA PIX → "Pix enviado para NOME") quando PDF_PATH é informado.
+    pdf_lookup = _load_pdf_lookup(inputs.get("PDF_PATH"))
+
     screenshot_path: Optional[str] = None
     toast_text = ""
     categorization_stats: Optional[dict[str, Any]] = None
@@ -178,7 +190,7 @@ async def _run_planner_import_async(
             if rules:
                 try:
                     categorization_stats = await _categorize_pending_lines(
-                        session, rules
+                        session, rules, pdf_lookup=pdf_lookup
                     )
                 except Exception as exc:
                     logger.warning(
@@ -544,6 +556,8 @@ async def _set_select_by_label(combobox_locator, label: str) -> None:
 async def _categorize_pending_lines(
     session: KronosPlannerSession,
     rules: list[Rule],
+    *,
+    pdf_lookup: Optional[dict[tuple[str, int], str]] = None,
     max_lines: int = _MAX_CATEGORIZE_LINES,
 ) -> dict[str, Any]:
     """Itera linhas com `Categoria='Sem Categoria...'` e aplica match_rule.
@@ -552,6 +566,10 @@ async def _categorize_pending_lines(
     - Re-query a cada iteração (tabela re-renderiza após save).
     - Marca rows já processadas com `data-kronos-processed` pra não voltar.
     - Catch per-row: falha de uma linha não para o loop.
+
+    VEC-425: `pdf_lookup` opcional. Quando fornecido, descrições genéricas
+    (`TRANSF ENVIADA PIX`) são enriquecidas via (data, valor) → descrição
+    PDF antes do `match_rule`.
     """
     page = session.page
     assert page is not None, "KronosPlannerSession sem page ativa"
@@ -572,38 +590,58 @@ async def _categorize_pending_lines(
             )
             break
 
-        desc = await _read_row_description(row)
-        result = match_rule(desc, rules)
+        row_data = await _read_row_data(row)
+        original_desc = row_data["desc"]
+        enriched_desc = original_desc
+
+        # VEC-425: enrichment via PDF lookup
+        if pdf_lookup and row_data["date_str"] and row_data["amount_centavos"]:
+            enriched = find_enriched_description(
+                pdf_lookup,
+                row_data["date_str"],
+                row_data["amount_centavos"],
+            )
+            if enriched:
+                enriched_desc = enriched
+                if original_desc != enriched:
+                    logger.debug(
+                        "enriched: '%s' → '%s'",
+                        original_desc[:40],
+                        enriched[:60],
+                    )
+
+        result = match_rule(enriched_desc, rules)
 
         if result is None:
             await _mark_row(row, "skipped")
             stats["lines_unclassified"] += 1
-            _append_detail(
-                stats, {"desc": desc[:60], "action": "skipped"}
-            )
+            detail: dict[str, Any] = {"desc": enriched_desc[:60], "action": "skipped"}
+            if enriched_desc != original_desc:
+                detail["original_desc"] = original_desc[:40]
+            _append_detail(stats, detail)
             continue
 
         try:
             await _apply_categorization_to_row(session, row, result)
             stats["lines_categorized"] += 1
-            _append_detail(
-                stats,
-                {
-                    "desc": desc[:60],
-                    "categoria": result.categoria,
-                    "subcategoria": result.subcategoria,
-                },
-            )
+            success_detail: dict[str, Any] = {
+                "desc": enriched_desc[:60],
+                "categoria": result.categoria,
+                "subcategoria": result.subcategoria,
+            }
+            if enriched_desc != original_desc:
+                success_detail["original_desc"] = original_desc[:40]
+            _append_detail(stats, success_detail)
         except Exception as exc:
             logger.warning(
                 "categorize linha %d falhou (%s): %s",
                 iteration,
-                desc[:60],
+                enriched_desc[:60],
                 exc,
             )
             stats["lines_failed"] += 1
             _append_detail(
-                stats, {"desc": desc[:60], "error": str(exc)[:100]}
+                stats, {"desc": enriched_desc[:60], "error": str(exc)[:100]}
             )
             # Tenta cancelar o edit caso tenha ficado aberto
             try:
@@ -663,12 +701,77 @@ async def _find_next_uncategorized_row(page):
 
 
 async def _read_row_description(row) -> str:
-    """Lê texto da célula 'Descrição' (índice 7)."""
+    """Lê texto da célula 'Descrição' (índice 7).
+
+    Mantida pra compat com tests antigos. Novo código usa `_read_row_data`.
+    """
     cells = row.locator("td")
     if await cells.count() <= _DESC_CELL_INDEX:
         return ""
     text = await cells.nth(_DESC_CELL_INDEX).text_content()
     return (text or "").strip()
+
+
+async def _read_row_data(row) -> dict[str, Any]:
+    """Lê células-chave da row pra enrichment via PDF lookup.
+
+    Retorna `{desc, date_str, amount_centavos}`. Campos vêm vazios/zero
+    quando a row não tem cells suficientes.
+    """
+    cells = row.locator("td")
+    ncells = await cells.count()
+    if ncells <= _DESC_CELL_INDEX:
+        return {"desc": "", "date_str": "", "amount_centavos": 0}
+
+    desc = ((await cells.nth(_DESC_CELL_INDEX).text_content()) or "").strip()
+    date_str = ""
+    if ncells > _DATA_EVENTO_CELL_INDEX:
+        date_str = (
+            (await cells.nth(_DATA_EVENTO_CELL_INDEX).text_content()) or ""
+        ).strip()
+    amount_centavos = 0
+    if ncells > _VALOR_CELL_INDEX:
+        valor_text = (
+            (await cells.nth(_VALOR_CELL_INDEX).text_content()) or ""
+        ).strip()
+        amount_centavos = parse_brl_amount_to_centavos(valor_text)
+
+    return {
+        "desc": desc,
+        "date_str": date_str,
+        "amount_centavos": amount_centavos,
+    }
+
+
+def _load_pdf_lookup(
+    pdf_path_str: Optional[str],
+) -> Optional[dict[tuple[str, int], str]]:
+    """Carrega lookup do PDF do extrato (best-effort).
+
+    Retorna `None` se path ausente, file não existe, ou parse falha. Quando
+    `None`, categorize roda sem enrichment (comportamento pré-VEC-425).
+    """
+    if not pdf_path_str:
+        return None
+    pdf_path = Path(pdf_path_str)
+    if not pdf_path.exists():
+        logger.warning("PDF_PATH não existe: %s — sem enrichment", pdf_path)
+        return None
+    try:
+        entries = parse_c6_pdf(pdf_path)
+    except Exception as exc:
+        logger.warning("parse_c6_pdf falhou (%s) — sem enrichment", exc)
+        return None
+    if not entries:
+        logger.info("PDF sem transações reconhecidas — sem enrichment")
+        return None
+    lookup = build_pdf_lookup(entries)
+    logger.info(
+        "PDF lookup carregado: %d transações, %d chaves únicas",
+        len(entries),
+        len(lookup),
+    )
+    return lookup
 
 
 async def _mark_row(row, status: str) -> None:

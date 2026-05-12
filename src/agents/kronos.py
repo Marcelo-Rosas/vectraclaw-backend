@@ -1388,6 +1388,10 @@ _KRONOS_INPUT_KEYS = (
     # Instituição Financeira no combobox do Meu Planner Financeiro.
     # Default = primeira opção real do combobox (single-conta).
     "PLANNER_INSTITUICAO",
+    # VEC-425: caminho do PDF do extrato bancário (mesma janela do OFX)
+    # — usado pelo kronos_pdf_enricher pra enriquecer descrição genérica
+    # 'TRANSF ENVIADA PIX' com nome do destinatário do PDF.
+    "PDF_PATH",
 )
 
 # Parâmetros persistidos na rotina (template); APPLY_BAIXA fica só na task.

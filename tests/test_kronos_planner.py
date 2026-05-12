@@ -376,13 +376,13 @@ def test_categorize_pending_lines_skips_when_no_rules_match():
     async def find_next(_page):
         return row_sequence.pop(0)
 
-    async def read_desc(_row):
-        return "TRANSF ENVIADA PIX"
+    async def read_data(_row):
+        return {"desc": "TRANSF ENVIADA PIX", "date_str": "", "amount_centavos": 0}
 
     with patch.object(
         kronos_planner, "_find_next_uncategorized_row", side_effect=find_next
     ), patch.object(
-        kronos_planner, "_read_row_description", side_effect=read_desc
+        kronos_planner, "_read_row_data", side_effect=read_data
     ), patch.object(
         kronos_planner, "match_rule", return_value=None
     ):
@@ -409,8 +409,8 @@ def test_categorize_pending_lines_applies_match_and_counts():
     async def find_next(_page):
         return row_sequence.pop(0)
 
-    async def read_desc(_row):
-        return "ACTIVE TRANS; Gasto Recorrente"
+    async def read_data(_row):
+        return {"desc": "ACTIVE TRANS; Gasto Recorrente", "date_str": "", "amount_centavos": 0}
 
     async def apply_cat(_session, _row, _result):
         return None
@@ -425,7 +425,7 @@ def test_categorize_pending_lines_applies_match_and_counts():
     with patch.object(
         kronos_planner, "_find_next_uncategorized_row", side_effect=find_next
     ), patch.object(
-        kronos_planner, "_read_row_description", side_effect=read_desc
+        kronos_planner, "_read_row_data", side_effect=read_data
     ), patch.object(
         kronos_planner, "match_rule", return_value=match_value
     ), patch.object(
@@ -457,8 +457,8 @@ def test_categorize_pending_lines_continues_on_per_row_failure():
     async def find_next(_page):
         return row_sequence.pop(0)
 
-    async def read_desc(_row):
-        return desc_sequence.pop(0)
+    async def read_data(_row):
+        return {"desc": desc_sequence.pop(0), "date_str": "", "amount_centavos": 0}
 
     call_count = [0]
 
@@ -483,7 +483,7 @@ def test_categorize_pending_lines_continues_on_per_row_failure():
     with patch.object(
         kronos_planner, "_find_next_uncategorized_row", side_effect=find_next
     ), patch.object(
-        kronos_planner, "_read_row_description", side_effect=read_desc
+        kronos_planner, "_read_row_data", side_effect=read_data
     ), patch.object(
         kronos_planner, "match_rule", return_value=match_value
     ), patch.object(
@@ -511,13 +511,13 @@ def test_categorize_pending_lines_respects_max_lines():
     async def find_next(_page):
         return fake_row
 
-    async def read_desc(_row):
-        return "TRANSF ENVIADA PIX"
+    async def read_data(_row):
+        return {"desc": "TRANSF ENVIADA PIX", "date_str": "", "amount_centavos": 0}
 
     with patch.object(
         kronos_planner, "_find_next_uncategorized_row", side_effect=find_next
     ), patch.object(
-        kronos_planner, "_read_row_description", side_effect=read_desc
+        kronos_planner, "_read_row_data", side_effect=read_data
     ), patch.object(
         kronos_planner, "match_rule", return_value=None
     ), patch.object(
@@ -560,7 +560,7 @@ def test_handler_includes_categorization_in_output(tmp_path):
 
     fake_session = _make_mock_session()
 
-    async def fake_categorize(_session, _rules, max_lines=None):
+    async def fake_categorize(_session, _rules, **_kwargs):
         return {
             "lines_categorized": 7,
             "lines_unclassified": 2,

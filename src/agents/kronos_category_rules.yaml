@@ -1,8 +1,21 @@
-# Kronos category rules — gerado por bootstrap_rules_from_csv.
+# Kronos category rules — gerado por bootstrap_rules_from_csv + curadoria manual.
 # Edite à vontade: ordem importa (primeiro match wins).
 # Comportamento default: match_type=substring, case_sensitive=false.
+#
+# Seções:
+#   1. Regras manuais (PDF-enriched) — VEC-425
+#   2. Regras bootstrap do CSV histórico — VEC-422
 
 rules:
+# ── 1. Regras manuais ditadas pelo user (descrições enriquecidas via PDF) ──
+- pattern: COND ED VILA IMPERIAL
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Moradia – Condomínio'
+- pattern: SAO JOAO FARMACIAS
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# ── 2. Regras bootstrap do CSV histórico ──
 - pattern: FAST MARKET            NAVEGANTES    BRA
   categoria: Despesas Pessoais
   subcategoria: 'Despesas Pessoais: Uso Pessoal'
