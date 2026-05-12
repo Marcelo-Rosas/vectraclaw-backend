@@ -3290,6 +3290,7 @@ _KRONOS_ROUTINE_OPERATIONS = (
     "financial-audit",
     "financial-bookkeeping",
     "conciliacao-backlog",
+    "planner-import-ofx",
 )
 
 
