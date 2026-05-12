@@ -333,8 +333,11 @@ class ResilientHarnessDaemon:
                 TaskFactory(client).promote_successors_after_completion(task_id)
             except Exception as promo_err:
                 logger.warning("_complete_task promotion failed task=%s: %s", task_id, promo_err)
-            # VEC-429 Fase 1 — heartbeat terminal ligado à task (visível no dashboard)
-            hb_status = "succeeded" if (success and status != "blocked") else "error"
+            # VEC-429 Fase 1 — heartbeat terminal ligado à task (visível no dashboard).
+            # `heartbeats.status` CHECK aceita: working|idle|paused|errored|offline.
+            # Sucesso → 'working' (mesmo padrão de `_emit_oracle_records`);
+            # falha → 'errored'. Distinção fim vs claim fica em `log_excerpt`.
+            hb_status = "working" if (success and status != "blocked") else "errored"
             self._emit_task_lifecycle_heartbeat(
                 task_id=task_id,
                 status=hb_status,
