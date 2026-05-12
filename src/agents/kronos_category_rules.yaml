@@ -15,6 +15,95 @@ rules:
   categoria: Despesas Pessoais
   subcategoria: 'Despesas Pessoais: Uso Pessoal'
 
+# ── 1b. Batch de patterns curtos pro PDF enrichment (smoke 2026-05-12) ──
+# Estabelecimentos com nomes únicos identificados no PDF como "Pix enviado para X"
+# ou "Débito de Cartão X". Mapeados pela inferência do CSV histórico
+# (Despesas Pessoais → Uso Pessoal) + senso comum. Revisar antes de merge.
+
+# -- Postos de combustível --
+- pattern: POSTO NASATO
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: POSTO NAVEL
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# -- Alimentação e cafés --
+- pattern: FAST MARKET
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: DEGUSTA CAFE
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: MILIUM TEM DE TUDO
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# -- Transporte --
+- pattern: UBER DO BRASIL
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: AUTOPISTA LITORAL SUL
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# -- Lazer --
+- pattern: ARCOPLEXCINEMAS
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# -- Farmácias --
+- pattern: RAIA DROGASIL
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# -- iFood (IFD*) e outros débitos de cartão genéricos --
+- pattern: IFD*
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: VMT*
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# -- Receitas (Pix recebido de clientes) --
+- pattern: Pix recebido de SMARTFIT
+  categoria: Receita Operacional – Frete
+  subcategoria: 'Receita - Pagamento à vista'
+- pattern: Pix recebido de TM ACADEMIA
+  categoria: Receita Operacional – Frete
+  subcategoria: 'Receita - Pagamento à vista'
+- pattern: Pix recebido de VECTRA HUB
+  categoria: Receita Operacional – Frete
+  subcategoria: 'Receita - Pagamento à vista'
+
+# ── TODO: casos ambíguos (revisar com user) ──
+#
+# Familiares — categoria pessoal mas subcategoria depende do uso:
+#   CAMILLA AZEVEDO SERRAN VIEIRA
+#   Carolina Azevedo Serran Vieira
+#   CRISTINA AZEVEDO SERRAN VIEIRA
+#   Andryelle Vargas Coimbra
+#   Renné Junior Rodrigues dos Santos
+#   JOSE BATINGA PEREIRA
+#   LEANDRO DE OLIVEIRA
+#   DIEGO ADRIANO ALVES
+#   Sérgio Ferreira Silva
+#
+# Operacional/empresarial — categoria depende do contexto:
+#   Centro Educacional Sinergia Ltda  (escola: filhos? alunos?)
+#   UNIFIQUE TELECOMUNICACOES         (internet: galpão? pessoal?)
+#   GOOGLE CLOUD BRASIL                (TI: Despesa Administrativa?)
+#   FACEBOOK SERVICOS ONLINE           (marketing)
+#   ZOOP BRASIL                        (payment processor)
+#   CAPPTA                             (POS / pagamentos)
+#   FRETEBRAS INTERNET E SERVICOS      (frete: Custos Operacionais?)
+#   MAYCOM CARGA E DESCARGA            (frete agregado?)
+#   J L CESCON ME (Pagamento)          (fornecedor: Despesas Operacionais?)
+#   HAVAN FUNDO DE INVESTIMENTO        (investimento?)
+#   VECTRA CARGO (Pix enviado pra si)  (transferência interna?)
+#   VECTRA HUB LTDA (saída/entrada)    (transferência entre empresas?)
+#   226 LIV CTBA                       (livraria?)
+
 # ── 2. Regras bootstrap do CSV histórico ──
 - pattern: FAST MARKET            NAVEGANTES    BRA
   categoria: Despesas Pessoais
