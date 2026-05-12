@@ -67,40 +67,63 @@ rules:
 
 # -- Receitas (Pix recebido de clientes) --
 - pattern: Pix recebido de SMARTFIT
+  # SmartFit: pagamento programado, sempre "à vista"
   categoria: Receita Operacional – Frete
   subcategoria: 'Receita - Pagamento à vista'
 - pattern: Pix recebido de TM ACADEMIA
+  # TM Academia: default = Saldo de cliente (descrição repete em dias
+  # próximos quando é saldo). User confirmou em 2026-05-12.
   categoria: Receita Operacional – Frete
-  subcategoria: 'Receita - Pagamento à vista'
+  subcategoria: 'Receita - Saldo de cliente'
 - pattern: Pix recebido de VECTRA HUB
   categoria: Receita Operacional – Frete
   subcategoria: 'Receita - Pagamento à vista'
 
-# ── TODO: casos ambíguos (revisar com user) ──
+# -- Pix enviado: classificação confirmada pelo user (2026-05-12) --
+- pattern: Pix enviado para MAYCOM CARGA E DESCARGA
+  categoria: Custos Operacionais
+  subcategoria: 'Carga e Descarga'
+- pattern: Pix enviado para Sérgio Ferreira Silva
+  # Sérgio: motorista — adiantamento de frete (não despesa pessoal)
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: 'Frete - Adiantamento de Frete'
+- pattern: Pix enviado para DIEGO ADRIANO ALVES
+  # Diego: motorista — saldo de frete (acerto pós-viagem)
+  categoria: Custos Operacionais
+  subcategoria: 'Frete – Saldo de Frete'
+- pattern: Pix enviado para CAMILLA AZEVEDO SERRAN VIEIRA
+  # Camilla: uso pessoal (familiar)
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal (Camilla)'
+- pattern: Pix enviado para VECTRA CARGO
+  # Pix da PF para a própria empresa = movimentação bancária
+  categoria: Movimentação bancária
+  subcategoria: 'Empresa'
+- pattern: Pix enviado para GOOGLE CLOUD BRASIL
+  categoria: Despesa Administrativa
+  subcategoria: 'Despesa Administrativa – Sistema IA'
+- pattern: Pix enviado para FACEBOOK SERVICOS ONLINE
+  categoria: Despesa Administrativa
+  subcategoria: 'Despesa Administrativa – Sistema IA'
+
+# ── TODO: casos ambíguos remanescentes (não resolvidos pelo user) ──
 #
 # Familiares — categoria pessoal mas subcategoria depende do uso:
-#   CAMILLA AZEVEDO SERRAN VIEIRA
 #   Carolina Azevedo Serran Vieira
 #   CRISTINA AZEVEDO SERRAN VIEIRA
 #   Andryelle Vargas Coimbra
 #   Renné Junior Rodrigues dos Santos
 #   JOSE BATINGA PEREIRA
 #   LEANDRO DE OLIVEIRA
-#   DIEGO ADRIANO ALVES
-#   Sérgio Ferreira Silva
 #
 # Operacional/empresarial — categoria depende do contexto:
 #   Centro Educacional Sinergia Ltda  (escola: filhos? alunos?)
 #   UNIFIQUE TELECOMUNICACOES         (internet: galpão? pessoal?)
-#   GOOGLE CLOUD BRASIL                (TI: Despesa Administrativa?)
-#   FACEBOOK SERVICOS ONLINE           (marketing)
 #   ZOOP BRASIL                        (payment processor)
 #   CAPPTA                             (POS / pagamentos)
 #   FRETEBRAS INTERNET E SERVICOS      (frete: Custos Operacionais?)
-#   MAYCOM CARGA E DESCARGA            (frete agregado?)
 #   J L CESCON ME (Pagamento)          (fornecedor: Despesas Operacionais?)
 #   HAVAN FUNDO DE INVESTIMENTO        (investimento?)
-#   VECTRA CARGO (Pix enviado pra si)  (transferência interna?)
 #   VECTRA HUB LTDA (saída/entrada)    (transferência entre empresas?)
 #   226 LIV CTBA                       (livraria?)
 
@@ -177,9 +200,9 @@ rules:
 - pattern: Pix recebido de THIAGO MARCELO GARCIA RAGASSI
   categoria: Receita Operacional – Frete
   subcategoria: Receita - Pagamento à vista
-- pattern: Pix recebido de TM ACADEMIA DE GINASTICA LTDA
-  categoria: Receita Operacional – Frete
-  subcategoria: Receita - Pagamento à vista
+# Pix recebido de TM ACADEMIA DE GINASTICA LTDA: já coberto pela rule
+# `Pix recebido de TM ACADEMIA` no topo (Saldo de cliente, default).
+# Bootstrap legacy removido para evitar ordering ambíguo.
 - pattern: Frete fabrica montro
   categoria: Receita Operacional – Frete
   subcategoria: Receita - Pagamento à vista
