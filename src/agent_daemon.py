@@ -280,6 +280,11 @@ class ResilientHarnessDaemon:
             result = entrypoint_planner_import(task, self._get_supabase())
             return _json.dumps(result)
 
+        if op_type == "planner-categorize-pendings":
+            from src.agents.kronos_planner import entrypoint_categorize_pendings
+            result = entrypoint_categorize_pendings(task, self._get_supabase())
+            return _json.dumps(result)
+
         if op_type == "oracle-report":
             from src.agents.hermes_reporter import entrypoint as hr_entry
             result = hr_entry(task)

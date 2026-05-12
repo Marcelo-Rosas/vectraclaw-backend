@@ -557,6 +557,115 @@ def test_categorize_pending_lines_respects_max_lines():
     assert stats["lines_unclassified"] == 5
 
 
+def test_categorize_only_returns_done_when_no_rules(tmp_path):
+    """Sem regras carregadas → status=done, reason=no_rules. Sem abrir browser."""
+    from src.agents import kronos_planner
+
+    task = {"id": "t1", "input_json": {}, "description": ""}
+    client = MagicMock()
+
+    with patch.object(
+        kronos_planner, "_load_categorization_rules", return_value=[]
+    ):
+        result = kronos_planner.entrypoint_categorize_pendings(task, client)
+
+    assert result["status"] == "done"
+    assert result["output_json"]["reason"] == "no_rules"
+
+
+def test_categorize_only_calls_categorize_pending():
+    """Com regras, abre session + chama _categorize_pending_lines + screenshot."""
+    from src.agents import kronos_planner
+
+    task = {"id": "t2", "input_json": {}, "description": ""}
+    client = MagicMock()
+    fake_session = _make_mock_session()
+
+    async def fake_categorize(_session, _rules, **kwargs):
+        return {
+            "lines_categorized": 5,
+            "lines_unclassified": 1,
+            "lines_failed": 0,
+            "details": [],
+        }
+
+    with patch.object(
+        kronos_planner, "_load_categorization_rules", return_value=[MagicMock()]
+    ), patch.object(
+        kronos_planner, "KronosPlannerSession", return_value=fake_session
+    ), patch.object(
+        kronos_planner, "_categorize_pending_lines", side_effect=fake_categorize
+    ):
+        result = kronos_planner.entrypoint_categorize_pendings(task, client)
+
+    assert result["status"] == "done"
+    cat = result["output_json"]["categorization"]
+    assert cat["lines_categorized"] == 5
+    assert cat["lines_unclassified"] == 1
+
+
+def test_categorize_only_passes_pdf_lookup_when_present(tmp_path):
+    """PDF_PATH no input_json é passado pro _categorize_pending_lines."""
+    from src.agents import kronos_planner
+
+    fake_pdf = tmp_path / "extrato.pdf"
+    fake_pdf.write_bytes(b"%PDF-fake")
+    task = {
+        "id": "t3",
+        "input_json": {"PDF_PATH": str(fake_pdf)},
+        "description": "",
+    }
+    client = MagicMock()
+    fake_session = _make_mock_session()
+
+    captured_kwargs = {}
+
+    async def fake_categorize(_session, _rules, **kwargs):
+        captured_kwargs.update(kwargs)
+        return {"lines_categorized": 0, "lines_unclassified": 0, "lines_failed": 0, "details": []}
+
+    fake_lookup = {("2026-05-01", 100): "PIX FOO"}
+
+    with patch.object(
+        kronos_planner, "_load_categorization_rules", return_value=[MagicMock()]
+    ), patch.object(
+        kronos_planner, "_load_pdf_lookup", return_value=fake_lookup
+    ), patch.object(
+        kronos_planner, "KronosPlannerSession", return_value=fake_session
+    ), patch.object(
+        kronos_planner, "_categorize_pending_lines", side_effect=fake_categorize
+    ):
+        result = kronos_planner.entrypoint_categorize_pendings(task, client)
+
+    assert result["status"] == "done"
+    assert captured_kwargs.get("pdf_lookup") == fake_lookup
+
+
+def test_categorize_only_handles_login_failure():
+    """KronosLoginFailed vira status=errored com error_detail estruturado."""
+    from src.agents import kronos_planner
+    from src.agents.kronos_browser import KronosLoginFailed
+
+    task = {"id": "t4", "input_json": {}, "description": ""}
+    client = MagicMock()
+    fake_session = _make_mock_session()
+
+    async def fail_login(*_a, **_kw):
+        raise KronosLoginFailed("captcha apareceu")
+
+    fake_session.__aenter__ = fail_login
+
+    with patch.object(
+        kronos_planner, "_load_categorization_rules", return_value=[MagicMock()]
+    ), patch.object(
+        kronos_planner, "KronosPlannerSession", return_value=fake_session
+    ):
+        result = kronos_planner.entrypoint_categorize_pendings(task, client)
+
+    assert result["status"] == "errored"
+    assert result["output_json"]["error_detail"]["exception"] == "KronosLoginFailed"
+
+
 def test_is_uncategorized_cell_detects_variants():
     """Empty / 'Sem Categoria' / '**' / 'Verificar' devem ser uncategorized."""
     from src.agents.kronos_planner import _is_uncategorized_cell
