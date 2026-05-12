@@ -117,6 +117,245 @@ def infer_period_from_ofx_path(path: str) -> tuple[str, str]:
     return dates[0].isoformat(), dates[-1].isoformat()
 
 
+# ── VEC-415: parser + selector de OFX por semana ─────────────────────
+#
+# Padrão de nome de arquivo: `semana-N-mês-AA.ofx`
+#   N      → número da semana (inteiro positivo)
+#   mês    → nome pt-BR (janeiro..dezembro), tolerante a `marco`/`março`
+#   AA     → ano com 2 ou 4 dígitos
+#
+# Exemplos válidos:
+#   semana-1-maio-26.ofx
+#   semana-12-março-2026.ofx
+#   semana-3-MARCO-26.OFX  (case-insensitive)
+
+_PT_BR_MONTHS: dict[str, int] = {
+    "janeiro": 1,
+    "fevereiro": 2,
+    "marco": 3,
+    "março": 3,
+    "abril": 4,
+    "maio": 5,
+    "junho": 6,
+    "julho": 7,
+    "agosto": 8,
+    "setembro": 9,
+    "outubro": 10,
+    "novembro": 11,
+    "dezembro": 12,
+}
+
+_SEMANA_FILENAME_RE = re.compile(
+    r"^semana-(\d+)-(janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|"
+    r"setembro|outubro|novembro|dezembro)-(\d{2,4})\.ofx$",
+    re.IGNORECASE,
+)
+
+
+def parse_semana_filename(name: str) -> Optional[tuple[int, int, int]]:
+    """Extrai `(year, month, week)` de `semana-N-mês-AA.ofx`. Retorna `None` se
+    o nome não bate no padrão (não levanta — caller decide o que fazer).
+
+    Ano de 2 dígitos vira `2000 + N` (26 → 2026).
+    """
+    match = _SEMANA_FILENAME_RE.match(name.strip())
+    if not match:
+        return None
+    week_str, month_str, year_str = match.groups()
+    month = _PT_BR_MONTHS.get(month_str.lower())
+    if month is None:
+        return None
+    year = int(year_str)
+    if year < 100:
+        year += 2000
+    return year, month, int(week_str)
+
+
+def list_ofx_files_sorted(directory: str | Path) -> list[Path]:
+    """Lista todos os `.ofx` de um diretório, ordenados por `(year, month, week)`.
+
+    Arquivos que NÃO batem no padrão `semana-N-mês-AA.ofx` vão pro fim da lista,
+    em ordem alfabética. Não recursivo. Não levanta se o diretório não existe —
+    devolve lista vazia.
+    """
+    base = Path(directory)
+    if not base.is_dir():
+        return []
+    matched: list[tuple[tuple[int, int, int], Path]] = []
+    unmatched: list[Path] = []
+    for entry in base.iterdir():
+        if not entry.is_file() or entry.suffix.lower() != ".ofx":
+            continue
+        key = parse_semana_filename(entry.name)
+        if key is not None:
+            matched.append((key, entry))
+        else:
+            unmatched.append(entry)
+    matched.sort(key=lambda pair: pair[0])
+    unmatched.sort(key=lambda p: p.name.lower())
+    return [p for _, p in matched] + unmatched
+
+
+def pick_next_ofx_file(
+    directory: str | Path,
+    last_processed: Optional[str],
+) -> Optional[Path]:
+    """Retorna o próximo `.ofx` a processar, dado o último processado.
+
+    Regras:
+    - Se `last_processed` é `None` ou vazio → devolve o primeiro arquivo da
+      lista ordenada (ou `None` se diretório vazio).
+    - Se `last_processed` está no padrão `semana-N-mês-AA.ofx`: devolve o
+      primeiro arquivo cujo `(year, month, week)` é estritamente maior.
+    - Se `last_processed` NÃO está no padrão (ou não é encontrado): fallback
+      pra comparação alfabética case-insensitive — devolve o primeiro nome
+      ordenado lexicograficamente maior.
+    - Sem próximo → `None`.
+
+    `last_processed` deve ser apenas o **basename** (ex: `semana-2-maio-26.ofx`),
+    não o path completo.
+    """
+    files = list_ofx_files_sorted(directory)
+    if not files:
+        return None
+
+    if not last_processed:
+        return files[0]
+
+    cursor_key = parse_semana_filename(last_processed)
+
+    if cursor_key is not None:
+        for entry in files:
+            entry_key = parse_semana_filename(entry.name)
+            if entry_key is not None and entry_key > cursor_key:
+                return entry
+        return None
+
+    # Fallback alfabético quando o cursor não bate no padrão.
+    cursor_lower = last_processed.strip().lower()
+    for entry in files:
+        if entry.name.lower() > cursor_lower:
+            return entry
+    return None
+
+
+# ── VEC-415: helpers de cursor em routines.metadata ──────────────────
+
+_OFX_CURSOR_METADATA_KEY = "lastProcessedOfx"
+
+
+def get_routine_ofx_cursor(
+    supabase_client: Any,
+    routine_id: str,
+) -> Optional[str]:
+    """Lê `routines.metadata.lastProcessedOfx` de uma rotina.
+
+    Retorna o basename do último OFX processado, ou `None` se não houver cursor.
+    Levanta `ValueError` se a rotina não existe.
+    """
+    if not routine_id:
+        raise ValueError("routine_id é obrigatório")
+    if supabase_client is None:
+        return None
+    try:
+        res = (
+            supabase_client.table("routines")
+            .select("metadata")
+            .eq("id", routine_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:  # pragma: no cover — depende do supabase
+        logger.warning("get_routine_ofx_cursor: query falhou: %s", exc)
+        return None
+
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise ValueError(f"routine_id={routine_id} não encontrada")
+    metadata = rows[0].get("metadata") if isinstance(rows[0], dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(_OFX_CURSOR_METADATA_KEY)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def update_routine_ofx_cursor(
+    supabase_client: Any,
+    routine_id: str,
+    processed_basename: str,
+) -> dict[str, Any]:
+    """Persiste `lastProcessedOfx=<basename>` em `routines.metadata`,
+    preservando outros campos do metadata.
+
+    Retorna o metadata atualizado. Levanta `ValueError` se a rotina não
+    existe ou se `processed_basename` é vazio.
+    """
+    if not routine_id:
+        raise ValueError("routine_id é obrigatório")
+    basename = (processed_basename or "").strip()
+    if not basename:
+        raise ValueError("processed_basename não pode ser vazio")
+    if supabase_client is None:
+        raise ValueError("supabase_client é obrigatório")
+
+    res = (
+        supabase_client.table("routines")
+        .select("metadata")
+        .eq("id", routine_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise ValueError(f"routine_id={routine_id} não encontrada")
+    current = rows[0].get("metadata") if isinstance(rows[0], dict) else None
+    merged: dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+    merged[_OFX_CURSOR_METADATA_KEY] = basename
+
+    supabase_client.table("routines").update({"metadata": merged}).eq(
+        "id", routine_id
+    ).execute()
+    return merged
+
+
+def clear_routine_ofx_cursor(
+    supabase_client: Any,
+    routine_id: str,
+) -> dict[str, Any]:
+    """Remove `lastProcessedOfx` do metadata. Preserva os outros campos.
+
+    Retorna o metadata atualizado (sem o cursor). Levanta `ValueError` se a
+    rotina não existe.
+    """
+    if not routine_id:
+        raise ValueError("routine_id é obrigatório")
+    if supabase_client is None:
+        raise ValueError("supabase_client é obrigatório")
+
+    res = (
+        supabase_client.table("routines")
+        .select("metadata")
+        .eq("id", routine_id)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        raise ValueError(f"routine_id={routine_id} não encontrada")
+    current = rows[0].get("metadata") if isinstance(rows[0], dict) else None
+    merged: dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+    had_cursor = _OFX_CURSOR_METADATA_KEY in merged
+    merged.pop(_OFX_CURSOR_METADATA_KEY, None)
+    if had_cursor:
+        supabase_client.table("routines").update({"metadata": merged}).eq(
+            "id", routine_id
+        ).execute()
+    return merged
+
+
 def scan_ofx_directory(
     path: str,
     inicio: str = None,

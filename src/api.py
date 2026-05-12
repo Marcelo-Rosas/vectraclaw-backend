@@ -3427,6 +3427,44 @@ async def run_routine_now(request: Request, routine_id: str):
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/routines/{routine_id}/reset-ofx-cursor")
+@app.post("/routines/{routine_id}/reset-ofx-cursor")
+async def reset_routine_ofx_cursor(request: Request, routine_id: str):
+    """VEC-415: limpa `metadata.lastProcessedOfx` da rotina, preservando demais campos.
+
+    Permite forçar reprocessamento do começo da pasta. Retorna o metadata atualizado
+    + o valor que foi removido (se havia).
+    """
+    if not supabase:
+        raise HTTPException(503, "supabase indisponível")
+    try:
+        from src.agents.kronos import (
+            _OFX_CURSOR_METADATA_KEY,
+            clear_routine_ofx_cursor,
+            get_routine_ofx_cursor,
+        )
+
+        client = get_authenticated_client(request.state.token)
+        previous = get_routine_ofx_cursor(client, routine_id)
+        merged = clear_routine_ofx_cursor(client, routine_id)
+        return {
+            "routineId": routine_id,
+            "previousCursor": previous,
+            "cursorCleared": previous is not None,
+            "metadata": merged,
+        }
+    except ValueError as exc:
+        msg = str(exc)
+        if "não encontrada" in msg:
+            raise HTTPException(404, "routine_not_found")
+        raise HTTPException(400, msg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"reset_routine_ofx_cursor failed: {e}")
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/companies/{company_id}/workflow-steps")
 @app.get("/companies/{company_id}/workflow-steps")
 async def list_workflow_steps(request: Request, company_id: str):
