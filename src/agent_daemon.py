@@ -270,7 +270,7 @@ class ResilientHarnessDaemon:
             result = kronos_entry(task, self._get_supabase())
             return _json.dumps(result)
 
-        if op_type == "conciliacao-backlog":
+        if op_type in ("conciliacao-backlog", "financial-bookkeeping"):
             from src.agents.kronos import entrypoint_backlog
             result = entrypoint_backlog(task, self._get_supabase())
             return _json.dumps(result)
@@ -856,6 +856,14 @@ class ResilientHarnessDaemon:
                                     cost_usd = float(parsed.get("cost_usd", 0) or 0)
                                     output_json = parsed.get("output_json")
                                     status_override = parsed.get("status_override")
+                                    if parsed.get("status") == "errored":
+                                        success = False
+                                        if output_json is None:
+                                            output_json = {
+                                                "error_detail": {
+                                                    "message": parsed.get("error") or "errored",
+                                                }
+                                            }
                                 except Exception:
                                     pass
                             finally:

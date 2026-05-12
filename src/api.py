@@ -14,8 +14,8 @@ from jose import jwt  # pyright: ignore[reportMissingModuleSource]
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query, UploadFile, File  # pyright: ignore[reportMissingImports]
 from fastapi.middleware.cors import CORSMiddleware  # pyright: ignore[reportMissingImports]
 from fastapi.openapi.utils import get_openapi  # pyright: ignore[reportMissingImports]
-from fastapi.responses import JSONResponse, Response  # pyright: ignore[reportMissingImports]
-from pydantic import BaseModel, Field, validator
+from fastapi.responses import JSONResponse, Response, StreamingResponse  # pyright: ignore[reportMissingImports]
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, validator
 
 # supabase import
 try:
@@ -1894,6 +1894,7 @@ class NewTaskInput(BaseModel):
     parentTaskId: Optional[str] = None
     assignedToAgentId: Optional[str] = None
     goalId: Optional[str] = None
+    inputJson: Optional[Dict[str, Any]] = None
 
     @validator("parentTaskId", "assignedToAgentId", "goalId", pre=True)
     def empty_str_to_none(cls, v):
@@ -1911,19 +1912,17 @@ class UpdateTaskInput(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     status: Optional[
-        Literal["backlog", "queued", "in_progress", "review", "done", "blocked"]
-    ] = None
-    operation_type: Optional[
         Literal[
-            "orchestration",
-            "code_generation",
-            "code_review",
-            "research",
-            "document_generation",
-            "qa_testing",
-            "other",
+            "backlog",
+            "queued",
+            "in_progress",
+            "review",
+            "done",
+            "blocked",
+            "skipped",
         ]
-    ] = Field(default=None, alias="operationType")
+    ] = None
+    operation_type: Optional[str] = Field(default=None, alias="operationType")
     budget_limit: Optional[int] = Field(default=None, alias="budgetLimit")
     spent: Optional[float] = None
     cost_usd: Optional[float] = Field(default=None, alias="costUsd")
@@ -1933,6 +1932,7 @@ class UpdateTaskInput(BaseModel):
     parent_task_id: Optional[str] = Field(default=None, alias="parentTaskId")
     goal_id: Optional[str] = Field(default=None, alias="goalId")
     output_json: Optional[Dict[str, Any]] = Field(default=None, alias="outputJson")
+    input_json: Optional[Dict[str, Any]] = Field(default=None, alias="inputJson")
 
     class Config:
         populate_by_name = True
@@ -1964,6 +1964,7 @@ def _task_patch_payload_to_camel(patch_snake: Dict[str, Any]) -> Dict[str, Any]:
         "parent_task_id": "parentTaskId",
         "goal_id": "goalId",
         "output_json": "outputJson",
+        "input_json": "inputJson",
     }
     return {key_map[k]: v for k, v in patch_snake.items()}
 
@@ -1993,6 +1994,8 @@ async def create_task(request: Request, company_id: str, payload: NewTaskInput):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    if payload.inputJson is not None:
+        insert_row["input_json"] = payload.inputJson
 
     if supabase:
         try:
@@ -3124,7 +3127,7 @@ async def list_routines(request: Request, company_id: str):
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("routines").select("*").eq("company_id", company_id).execute()
-        return [Routine(**row).to_zod_dict() for row in (res.data or [])]
+        return [_routine_wire_dict(row) for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_routines failed: {e}")
         raise HTTPException(500, str(e))
@@ -3138,11 +3141,16 @@ async def create_routine(request: Request, company_id: str, payload: Dict[str, A
     row = {
         "company_id": company_id,
         "name": payload.get("name"),
-        "status": "active",
+        "status": payload.get("status") or "active",
         "schedule": payload.get("schedule"),
         "agent_id": payload.get("agentId"),
+        "prompt_template": payload.get("promptTemplate"),
+        "operation_type": payload.get("operationType"),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    merged_metadata = _merge_routine_execution_params_payload(payload)
+    if merged_metadata is not None:
+        row["metadata"] = merged_metadata
 
     if not supabase:
         new_rot = row.copy()
@@ -3154,7 +3162,7 @@ async def create_routine(request: Request, company_id: str, payload: Dict[str, A
 
     try:
         res = supabase.table("routines").insert(row).execute()
-        return Routine(**res.data[0]).to_zod_dict()
+        return _routine_wire_dict(res.data[0])
     except Exception as e:
         logger.error(f"create_routine failed: {e}")
         raise HTTPException(500, str(e))
@@ -3173,7 +3181,7 @@ async def get_routine(request: Request, routine_id: str):
         res = client.table("routines").select("*").eq("id", routine_id).limit(1).execute()
         if not res.data:
             raise HTTPException(404, "routine_not_found")
-        return Routine(**res.data[0]).to_zod_dict()
+        return _routine_wire_dict(res.data[0])
     except HTTPException:
         raise
     except Exception as e:
@@ -3192,26 +3200,47 @@ async def patch_routine(request: Request, routine_id: str, payload: Dict[str, An
         return row
     try:
         client = get_authenticated_client(request.state.token)
-        res = client.table("routines").select("id").eq("id", routine_id).limit(1).execute()
+        res = client.table("routines").select("id,metadata").eq("id", routine_id).limit(1).execute()
         if not res.data:
             raise HTTPException(404, "routine_not_found")
+        current_metadata = res.data[0].get("metadata")
 
         # Normalise camelCase keys from the frontend to snake_case for DB
         CAMEL_TO_SNAKE = {
             "agentId": "agent_id",
             "promptTemplate": "prompt_template",
             "nextRunAt": "next_run_at",
+            "operationType": "operation_type",
         }
         normalised = {CAMEL_TO_SNAKE.get(k, k): v for k, v in payload.items()}
 
-        ALLOWED = {"name", "status", "schedule", "agent_id", "prompt_template",
-                   "description", "metadata", "next_run_at"}
+        ALLOWED = {
+            "name",
+            "status",
+            "schedule",
+            "agent_id",
+            "prompt_template",
+            "metadata",
+            "next_run_at",
+            "operation_type",
+        }
         update_data = {k: v for k, v in normalised.items() if k in ALLOWED}
+        if payload.get("executionParams") is not None or payload.get("metadata") is not None:
+            merged_metadata = _merge_routine_execution_params_payload(
+                payload,
+                current_metadata if isinstance(current_metadata, dict) else None,
+            )
+            if merged_metadata is not None:
+                update_data["metadata"] = merged_metadata
+        # Evita apagar agendamento da próxima execução quando o front envia null por omissão.
+        for nullable_ts in ("next_run_at",):
+            if nullable_ts in update_data and update_data[nullable_ts] is None:
+                update_data.pop(nullable_ts)
         if not update_data:
             raise HTTPException(400, "no_valid_fields")
 
         updated = client.table("routines").update(update_data).eq("id", routine_id).execute()
-        return Routine(**updated.data[0]).to_zod_dict()
+        return _routine_wire_dict(updated.data[0])
     except HTTPException:
         raise
     except Exception as e:
@@ -3250,10 +3279,54 @@ async def list_agent_routines(request: Request, agent_id: str):
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("routines").select("*").eq("agent_id", agent_id).execute()
-        return [Routine(**row).to_zod_dict() for row in (res.data or [])]
+        return [_routine_wire_dict(row) for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_agent_routines failed: {e}")
         raise HTTPException(500, str(e))
+
+
+KRONOS_AGENT_ID = "9c8d7e6f-5a4b-4321-9876-543210fedcba"
+_KRONOS_ROUTINE_OPERATIONS = (
+    "financial-audit",
+    "financial-bookkeeping",
+    "conciliacao-backlog",
+)
+
+
+def _routine_wire_dict(row: dict) -> dict:
+    from src.agents.kronos import extract_routine_execution_params
+
+    wire = Routine(**row).to_zod_dict()
+    params = extract_routine_execution_params(row.get("metadata"))
+    if params:
+        wire["executionParams"] = params
+    return wire
+
+
+def _merge_routine_execution_params_payload(
+    payload: Dict[str, Any],
+    current_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    from src.agents.kronos import merge_routine_execution_params
+
+    execution_params = payload.get("executionParams")
+    metadata = payload.get("metadata")
+    if execution_params is None and metadata is None:
+        return current_metadata
+    return merge_routine_execution_params(
+        metadata if isinstance(metadata, dict) else current_metadata,
+        execution_params if isinstance(execution_params, dict) else None,
+    )
+
+
+def _resolve_routine_operation_type(routine_row: dict) -> str:
+    explicit = str(routine_row.get("operation_type") or "").strip()
+    if explicit and explicit != "email_lead":
+        return explicit
+    agent_id = str(routine_row.get("agent_id") or "")
+    if agent_id == KRONOS_AGENT_ID:
+        return "financial-bookkeeping"
+    return explicit or "email_lead"
 
 
 @app.post("/api/routines/{routine_id}/run-now")
@@ -3292,20 +3365,38 @@ async def run_routine_now(request: Request, routine_id: str):
         description = prompt_template \
             .replace("{{now}}", now_iso) \
             .replace("{{lastRun}}", routine_row.get("last_run_at") or "nunca")
+        operation_type = _resolve_routine_operation_type(routine_row)
+        input_json = None
+        if operation_type in _KRONOS_ROUTINE_OPERATIONS:
+            from src.agents.kronos import build_kronos_input_json
+
+            metadata = routine_row.get("metadata")
+            input_json = build_kronos_input_json(
+                description=description,
+                metadata=metadata if isinstance(metadata, dict) else None,
+            )
+            input_json = dict(input_json)
+            input_json["routine_id"] = routine_id
         task_payload = {
             "company_id": routine_row.get("company_id"),
             "assigned_to_agent_id": routine_row.get("agent_id"),
             "title": f"[Rotina] {routine_row.get('name', 'Rotina')}",
             "description": description,
             "status": "queued",
-            "operation_type": routine_row.get("operation_type") or "email_lead",
-            "output_json": {"hermes_leads": []},
+            "operation_type": operation_type,
+            "output_json": (
+                {"hermes_leads": []}
+                if operation_type == "email_lead"
+                else {}
+            ),
             "budget_limit": 0,
             "spent": 0,
             "cost_usd": 0,
             "created_at": now_iso,
             "updated_at": now_iso,
         }
+        if input_json is not None:
+            task_payload["input_json"] = input_json
         task_id = None
         task_err_msg = None
         try:
@@ -4259,7 +4350,11 @@ async def get_agent_specialty_config(request: Request, agent_id: str):
 
 
 class SaveAgentSpecialtyConfigInput(BaseModel):
-    specialty_id: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    specialty_id: str = Field(
+        validation_alias=AliasChoices("specialtyId", "specialty_id"),
+    )
     values: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -6459,16 +6554,11 @@ if __name__ == "__main__":
 
 
 
-from fastapi.responses import StreamingResponse
-import json
-import asyncio
-from fastapi import Request, HTTPException
-
 @app.post("/api/workflow/run-orchestrator")
 async def run_flow_orchestrator(request: Request):
     try:
         from src.services.flow_orchestrator import build_orchestrator
-        from langchain_core.messages import HumanMessage
+        from langchain_core.messages import HumanMessage  # pyright: ignore[reportMissingImports]
     except ImportError:
         raise HTTPException(status_code=500, detail="LangGraph engine not installed or built.")
         
@@ -6488,7 +6578,7 @@ async def run_flow_orchestrator(request: Request):
         for output in app_orchestrator.stream(initial_state):
             for key, value in output.items():
                 event_data = {"node": key, "message": f"Nó Concluído: {key}"}
-                yield f"data: {json.dumps(event_data)}\n\n"
+                yield f"data: {_json_wf.dumps(event_data)}\n\n"
                 await asyncio.sleep(0.5)
         yield "data: {\"node\": \"END\", \"message\": \"Fluxo Finalizado\"}\n\n"
 
