@@ -227,6 +227,85 @@ class ResilientHarnessDaemon:
             logger.warning(f"_claim_task failed task={task_id}: {e}")
             return False
 
+    def _emit_task_lifecycle_heartbeat(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        company_id: Optional[str] = None,
+        operation_type: Optional[str] = None,
+        log_excerpt: Optional[str] = None,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """VEC-429 Fase 1 — emite heartbeat ligado a `task_id` para todos os daemons.
+
+        Antes desta função, apenas o Oracle emitia heartbeat com task_id (via
+        `_emit_oracle_records`); os demais daemons só emitiam heartbeats
+        `idle` (task_id=NULL) através de `_emit_idle_heartbeat`. Consequência:
+        o dashboard não conseguia indicar visualmente que o agente X estava
+        executando a task Y, e o handoff (Kronos→HermesReporter) ficava
+        invisível durante a janela ativa.
+
+        Chamada em dois pontos:
+        - logo após `_claim_task` retornar True (status='working').
+        - dentro de `_complete_task` (status='succeeded' | 'error').
+
+        Falha silenciosa — heartbeat é best-effort.
+        """
+        if not self.agent_id or not task_id:
+            return
+        client = self._get_supabase()
+        if not client:
+            return
+
+        resolved_company = company_id or self._agent_config.get("company_id")
+        if not resolved_company:
+            try:
+                ag = (
+                    client.table("agents")
+                    .select("company_id")
+                    .eq("id", self.agent_id)
+                    .maybe_single()
+                    .execute()
+                )
+                if ag and ag.data:
+                    resolved_company = ag.data.get("company_id")
+                    self._agent_config["company_id"] = resolved_company
+            except Exception:
+                pass
+
+        if not log_excerpt:
+            if operation_type:
+                log_excerpt = f"task {status}: {operation_type}"
+            else:
+                log_excerpt = f"task lifecycle: {status}"
+
+        now = datetime.now(timezone.utc).isoformat()
+        row: Dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "task_id": task_id,
+            "status": status,
+            "tokens_used": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "model_id": None,
+            "cost_usd": round(float(cost_usd or 0.0), 8),
+            "log_excerpt": log_excerpt,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if resolved_company:
+            row["company_id"] = resolved_company
+
+        try:
+            client.table("heartbeats").insert(row).execute()
+        except Exception as e:
+            logger.warning(
+                "_emit_task_lifecycle_heartbeat failed task=%s status=%s: %s",
+                task_id, status, e,
+            )
+
     def _complete_task(
         self,
         task_id: str,
@@ -234,6 +313,7 @@ class ResilientHarnessDaemon:
         cost_usd: float = 0.0,
         output_json: Optional[Dict[str, Any]] = None,
         status_override: Optional[str] = None,
+        task_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         client = self._get_supabase()
         if not client:
@@ -253,6 +333,19 @@ class ResilientHarnessDaemon:
                 TaskFactory(client).promote_successors_after_completion(task_id)
             except Exception as promo_err:
                 logger.warning("_complete_task promotion failed task=%s: %s", task_id, promo_err)
+            # VEC-429 Fase 1 — heartbeat terminal ligado à task (visível no dashboard)
+            hb_status = "succeeded" if (success and status != "blocked") else "error"
+            self._emit_task_lifecycle_heartbeat(
+                task_id=task_id,
+                status=hb_status,
+                company_id=(task_meta or {}).get("company_id"),
+                operation_type=(task_meta or {}).get("operation_type"),
+                log_excerpt=(
+                    f"task {status}"
+                    + (f": {task_meta.get('operation_type')}" if task_meta and task_meta.get("operation_type") else "")
+                ),
+                cost_usd=cost_usd,
+            )
         except Exception as e:
             logger.warning(f"_complete_task failed task={task_id}: {e}")
 
@@ -853,6 +946,18 @@ class ResilientHarnessDaemon:
                         task_id = task["id"]
 
                         if self._claim_task(task_id):
+                            # VEC-429 Fase 1 — heartbeat 'working' ligado à task
+                            # logo após claim. Permite dashboard exibir agente
+                            # como executando em vez de só 'idle'.
+                            self._emit_task_lifecycle_heartbeat(
+                                task_id=task_id,
+                                status="working",
+                                company_id=task.get("company_id"),
+                                operation_type=task.get("operation_type"),
+                                log_excerpt=(
+                                    f"executing {task.get('operation_type', 'task')}"
+                                ),
+                            )
                             success = False
                             cost_usd = 0.0
                             output_json = None
@@ -881,6 +986,10 @@ class ResilientHarnessDaemon:
                                     task_id, success, cost_usd,
                                     output_json=output_json,
                                     status_override=status_override,
+                                    task_meta={
+                                        "company_id": task.get("company_id"),
+                                        "operation_type": task.get("operation_type"),
+                                    },
                                 )
                         else:
                             logger.debug(f"task {task_id} já foi claimed por outro worker")
