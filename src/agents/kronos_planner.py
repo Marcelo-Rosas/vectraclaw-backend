@@ -223,6 +223,37 @@ def _errored(
     }
 
 
+async def _select_first_real_partition(combobox_locator) -> None:
+    """Seleciona a primeira opção real do combobox de Instituição
+    (skipando placeholder 'Selecione' / opções vazias).
+
+    Útil quando o user tem uma única instituição cadastrada — evita exigir
+    `PLANNER_INSTITUICAO` na rotina pra uso single-conta.
+    """
+    options = await combobox_locator.evaluate(
+        """(el) => Array.from(el.options).map(o => ({
+            value: o.value || '',
+            text: (o.textContent || '').trim()
+        }))"""
+    )
+    candidates = [
+        o
+        for o in options
+        if o["value"] and o["text"] and o["text"].lower() != "selecione"
+    ]
+    if not candidates:
+        logger.warning(
+            "combobox Instituição sem opções reais — pulando seleção (submit pode falhar)"
+        )
+        return
+    first = candidates[0]
+    await combobox_locator.select_option(value=first["value"])
+    logger.info(
+        "Instituição auto-selecionada (default): %s",
+        first["text"],
+    )
+
+
 async def _do_import_flow(
     session: KronosPlannerSession,
     target_file: Path,
@@ -251,21 +282,24 @@ async def _do_import_flow(
 
     # 2. Aba "Extrato bancário" é default. Skip.
 
-    # 3. Combobox Instituição — sobrescreve só se rotina informou
+    # 3. Combobox Instituição (obrigatório — campo com asterisco).
+    #    Por padrão vem em "Selecione" (placeholder vazio). Se a rotina não
+    #    informou `PLANNER_INSTITUICAO`, escolhemos a primeira opção real
+    #    (skipando o placeholder) — single-conta o user normalmente só tem
+    #    uma instituição cadastrada.
+    modal_select = page.locator(SELECTOR_INSTITUICAO_COMBOBOX).first
     if instituicao:
         try:
-            modal_select = page.locator(
-                f"dialog {SELECTOR_INSTITUICAO_COMBOBOX}"
-            ).first
-            if await modal_select.count() == 0:
-                modal_select = page.locator(SELECTOR_INSTITUICAO_COMBOBOX).first
             await modal_select.select_option(label=instituicao)
         except Exception as exc:
             logger.warning(
-                "não foi possível selecionar Instituição %r: %s",
+                "não foi possível selecionar Instituição %r: %s — caindo no default",
                 instituicao,
                 exc,
             )
+            await _select_first_real_partition(modal_select)
+    else:
+        await _select_first_real_partition(modal_select)
 
     # 4. Radio OFX é default. Skip.
 
@@ -273,8 +307,21 @@ async def _do_import_flow(
     file_input = page.locator(SELECTOR_FILE_INPUT).first
     await file_input.set_input_files(str(target_file))
 
-    # 6. Submit
-    await page.locator(SELECTOR_IMPORTAR_SUBMIT).first.click()
+    # 6. Submit — backend valida o OFX após upload e só então habilita o
+    #    botão. Esperamos ele ficar enabled (não-disabled) antes do click.
+    submit_btn = page.locator(SELECTOR_IMPORTAR_SUBMIT).first
+    await submit_btn.wait_for(state="visible", timeout=15_000)
+    enabled = False
+    for _ in range(30):  # até 15s (30 × 500ms)
+        if not await submit_btn.is_disabled():
+            enabled = True
+            break
+        await asyncio.sleep(0.5)
+    if not enabled:
+        raise KronosSaveTimeout(
+            "botão Importar do modal ficou disabled após upload do OFX"
+        )
+    await submit_btn.click()
 
     # 7. Aguarda modal fechar — sinal primário de sucesso
     try:

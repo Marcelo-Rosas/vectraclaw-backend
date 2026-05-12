@@ -202,6 +202,10 @@ def _make_mock_session():
     locator_first.count = AsyncMock(return_value=1)
     locator_first.select_option = AsyncMock(return_value=None)
     locator_first.set_input_files = AsyncMock(return_value=None)
+    locator_first.is_disabled = AsyncMock(return_value=False)
+    locator_first.evaluate = AsyncMock(
+        return_value=[{"value": "abc-uuid", "text": "C6 Bank - Principal"}]
+    )
     page_locator.first = locator_first
     page_locator.wait_for = AsyncMock(return_value=None)
     session.page.locator = MagicMock(return_value=page_locator)
