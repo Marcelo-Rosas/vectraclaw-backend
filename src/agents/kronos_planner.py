@@ -52,13 +52,15 @@ logger = logging.getLogger("KronosPlanner")
 PLANNER_LANCAMENTOS_URL = (
     "https://web.meuplannerfinanceiro.com.br/controle/lancamentos"
 )
-SELECTOR_IMPORT_BUTTON = 'button:has-text("Importar Extratos e Faturas")'
+# Botão de abrir o modal de import é um ícone com tooltip — texto não está
+# no DOM, só em `data-tip`. Usar o id estável é mais robusto.
+SELECTOR_IMPORT_BUTTON = "#import-file-btn"
 SELECTOR_IMPORT_MODAL_HEADING = 'h2:has-text("Importar Arquivo")'
-SELECTOR_INSTITUICAO_COMBOBOX = 'select'
-SELECTOR_FILE_INPUT = 'input[type="file"]'
-SELECTOR_IMPORTAR_SUBMIT = (
-    'button:has-text("Importar"):not(:has-text("Extratos"))'
-)
+SELECTOR_INSTITUICAO_COMBOBOX = 'select[name="partitionId"]'
+SELECTOR_FILE_TYPE_STATEMENT = 'input[name="fileType"][value="statement"]'
+SELECTOR_FILE_EXTENSION_OFX = 'input[name="fileExtension"][value="ofx"]'
+SELECTOR_FILE_INPUT = 'input[type="file"][accept*="ofx"]'
+SELECTOR_IMPORTAR_SUBMIT = 'button[type="submit"]:has-text("Importar")'
 
 
 # ── Entry point (sync wrapper) ────────────────────────────────────────────
