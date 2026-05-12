@@ -366,9 +366,15 @@ def test_categorize_pending_lines_skips_when_no_rules_match():
 
     fake_row = MagicMock()
     fake_row.evaluate = AsyncMock(return_value=None)
+    fake_row.evaluate = AsyncMock(return_value=None)
 
     session = MagicMock()
     session.page = MagicMock()
+    # Mock page.locator(...).first → pinned_row com evaluate/locator/count async
+    pinned_mock = MagicMock()
+    pinned_mock.evaluate = AsyncMock(return_value=None)
+    pinned_mock.locator = MagicMock(return_value=MagicMock(first=MagicMock(count=AsyncMock(return_value=0))))
+    session.page.locator = MagicMock(return_value=MagicMock(first=pinned_mock))
 
     # Sequência: 1ª chamada acha row; 2ª chamada acha nada → loop sai
     row_sequence = [fake_row, None]
@@ -401,8 +407,14 @@ def test_categorize_pending_lines_applies_match_and_counts():
     from src.agents.kronos_categorizer import MatchResult
 
     fake_row = MagicMock()
+    fake_row.evaluate = AsyncMock(return_value=None)
     session = MagicMock()
     session.page = MagicMock()
+    # Mock page.locator(...).first → pinned_row com evaluate/locator/count async
+    pinned_mock = MagicMock()
+    pinned_mock.evaluate = AsyncMock(return_value=None)
+    pinned_mock.locator = MagicMock(return_value=MagicMock(first=MagicMock(count=AsyncMock(return_value=0))))
+    session.page.locator = MagicMock(return_value=MagicMock(first=pinned_mock))
 
     row_sequence = [fake_row, None]
 
@@ -447,9 +459,16 @@ def test_categorize_pending_lines_continues_on_per_row_failure():
     from src.agents.kronos_categorizer import MatchResult
 
     row_a = MagicMock()
+    row_a.evaluate = AsyncMock(return_value=None)
     row_b = MagicMock()
+    row_b.evaluate = AsyncMock(return_value=None)
     session = MagicMock()
     session.page = MagicMock()
+    # Mock page.locator(...).first → pinned_row com evaluate/locator/count async
+    pinned_mock = MagicMock()
+    pinned_mock.evaluate = AsyncMock(return_value=None)
+    pinned_mock.locator = MagicMock(return_value=MagicMock(first=MagicMock(count=AsyncMock(return_value=0))))
+    session.page.locator = MagicMock(return_value=MagicMock(first=pinned_mock))
 
     row_sequence = [row_a, row_b, None]
     desc_sequence = ["FAIL ROW", "OK ROW"]
@@ -504,8 +523,14 @@ def test_categorize_pending_lines_respects_max_lines():
     from src.agents import kronos_planner
 
     fake_row = MagicMock()
+    fake_row.evaluate = AsyncMock(return_value=None)
     session = MagicMock()
     session.page = MagicMock()
+    # Mock page.locator(...).first → pinned_row com evaluate/locator/count async
+    pinned_mock = MagicMock()
+    pinned_mock.evaluate = AsyncMock(return_value=None)
+    pinned_mock.locator = MagicMock(return_value=MagicMock(first=MagicMock(count=AsyncMock(return_value=0))))
+    session.page.locator = MagicMock(return_value=MagicMock(first=pinned_mock))
 
     # Sempre retorna uma row (loop só para por max_lines)
     async def find_next(_page):
