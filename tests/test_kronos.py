@@ -320,3 +320,241 @@ def test_extract_routine_execution_params_ignores_apply_baixa():
     )
 
     assert params == {"OFX_PATH": r"C:\ofx"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VEC-415: parser + selector de OFX por semana
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_parse_semana_filename_valid_2digit_year():
+    from src.agents.kronos import parse_semana_filename
+
+    assert parse_semana_filename("semana-2-maio-26.ofx") == (2026, 5, 2)
+
+
+def test_parse_semana_filename_valid_4digit_year():
+    from src.agents.kronos import parse_semana_filename
+
+    assert parse_semana_filename("semana-12-março-2026.ofx") == (2026, 3, 12)
+
+
+def test_parse_semana_filename_tolerates_no_accent():
+    from src.agents.kronos import parse_semana_filename
+
+    # "marco" sem cedilha
+    assert parse_semana_filename("semana-3-marco-26.ofx") == (2026, 3, 3)
+
+
+def test_parse_semana_filename_case_insensitive():
+    from src.agents.kronos import parse_semana_filename
+
+    assert parse_semana_filename("SEMANA-1-DEZEMBRO-25.OFX") == (2025, 12, 1)
+
+
+def test_parse_semana_filename_rejects_invalid_patterns():
+    from src.agents.kronos import parse_semana_filename
+
+    cases = [
+        "abril-2026.ofx",                # sem prefixo `semana-`
+        "semana-1-maio-26.csv",          # extensão errada
+        "semana-1-maio.ofx",             # sem ano
+        "semana-mês-26.ofx",             # sem número de semana
+        "semana-1-junio-26.ofx",         # espanhol, não pt-BR
+        "extrato-maio.ofx",              # padrão arbitrário
+    ]
+    for case in cases:
+        assert parse_semana_filename(case) is None, f"esperava None para {case!r}"
+
+
+def test_list_ofx_files_sorted_orders_cross_month(tmp_path):
+    from src.agents.kronos import list_ofx_files_sorted
+
+    for name in [
+        "semana-4-maio-26.ofx",
+        "semana-1-junho-26.ofx",
+        "semana-2-maio-26.ofx",
+        "semana-3-maio-26.ofx",
+        "semana-1-maio-26.ofx",
+    ]:
+        (tmp_path / name).write_text("dummy")
+
+    names = [p.name for p in list_ofx_files_sorted(tmp_path)]
+    assert names == [
+        "semana-1-maio-26.ofx",
+        "semana-2-maio-26.ofx",
+        "semana-3-maio-26.ofx",
+        "semana-4-maio-26.ofx",
+        "semana-1-junho-26.ofx",
+    ]
+
+
+def test_list_ofx_files_sorted_puts_unmatched_at_end(tmp_path):
+    from src.agents.kronos import list_ofx_files_sorted
+
+    (tmp_path / "semana-1-maio-26.ofx").write_text("")
+    (tmp_path / "semana-2-maio-26.ofx").write_text("")
+    (tmp_path / "z-arquivo-arbitrario.ofx").write_text("")
+    (tmp_path / "a-outro-extrato.ofx").write_text("")
+    (tmp_path / "nao-e-ofx.csv").write_text("")
+
+    names = [p.name for p in list_ofx_files_sorted(tmp_path)]
+    assert names == [
+        "semana-1-maio-26.ofx",
+        "semana-2-maio-26.ofx",
+        "a-outro-extrato.ofx",
+        "z-arquivo-arbitrario.ofx",
+    ]
+
+
+def test_list_ofx_files_sorted_returns_empty_for_missing_dir(tmp_path):
+    from src.agents.kronos import list_ofx_files_sorted
+
+    assert list_ofx_files_sorted(tmp_path / "nao-existe") == []
+
+
+def test_pick_next_ofx_file_returns_first_when_no_cursor(tmp_path):
+    from src.agents.kronos import pick_next_ofx_file
+
+    (tmp_path / "semana-2-maio-26.ofx").write_text("")
+    (tmp_path / "semana-1-maio-26.ofx").write_text("")
+
+    picked = pick_next_ofx_file(tmp_path, None)
+    assert picked is not None
+    assert picked.name == "semana-1-maio-26.ofx"
+
+
+def test_pick_next_ofx_file_advances_from_cursor(tmp_path):
+    from src.agents.kronos import pick_next_ofx_file
+
+    for name in [
+        "semana-1-maio-26.ofx",
+        "semana-2-maio-26.ofx",
+        "semana-3-maio-26.ofx",
+        "semana-1-junho-26.ofx",
+    ]:
+        (tmp_path / name).write_text("")
+
+    picked = pick_next_ofx_file(tmp_path, "semana-2-maio-26.ofx")
+    assert picked is not None
+    assert picked.name == "semana-3-maio-26.ofx"
+
+
+def test_pick_next_ofx_file_crosses_month_boundary(tmp_path):
+    from src.agents.kronos import pick_next_ofx_file
+
+    (tmp_path / "semana-4-maio-26.ofx").write_text("")
+    (tmp_path / "semana-1-junho-26.ofx").write_text("")
+
+    picked = pick_next_ofx_file(tmp_path, "semana-4-maio-26.ofx")
+    assert picked is not None
+    assert picked.name == "semana-1-junho-26.ofx"
+
+
+def test_pick_next_ofx_file_returns_none_when_caught_up(tmp_path):
+    from src.agents.kronos import pick_next_ofx_file
+
+    (tmp_path / "semana-1-maio-26.ofx").write_text("")
+    (tmp_path / "semana-2-maio-26.ofx").write_text("")
+
+    picked = pick_next_ofx_file(tmp_path, "semana-2-maio-26.ofx")
+    assert picked is None
+
+
+def test_pick_next_ofx_file_returns_none_for_empty_dir(tmp_path):
+    from src.agents.kronos import pick_next_ofx_file
+
+    assert pick_next_ofx_file(tmp_path, None) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VEC-415: helpers de cursor em routines.metadata
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _mock_routines_select(metadata):
+    """Cria mock do supabase_client com .table('routines').select(...).eq(...).limit(...).execute()."""
+    mock_client = MagicMock()
+    chain = mock_client.table.return_value.select.return_value.eq.return_value.limit.return_value
+    chain.execute.return_value.data = [{"metadata": metadata}]
+    return mock_client
+
+
+def test_get_routine_ofx_cursor_reads_metadata_field():
+    from src.agents.kronos import get_routine_ofx_cursor
+
+    client = _mock_routines_select(
+        {"lastProcessedOfx": "semana-2-maio-26.ofx", "OFX_PATH": "/x"}
+    )
+    assert get_routine_ofx_cursor(client, "routine-id") == "semana-2-maio-26.ofx"
+
+
+def test_get_routine_ofx_cursor_returns_none_when_absent():
+    from src.agents.kronos import get_routine_ofx_cursor
+
+    client = _mock_routines_select({"OFX_PATH": "/x"})
+    assert get_routine_ofx_cursor(client, "routine-id") is None
+
+
+def test_get_routine_ofx_cursor_returns_none_when_metadata_null():
+    from src.agents.kronos import get_routine_ofx_cursor
+
+    client = _mock_routines_select(None)
+    assert get_routine_ofx_cursor(client, "routine-id") is None
+
+
+def test_get_routine_ofx_cursor_raises_when_routine_missing():
+    from src.agents.kronos import get_routine_ofx_cursor
+
+    client = MagicMock()
+    chain = client.table.return_value.select.return_value.eq.return_value.limit.return_value
+    chain.execute.return_value.data = []
+    with pytest.raises(ValueError, match="não encontrada"):
+        get_routine_ofx_cursor(client, "missing-id")
+
+
+def test_update_routine_ofx_cursor_preserves_other_keys():
+    from src.agents.kronos import update_routine_ofx_cursor
+
+    client = _mock_routines_select({"OFX_PATH": "/extratos", "RECIPIENT": "ops@x"})
+
+    merged = update_routine_ofx_cursor(client, "routine-id", "semana-3-maio-26.ofx")
+
+    assert merged["lastProcessedOfx"] == "semana-3-maio-26.ofx"
+    assert merged["OFX_PATH"] == "/extratos"
+    assert merged["RECIPIENT"] == "ops@x"
+    update_call = client.table.return_value.update.call_args[0][0]
+    assert update_call == {"metadata": merged}
+
+
+def test_update_routine_ofx_cursor_rejects_empty_basename():
+    from src.agents.kronos import update_routine_ofx_cursor
+
+    client = _mock_routines_select({})
+    with pytest.raises(ValueError, match="processed_basename"):
+        update_routine_ofx_cursor(client, "routine-id", "   ")
+
+
+def test_clear_routine_ofx_cursor_removes_field_only():
+    from src.agents.kronos import clear_routine_ofx_cursor
+
+    client = _mock_routines_select(
+        {"lastProcessedOfx": "semana-1-maio-26.ofx", "OFX_PATH": "/x"}
+    )
+
+    merged = clear_routine_ofx_cursor(client, "routine-id")
+
+    assert "lastProcessedOfx" not in merged
+    assert merged["OFX_PATH"] == "/x"
+    update_call = client.table.return_value.update.call_args[0][0]
+    assert update_call == {"metadata": merged}
+
+
+def test_clear_routine_ofx_cursor_noop_when_already_clear():
+    from src.agents.kronos import clear_routine_ofx_cursor
+
+    client = _mock_routines_select({"OFX_PATH": "/x"})
+    merged = clear_routine_ofx_cursor(client, "routine-id")
+
+    assert merged == {"OFX_PATH": "/x"}
+    client.table.return_value.update.assert_not_called()
