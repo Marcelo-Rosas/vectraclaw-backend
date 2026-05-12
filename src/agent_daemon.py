@@ -275,6 +275,11 @@ class ResilientHarnessDaemon:
             result = entrypoint_backlog(task, self._get_supabase())
             return _json.dumps(result)
 
+        if op_type == "planner-import-ofx":
+            from src.agents.kronos_planner import entrypoint_planner_import
+            result = entrypoint_planner_import(task, self._get_supabase())
+            return _json.dumps(result)
+
         if op_type == "oracle-report":
             from src.agents.hermes_reporter import entrypoint as hr_entry
             result = hr_entry(task)
