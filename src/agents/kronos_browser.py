@@ -55,8 +55,8 @@ SELECTOR_TOAST_SUCCESS = ".Toastify__toast--success"
 SELECTOR_TOAST_ERROR = ".Toastify__toast--error"
 SELECTOR_TOAST_BODY = ".Toastify__toast-body"
 
-INPUT_EMAIL = 'input[name="current_email"]'
-INPUT_PASSWORD = 'input[name="current_password"]'
+INPUT_EMAIL = 'input[name="username"]'
+INPUT_PASSWORD = 'input[name="password"]'
 
 DEFAULT_NAV_TIMEOUT_MS = 15_000
 DEFAULT_OVERLAY_TIMEOUT_MS = 10_000
@@ -214,41 +214,65 @@ class KronosPlannerSession:
 
     async def _ensure_logged_in(self) -> None:
         page = self._require_page()
+        # Navega direto para /login. Se já logado via cookies, o SPA redireciona
+        # para /inicio. Se não logado, /login renderiza o form (evita o alert
+        # "Sua sessão expirou" que aparece quando vamos para /inicio sem cookie).
         try:
-            await page.goto(PLANNER_HOME_URL, wait_until="domcontentloaded")
+            await page.goto(PLANNER_LOGIN_URL, wait_until="domcontentloaded")
         except PlaywrightTimeoutError as exc:
             raise KronosLoginFailed(
-                f"timeout navegando para {PLANNER_HOME_URL}: {exc}"
+                f"timeout navegando para {PLANNER_LOGIN_URL}: {exc}"
             ) from exc
 
         try:
             await page.wait_for_load_state("networkidle", timeout=self.nav_timeout_ms)
         except PlaywrightTimeoutError:
-            # Não fatal — alguns dashboards mantêm long polls. Seguimos.
-            logger.debug("networkidle não atingido; prosseguindo com login")
+            logger.debug("networkidle não atingido em /login; prosseguindo")
 
-        if "/login" in page.url:
-            await self._do_login()
-            try:
-                await page.wait_for_url(
-                    re.compile(r"/inicio"), timeout=self.nav_timeout_ms
-                )
-            except PlaywrightTimeoutError as exc:
-                raise KronosLoginFailed(
-                    "após submit do login, não redirecionou para /inicio"
-                ) from exc
+        if "/inicio" in page.url:
+            # Cookie da storage_state já validou — pulamos login.
+            logger.debug("já autenticado via storage state — login skipado")
+            await self.dismiss_known_modals()
+            return
+
+        if "/login" not in page.url:
+            await self._safe_screenshot("login-unexpected-url")
+            raise KronosLoginFailed(
+                f"esperava /login ou /inicio, mas estamos em {page.url}"
+            )
+
+        await self._do_login()
+        try:
+            await page.wait_for_url(
+                re.compile(r"/inicio"), timeout=self.nav_timeout_ms
+            )
+        except PlaywrightTimeoutError as exc:
+            await self._safe_screenshot("login-no-redirect")
+            raise KronosLoginFailed(
+                "após submit do login, não redirecionou para /inicio"
+            ) from exc
 
         await self.dismiss_known_modals()
 
     async def _do_login(self) -> None:
         page = self._require_page()
         try:
+            # Aguarda o form renderizar (SPA pode demorar a montar)
+            await page.wait_for_selector(INPUT_EMAIL, state="visible", timeout=10_000)
+        except PlaywrightTimeoutError as exc:
+            await self._safe_screenshot("login-form-not-rendered")
+            raise KronosLoginFailed(
+                f"form de login não renderizou: {exc}"
+            ) from exc
+
+        try:
             await page.fill(INPUT_EMAIL, self.email)
             await page.fill(INPUT_PASSWORD, self.password)
             submit = page.locator('button[type="submit"]').first
             await submit.click()
         except PlaywrightTimeoutError as exc:
-            raise KronosLoginFailed(f"form de login inacessível: {exc}") from exc
+            await self._safe_screenshot("login-submit-failed")
+            raise KronosLoginFailed(f"falha ao preencher/submeter login: {exc}") from exc
 
     # ── Helpers públicos ──
 
