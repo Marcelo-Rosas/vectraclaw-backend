@@ -1,0 +1,284 @@
+# Kronos category rules — gerado por bootstrap_rules_from_csv.
+# Edite à vontade: ordem importa (primeiro match wins).
+# Comportamento default: match_type=substring, case_sensitive=false.
+
+rules:
+- pattern: FAST MARKET            NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: ESCOLA JM
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*ANTONIO JOSE VAILA NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*EMPREENDIMENTOS PA NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: POSTO DE COMBUSTIVEIS  NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: DEGUSTA CAFE, CONFEITA NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Uber UBER *TRIP HELP.U SP            BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*EMPORIO DE CARNES  NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*Elodoces           NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*DAZUMBANHO NA COZI NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*53.973.317 ricardo BALNEARIO CAM BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*BRAZA 55
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: POSTO CAT3             NAVEGANTES    BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: GLOBO*Globoplay        RIO DE JANEIR BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Globo Premiere         RJ            BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*EMPORIO DE CARNES NAVEGANTES
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*ANTONIO JOSE VAILA NAVEGANTES
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: IFD*Elodoces NAVEGANTES
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Disney Plus            SP            BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: NETFLIX.COM            SP            BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: EBN         *SPOTIFY   CURITIBA      BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Pix recebido de SMARTFIT ESCOLA DE GINASTICA E DANCA S A
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de VECTRA HUB LTDA
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de THIAGO MARCELO GARCIA RAGASSI
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de TM ACADEMIA DE GINASTICA LTDA
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Frete fabrica montro
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido c6 de VECTRA HUB
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de FORMENTO ADMINISTRADORA DE BENS LTDA
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix qr code recebido de VANGARD ACADEMIA LTDA
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Frete academia
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de 3C ASSESSORIA E CORRETAGEM DE SEGUROS LTDA
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de HOTEL ASSAY LTDA
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Referente ao frete da NF 1456
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de VANGARD ACADEMIA LTDA
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de BERNARDO SILVA MIRANDA FILHO
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de VINICIUS DE PAULA DIAS
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento à vista
+- pattern: Pix recebido de Camilla Azevedo Serran Vieira
+  categoria: Receita - Movimentações Internas
+  subcategoria: Receita - Transferência entre C/C
+- pattern: Pix recebido de VECTRA CARGO LTDA
+  categoria: Receita - Movimentações Internas
+  subcategoria: Receita - Transferência entre C/C
+- pattern: Pix recebido de CAROLINA AZEVEDO SERRAN VIEIRA
+  categoria: Receita - Movimentações Internas
+  subcategoria: Receita - Transferência entre C/C
+- pattern: Pix recebido c6 de CAMILLA AZEVEDO SERRAN VIEIRA
+  categoria: Receita - Movimentações Internas
+  subcategoria: Receita - Transferência entre C/C
+- pattern: Pix recebido de CAMILLA AZEVEDO SERRAN VIEIRA
+  categoria: Receita - Movimentações Internas
+  subcategoria: Receita - Transferência entre C/C
+- pattern: Pix recebido de CRISTINA AZEVEDO SERRAN VIEIRA
+  categoria: Receita - Empréstimo de PF
+  subcategoria: Receita - Empréstimo
+- pattern: '44415184715'
+  categoria: Receita - Empréstimo de PF
+  subcategoria: Receita - Empréstimo
+- pattern: Pix recebido de MARIA A ABISSULO ROSAS
+  categoria: Receita - Empréstimo de PF
+  subcategoria: Receita - Empréstimo
+- pattern: ALUGUEL APTO
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Moradia – Aluguel'
+- pattern: Uber UBER *TRIP HELP.U SP            BRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Moradia – Aluguel'
+- pattern: EQUILIBRIO MARMITARIA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Moradia – Aluguel'
+- pattern: STARKLINK
+  categoria: Despesas Operacionais – Galpão
+  subcategoria: Despesas Operacionais - Internet
+- pattern: ACTIVE TRANS
+  categoria: Despesa Administrativa
+  subcategoria: Despesa Administrativa – Gestão/ERP
+- pattern: SALÁRIO
+  categoria: Despesa Administrativa
+  subcategoria: Despesa Administrativa – Salário
+- pattern: ALUGUEL DE EQUIP  COT2026030020
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Pagamento à Vista
+- pattern: MAO DE OBRA  COT2026030020
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Pagamento à Vista
+- pattern: DIARIA  COT2026030020
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Pagamento à Vista
+- pattern: FRETECOT2026030020
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Pagamento à Vista
+- pattern: PIX  CARREGAMENTO  COT2026030020
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Pagamento à Vista
+- pattern: CO800003897
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete – Pagamento à Vista
+- pattern: PAG
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete – Pagamento à Vista
+- pattern: Pagamento de frete
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete – Pagamento à Vista
+- pattern: FRETEBRAS INTERNET E SERVICOS LTDA
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete – Pagamento à Vista
+- pattern: POSTO DE COMBUSTIVEIS  NAVEGANTES    BRA
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete - Frete Interno
+- pattern: Pix estornado
+  categoria: Receita - Estorno de valores
+  subcategoria: Receita – estorno de valores
+- pattern: Crédito Definitivo Contestação Compra
+  categoria: Receita - Estorno de valores
+  subcategoria: Receita – estorno de valores
+- pattern: IFD*EMPREENDIMENTOS PA NAVEGANTES    BRA
+  categoria: Receita - Estorno de valores
+  subcategoria: Receita – estorno de valores
+- pattern: Adiantamento de frete  70 Sergio Flores
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Adiantamento de Frete
+- pattern: Adiantamento de frete 70
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Adiantamento de Frete
+- pattern: Seguro Conta Abr 26
+  categoria: Despesas Financeiras
+  subcategoria: Despesas Financeiras – Tarifa Bancária
+- pattern: TARIFA DE SERVICO DE NEGATIVACAO
+  categoria: Despesas Financeiras
+  subcategoria: Despesas Financeiras – Tarifa Bancária
+- pattern: Seguro Conta MarÃ§o 26
+  categoria: Despesas Financeiras
+  subcategoria: Despesas Financeiras – Tarifa Bancária
+- pattern: CO800003897
+  categoria: Despesa Administrativa
+  subcategoria: Despesa Administrativa – Diversos
+- pattern: FAT
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Saldo de cliente
+- pattern: Pagamento de frete
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Saldo de cliente
+- pattern: PAG
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete – Saldo de Frete
+- pattern: D'LUCI TRANSPORTADORA 30% SALDO
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete – Saldo de Frete
+- pattern: FUNDO DE INVESTIMENTO EM DIREI
+  categoria: Despesas Financeiras
+  subcategoria: Despesas Financeiras – Empréstimo
+- pattern: Pagamento parcela empréstimo
+  categoria: Despesas Financeiras
+  subcategoria: Despesas Financeiras – Empréstimo
+- pattern: DANILO ENTULHO LTDA ME
+  categoria: Despesas Operacionais – Galpão
+  subcategoria: Despesas Operacionais – Caçamba
+- pattern: J L CESCON ME
+  categoria: Despesas Operacionais – Galpão
+  subcategoria: Despesas Operacionais – Caçamba
+- pattern: NTC
+  categoria: Despesa Administrativa
+  subcategoria: Despesa Administrativa – Meu Chappa
+- pattern: ASSOCIACAO NACIONAL DO TRANSPO
+  categoria: Despesa Administrativa
+  subcategoria: Despesa Administrativa – Meu Chappa
+- pattern: BUONNY PROJ SERV RIS SEC LTDA
+  categoria: Custos Oparacionais
+  subcategoria: Custos Operacionais - Gerenciamento de Risco
+- pattern: BUONNY PROJETOS E SERVICOS DE
+  categoria: Custos Oparacionais
+  subcategoria: Custos Operacionais - Gerenciamento de Risco
+- pattern: OFFICE MONEY SECURITIZADORA SA
+  categoria: Despesas Financeiras
+  subcategoria: Despesas Financeiras – Antecipação de Recebíveis
+- pattern: OFFICE MONEY SECURITIZADORA SA
+  categoria: Despesas Financeiras
+  subcategoria: Despesas Financeiras – Securizadora
+- pattern: Boleto
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: Frete - Pagamento via boleto
+- pattern: Vlr.Ref.Cobr/Trf.Tit
+  categoria: Receita Operacional – Frete
+  subcategoria: Receita - Pagamento via boleto
+- pattern: METARO
+  categoria: Despesas Operacionais – Galpão
+  subcategoria: Despesas Operacionais – Material Operacional
+- pattern: VPO SERGIO FLORES
+  categoria: Custos Oparacionais
+  subcategoria: Custos Operacionais - Pedágios – VPO
+- pattern: SALDO  FRETE  FDM  BH
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: Frete Agregado – Saldo de Frete
+- pattern: PIX  CARREGAMENTO  COT2026030020
+  categoria: Custos Oparacionais
+  subcategoria: Custos Operacionais - Carga e Descarga
+- pattern: Saldo devedor  formento galpÃ£o 06
+  categoria: Despesas Operacionais – Galpão
+  subcategoria: Despesas Operacionais – Aluguel
+- pattern: MUNICIPIO DE NAVEGANTES
+  categoria: Despesa Administrativa
+  subcategoria: Despesa Administrativa – Licenças e Registros
+- pattern: FRETEBRAS INTERNET E SERVICOS LTDA
+  categoria: Despesa Administrativa
+  subcategoria: Despesa Administrativa – Fretebras
+- pattern: MUNICIPIO DE NAVEGANTES
+  categoria: Despesas Operacionais – Galpão
+  subcategoria: Despesas Operacionais – IPTU
