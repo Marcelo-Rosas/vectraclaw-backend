@@ -1384,6 +1384,10 @@ _KRONOS_INPUT_KEYS = (
     "PERIODO_FIM",
     "RECIPIENT",
     "APPLY_BAIXA",
+    # VEC-419: consumido pelo entrypoint_planner_import pra selecionar a
+    # Instituição Financeira no combobox do Meu Planner Financeiro.
+    # Default = primeira opção real do combobox (single-conta).
+    "PLANNER_INSTITUICAO",
 )
 
 # Parâmetros persistidos na rotina (template); APPLY_BAIXA fica só na task.
