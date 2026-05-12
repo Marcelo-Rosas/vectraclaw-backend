@@ -42,6 +42,12 @@ from src.agents.kronos_browser import (
     KronosPlannerSession,
     KronosSaveTimeout,
 )
+from src.agents.kronos_categorizer import (
+    MatchResult,
+    Rule,
+    load_rules,
+    match_rule,
+)
 
 
 logger = logging.getLogger("KronosPlanner")
@@ -52,6 +58,15 @@ logger = logging.getLogger("KronosPlanner")
 PLANNER_LANCAMENTOS_URL = (
     "https://web.meuplannerfinanceiro.com.br/controle/lancamentos"
 )
+# VEC-423: categorização inline pós-import
+_DEFAULT_RULES_PATH = Path(__file__).parent / "kronos_category_rules.yaml"
+_CATEGORIA_CELL_INDEX = 3       # 0-indexed: Categoria
+_SUBCATEGORIA_CELL_INDEX = 4    # 0-indexed: Subcategoria
+_DESC_CELL_INDEX = 7            # 0-indexed: Descrição
+_SELECT_CATEGORY = 'select[name="category"]'
+_SELECT_SUBCATEGORY = 'select[name="subcategory"]'
+_MAX_CATEGORIZE_LINES = 200
+_CATEGORIZATION_DETAILS_CAP = 30  # output_json fica enxuto
 # Botão de abrir o modal de import é um ícone com tooltip — texto não está
 # no DOM, só em `data-tip`. Usar o id estável é mais robusto.
 SELECTOR_IMPORT_BUTTON = "#import-file-btn"
@@ -142,14 +157,35 @@ async def _run_planner_import_async(
         instituicao or "(default)",
     )
 
+    # VEC-423: carrega regras de categorização (best-effort — vazio é OK)
+    rules = _load_categorization_rules()
+
     screenshot_path: Optional[str] = None
     toast_text = ""
+    categorization_stats: Optional[dict[str, Any]] = None
     try:
         async with KronosPlannerSession() as session:
             await _do_import_flow(session, target_file, instituicao)
             toast_text = await _capture_post_import_toast(session)
             shot = await session.screenshot(f"import-{target_file.stem}")
             screenshot_path = str(shot)
+
+            # VEC-423: após import OK, categoriza linhas com "Sem Categoria"
+            if rules:
+                try:
+                    categorization_stats = await _categorize_pending_lines(
+                        session, rules
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "categorization falhou (não fatal): %s", exc
+                    )
+                    categorization_stats = {
+                        "lines_categorized": 0,
+                        "lines_unclassified": 0,
+                        "lines_failed": 0,
+                        "error": str(exc)[:200],
+                    }
     except KronosSaveTimeout as exc:
         return _errored(
             str(exc),
@@ -161,15 +197,16 @@ async def _run_planner_import_async(
 
     _write_cursor(supabase_client, routine_id, target_file.name)
 
-    return {
-        "status": "done",
-        "output_json": {
-            "file_processed": target_file.name,
-            "next_cursor": target_file.name,
-            "screenshot_path": screenshot_path,
-            "toast": toast_text,
-        },
+    output_json: dict[str, Any] = {
+        "file_processed": target_file.name,
+        "next_cursor": target_file.name,
+        "screenshot_path": screenshot_path,
+        "toast": toast_text,
     }
+    if categorization_stats is not None:
+        output_json["categorization"] = categorization_stats
+
+    return {"status": "done", "output_json": output_json}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -375,6 +412,246 @@ async def _capture_post_import_toast(
         return await session.wait_for_save_toast(timeout=3_000)
     except KronosSaveTimeout:
         return ""
+
+
+# ── VEC-423: categorização inline pós-import ─────────────────────────
+
+
+def _load_categorization_rules(
+    rules_path: Optional[Path] = None,
+) -> list[Rule]:
+    """Carrega regras do YAML default. Erro de IO/parse não é fatal — devolve [].
+    """
+    path = rules_path or _DEFAULT_RULES_PATH
+    try:
+        rules = load_rules(path)
+    except Exception as exc:
+        logger.warning(
+            "load_rules falhou (%s) — categorização será no-op", exc
+        )
+        return []
+    logger.info("regras de categorização carregadas: %d de %s", len(rules), path)
+    return rules
+
+
+async def _set_select_by_label(combobox_locator, label: str) -> None:
+    """Seleciona uma `<option>` pelo `textContent` (label visível ao user).
+
+    Estratégia:
+    1. Lê todas as options (value + text).
+    2. Procura match exato no text.
+    3. Fallback: match case-insensitive substring (ex: label tem espaço extra).
+    4. Chama `_set_select_value_robust` com o value encontrado.
+
+    Levanta `ValueError` se nenhum label bate.
+    """
+    options = await combobox_locator.evaluate(
+        """(el) => Array.from(el.options).map(o => ({
+            value: o.value || '',
+            text: (o.textContent || '').trim()
+        }))"""
+    )
+    if not options:
+        raise ValueError(f"combobox sem options ao tentar label={label!r}")
+
+    target = (label or "").strip()
+    match = next((o for o in options if o["text"] == target), None)
+    if match is None:
+        target_l = target.lower()
+        match = next(
+            (o for o in options if o["text"].lower() == target_l), None
+        )
+    if match is None:
+        target_l = target.lower()
+        match = next(
+            (
+                o
+                for o in options
+                if target_l in o["text"].lower() or o["text"].lower() in target_l
+            ),
+            None,
+        )
+    if match is None:
+        available = [o["text"] for o in options if o["text"]]
+        raise ValueError(
+            f"label {label!r} não encontrado no combobox. "
+            f"options: {available[:10]}..."
+        )
+
+    await _set_select_value_robust(combobox_locator, match["value"])
+
+
+async def _categorize_pending_lines(
+    session: KronosPlannerSession,
+    rules: list[Rule],
+    max_lines: int = _MAX_CATEGORIZE_LINES,
+) -> dict[str, Any]:
+    """Itera linhas com `Categoria='Sem Categoria...'` e aplica match_rule.
+
+    Estratégia:
+    - Re-query a cada iteração (tabela re-renderiza após save).
+    - Marca rows já processadas com `data-kronos-processed` pra não voltar.
+    - Catch per-row: falha de uma linha não para o loop.
+    """
+    page = session.page
+    assert page is not None, "KronosPlannerSession sem page ativa"
+
+    stats: dict[str, Any] = {
+        "lines_categorized": 0,
+        "lines_unclassified": 0,
+        "lines_failed": 0,
+        "details": [],
+    }
+
+    for iteration in range(max_lines):
+        row = await _find_next_uncategorized_row(page)
+        if row is None:
+            logger.info(
+                "categorize: sem mais linhas pendentes após %d iterações",
+                iteration,
+            )
+            break
+
+        desc = await _read_row_description(row)
+        result = match_rule(desc, rules)
+
+        if result is None:
+            await _mark_row(row, "skipped")
+            stats["lines_unclassified"] += 1
+            _append_detail(
+                stats, {"desc": desc[:60], "action": "skipped"}
+            )
+            continue
+
+        try:
+            await _apply_categorization_to_row(session, row, result)
+            stats["lines_categorized"] += 1
+            _append_detail(
+                stats,
+                {
+                    "desc": desc[:60],
+                    "categoria": result.categoria,
+                    "subcategoria": result.subcategoria,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "categorize linha %d falhou (%s): %s",
+                iteration,
+                desc[:60],
+                exc,
+            )
+            stats["lines_failed"] += 1
+            _append_detail(
+                stats, {"desc": desc[:60], "error": str(exc)[:100]}
+            )
+            # Tenta cancelar o edit caso tenha ficado aberto
+            try:
+                cancel = row.locator('button[type="button"]:visible').first
+                if await cancel.count() > 0:
+                    await cancel.click(timeout=1_000)
+            except Exception:
+                pass
+            try:
+                await _mark_row(row, "failed")
+            except Exception:
+                pass
+
+    return stats
+
+
+async def _find_next_uncategorized_row(page):
+    """Encontra a próxima linha com Categoria 'Sem Categoria' não marcada.
+
+    Como o filtro `:not([data-kronos-processed])` deixa de fora as já tocadas
+    nesta execução, o loop sempre avança.
+    """
+    rows = page.locator(
+        'tbody tr:not([data-kronos-processed])'
+    )
+    count = await rows.count()
+    for i in range(count):
+        row = rows.nth(i)
+        cells = row.locator("td")
+        ncells = await cells.count()
+        if ncells <= _CATEGORIA_CELL_INDEX:
+            continue
+        cat_text = (
+            await cells.nth(_CATEGORIA_CELL_INDEX).text_content()
+        ) or ""
+        if "sem categoria" in cat_text.strip().lower():
+            return row
+    return None
+
+
+async def _read_row_description(row) -> str:
+    """Lê texto da célula 'Descrição' (índice 7)."""
+    cells = row.locator("td")
+    if await cells.count() <= _DESC_CELL_INDEX:
+        return ""
+    text = await cells.nth(_DESC_CELL_INDEX).text_content()
+    return (text or "").strip()
+
+
+async def _mark_row(row, status: str) -> None:
+    """Adiciona `data-kronos-processed=<status>` na <tr> pra evitar reentrada."""
+    await row.evaluate(
+        "(el, s) => el.setAttribute('data-kronos-processed', s)", status
+    )
+
+
+async def _apply_categorization_to_row(
+    session: KronosPlannerSession,
+    row,
+    result: MatchResult,
+) -> None:
+    """Entra em edit mode, seta categoria + subcategoria, submete, aguarda
+    toast. Marca row processada ao final.
+    """
+    page = session.page
+    assert page is not None
+
+    # 1. Clicar no edit (último td)
+    cells = row.locator("td")
+    ncells = await cells.count()
+    edit_btn = cells.nth(ncells - 1).locator("button").first
+    await edit_btn.click()
+
+    # 2. Aguardar select category aparecer DENTRO da row
+    cat_select = row.locator(_SELECT_CATEGORY).first
+    await cat_select.wait_for(state="visible", timeout=5_000)
+
+    # 3. Aplicar categoria
+    await _set_select_by_label(cat_select, result.categoria)
+
+    # 4. Aguardar subcategoria repopular (delay curto cobre 95%)
+    await asyncio.sleep(0.5)
+
+    sub_select = row.locator(_SELECT_SUBCATEGORY).first
+    await sub_select.wait_for(state="visible", timeout=5_000)
+
+    # 5. Aplicar subcategoria
+    await _set_select_by_label(sub_select, result.subcategoria)
+
+    # 6. Submit (último td, type=submit)
+    submit_btn = row.locator('button[type="submit"]:visible').first
+    await submit_btn.click()
+
+    # 7. Aguarda toast de sucesso (ou ignora se ausente — modal saindo do edit já é sinal)
+    try:
+        await session.wait_for_save_toast(timeout=5_000)
+    except KronosSaveTimeout:
+        logger.debug("categorize: sem toast de success — ignorando")
+
+    # 8. Marca como processada
+    await _mark_row(row, "categorized")
+
+
+def _append_detail(stats: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Adiciona entry em stats['details'] respeitando o cap pra output enxuto."""
+    details = stats.setdefault("details", [])
+    if len(details) < _CATEGORIZATION_DETAILS_CAP:
+        details.append(entry)
 
 
 __all__ = [
