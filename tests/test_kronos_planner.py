@@ -715,3 +715,122 @@ def test_handler_includes_categorization_in_output(tmp_path):
     assert cat["lines_categorized"] == 7
     assert cat["lines_unclassified"] == 2
     assert cat["lines_failed"] == 1
+
+
+# ── VEC-428: relatório SMTP pós-import via HermesReporter ─────────────────
+
+
+def test_build_kronos_report_markdown_has_all_sections():
+    from src.agents import kronos_planner
+
+    stats = {
+        "lines_categorized": 2,
+        "lines_unclassified": 1,
+        "lines_failed": 1,
+        "details": [
+            {"desc": "FAST MARKET", "categoria": "Despesas", "subcategoria": "Uso"},
+            {"desc": "POSTO X", "categoria": "Despesas", "subcategoria": "Uso"},
+            {"desc": "CAPPTA", "action": "skipped"},
+            {"desc": "BUG ROW", "error": "Locator.click timeout"},
+        ],
+    }
+    md = kronos_planner._build_kronos_report_markdown(
+        file_processed="semana-1-maio-26.ofx",
+        stats=stats,
+        screenshot_path="audit-results/x.png",
+        toast_text="Importado com sucesso.",
+    )
+    assert "## Resumo" in md
+    assert "semana-1-maio-26.ofx" in md
+    assert "## Categorizadas" in md
+    assert "FAST MARKET" in md and "POSTO X" in md
+    assert "## Pendentes" in md
+    assert "CAPPTA" in md
+    assert "## Falhas" in md
+    assert "BUG ROW" in md
+
+
+def test_planner_import_creates_oracle_report_task(tmp_path):
+    """Após import OK + categorize, cria task derivada `oracle-report`."""
+    from src.agents import kronos_planner
+
+    ofx_file = tmp_path / "semana-1-maio-26.ofx"
+    ofx_file.write_text("dummy")
+
+    task = {
+        "id": "parent-task-id",
+        "company_id": "comp-id-123",
+        "input_json": {"OFX_PATH": str(ofx_file)},
+        "description": "",
+    }
+    client = MagicMock()
+    fake_session = _make_mock_session()
+
+    inserted_payload = {}
+
+    def fake_insert(payload):
+        inserted_payload["last"] = payload
+        # mimic supabase chainable .execute()
+        out = MagicMock()
+        out.execute = MagicMock(return_value=MagicMock(data=[{"id": "report-task-id"}]))
+        return out
+
+    client.table = MagicMock(return_value=MagicMock(insert=fake_insert))
+
+    async def fake_categorize(_session, _rules, **kw):
+        return {
+            "lines_categorized": 1,
+            "lines_unclassified": 0,
+            "lines_failed": 0,
+            "details": [{"desc": "X", "categoria": "A", "subcategoria": "B"}],
+        }
+
+    with patch.object(
+        kronos_planner, "_load_categorization_rules", return_value=[MagicMock()]
+    ), patch.object(
+        kronos_planner, "KronosPlannerSession", return_value=fake_session
+    ), patch.object(
+        kronos_planner, "_categorize_pending_lines", side_effect=fake_categorize
+    ):
+        result = kronos_planner.entrypoint_planner_import(task, client)
+
+    assert result["status"] == "done"
+    assert result["output_json"].get("report_task_id") == "report-task-id"
+
+    payload = inserted_payload["last"]
+    assert payload["operation_type"] == "oracle-report"
+    assert payload["assigned_to_agent_id"] == kronos_planner._HERMESREPORTER_AGENT_ID
+    assert payload["company_id"] == "comp-id-123"
+    assert payload["parent_task_id"] == "parent-task-id"
+    assert "RECIPIENT: marcelo.rosas@vectracargo.com.br" in payload["description"]
+    assert "semana-1-maio-26.ofx" in payload["description"]
+
+
+def test_categorize_only_does_NOT_create_oracle_report_task(tmp_path):
+    """Smoke iterativo (categorize-only) NÃO dispara e-mail — só rotina."""
+    from src.agents import kronos_planner
+
+    task = {"id": "t-categ", "company_id": "comp", "input_json": {}, "description": ""}
+    client = MagicMock()
+    fake_session = _make_mock_session()
+
+    async def fake_categorize(_session, _rules, **kw):
+        return {
+            "lines_categorized": 3,
+            "lines_unclassified": 0,
+            "lines_failed": 0,
+            "details": [],
+        }
+
+    with patch.object(
+        kronos_planner, "_load_categorization_rules", return_value=[MagicMock()]
+    ), patch.object(
+        kronos_planner, "KronosPlannerSession", return_value=fake_session
+    ), patch.object(
+        kronos_planner, "_categorize_pending_lines", side_effect=fake_categorize
+    ), patch.object(
+        kronos_planner, "_create_hermesreporter_task"
+    ) as mock_create:
+        kronos_planner.entrypoint_categorize_pendings(task, client)
+
+    mock_create.assert_not_called()
