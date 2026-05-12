@@ -590,7 +590,34 @@ async def _categorize_pending_lines(
             )
             break
 
-        row_data = await _read_row_data(row)
+        # VEC-423 fix: pin row com data-attr único antes de qualquer ação
+        # subsequente. Tabela do Meu Planner re-renderiza após save (Vue
+        # reactivity), invalidando o `tbody tr:not(...).nth(i)` Locator.
+        # Re-acquire via `tr[data-kronos-target="..."]` (selector estável).
+        marker = f"k{iteration}"
+        try:
+            await row.evaluate(
+                "(el, m) => el.setAttribute('data-kronos-target', m)",
+                marker,
+            )
+        except Exception as mark_exc:
+            logger.warning(
+                "categorize iter %d: falhou ao marcar row (%s) — pulando",
+                iteration,
+                mark_exc,
+            )
+            stats["lines_failed"] += 1
+            _append_detail(
+                stats,
+                {"desc": "(mark_failed)", "error": str(mark_exc)[:100]},
+            )
+            continue
+
+        pinned_row = page.locator(
+            f'tr[data-kronos-target="{marker}"]'
+        ).first
+
+        row_data = await _read_row_data(pinned_row)
         original_desc = row_data["desc"]
         enriched_desc = original_desc
 
@@ -613,7 +640,7 @@ async def _categorize_pending_lines(
         result = match_rule(enriched_desc, rules)
 
         if result is None:
-            await _mark_row(row, "skipped")
+            await _mark_row(pinned_row, "skipped")
             stats["lines_unclassified"] += 1
             detail: dict[str, Any] = {"desc": enriched_desc[:60], "action": "skipped"}
             if enriched_desc != original_desc:
@@ -622,7 +649,7 @@ async def _categorize_pending_lines(
             continue
 
         try:
-            await _apply_categorization_to_row(session, row, result)
+            await _apply_categorization_to_row(session, pinned_row, result)
             stats["lines_categorized"] += 1
             success_detail: dict[str, Any] = {
                 "desc": enriched_desc[:60],
@@ -645,13 +672,13 @@ async def _categorize_pending_lines(
             )
             # Tenta cancelar o edit caso tenha ficado aberto
             try:
-                cancel = row.locator('button[type="button"]:visible').first
+                cancel = pinned_row.locator('button[type="button"]:visible').first
                 if await cancel.count() > 0:
                     await cancel.click(timeout=1_000)
             except Exception:
                 pass
             try:
-                await _mark_row(row, "failed")
+                await _mark_row(pinned_row, "failed")
             except Exception:
                 pass
 
