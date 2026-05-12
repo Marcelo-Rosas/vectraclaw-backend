@@ -117,6 +117,34 @@ def entrypoint_planner_import(task: dict, supabase_client: Any) -> dict:
         }
 
 
+def entrypoint_categorize_pendings(task: dict, supabase_client: Any) -> dict:
+    """Handler sync para `operation_type='planner-categorize-pendings'`.
+
+    Roda **apenas** a categorização sobre linhas já existentes no Meu Planner
+    — sem reimportar OFX. Útil pra:
+    - Smoke iterativo após adicionar regras no YAML.
+    - Categorização retroativa de linhas antigas.
+    - Retry após falha parcial.
+
+    Inputs (via executionParams):
+    - `PDF_PATH` (opcional): caminho do extrato PDF pra enrichment.
+    """
+    try:
+        return asyncio.run(_run_categorize_only_async(task, supabase_client))
+    except Exception as exc:
+        logger.exception("entrypoint_categorize_pendings falhou")
+        return {
+            "status": "errored",
+            "error": str(exc),
+            "output_json": {
+                "error_detail": {
+                    "message": str(exc),
+                    "exception": type(exc).__name__,
+                }
+            },
+        }
+
+
 # ── Flow real ─────────────────────────────────────────────────────────────
 
 
@@ -227,6 +255,66 @@ async def _run_planner_import_async(
         output_json["categorization"] = categorization_stats
 
     return {"status": "done", "output_json": output_json}
+
+
+async def _run_categorize_only_async(
+    task: dict, supabase_client: Any
+) -> dict:
+    """Categorize-only flow: roda match_rule + apply via UI sobre as linhas
+    existentes em `/controle/lancamentos`. Sem reimportar OFX.
+
+    Reusa `KronosPlannerSession` + `_categorize_pending_lines` + PDF
+    enrichment opcional. Devolve `output_json.categorization` com stats.
+    """
+    task_id = task.get("id", "unknown")
+    inputs = resolve_kronos_inputs(task)
+
+    rules = _load_categorization_rules()
+    if not rules:
+        logger.info("task=%s: sem regras carregadas — done no-op", task_id)
+        return {
+            "status": "done",
+            "output_json": {
+                "reason": "no_rules",
+                "message": "kronos_category_rules.yaml vazio ou ausente",
+            },
+        }
+
+    pdf_lookup = _load_pdf_lookup(inputs.get("PDF_PATH"))
+
+    logger.info(
+        "task=%s: categorize-only — %d regras carregadas, PDF lookup=%s",
+        task_id,
+        len(rules),
+        "yes" if pdf_lookup else "no",
+    )
+
+    screenshot_path: Optional[str] = None
+    try:
+        async with KronosPlannerSession() as session:
+            page = session.page
+            assert page is not None, "KronosPlannerSession sem page ativa"
+
+            await page.goto(PLANNER_LANCAMENTOS_URL)
+            await session.dismiss_known_modals()
+            await session.wait_for_loading_overlay()
+
+            categorization_stats = await _categorize_pending_lines(
+                session, rules, pdf_lookup=pdf_lookup
+            )
+
+            shot = await session.screenshot("categorize-only")
+            screenshot_path = str(shot)
+    except KronosLoginFailed as exc:
+        return _errored(str(exc), exception="KronosLoginFailed")
+
+    return {
+        "status": "done",
+        "output_json": {
+            "categorization": categorization_stats,
+            "screenshot_path": screenshot_path,
+        },
+    }
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
