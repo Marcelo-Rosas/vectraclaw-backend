@@ -213,6 +213,7 @@ async def _run_planner_import_async(
             # fechado pra acessar as rows recém-importadas.
             await _dismiss_import_success_modal(session)
             await session.wait_for_loading_overlay()
+            await _wait_for_lancamentos_populated(session.page)
 
             # VEC-423: após import OK + modal fechado, categoriza linhas
             if rules:
@@ -298,6 +299,7 @@ async def _run_categorize_only_async(
             await page.goto(PLANNER_LANCAMENTOS_URL)
             await session.dismiss_known_modals()
             await session.wait_for_loading_overlay()
+            await _wait_for_lancamentos_populated(page)
 
             categorization_stats = await _categorize_pending_lines(
                 session, rules, pdf_lookup=pdf_lookup
@@ -792,6 +794,32 @@ def _is_uncategorized_cell(cat_text: str) -> bool:
 
 
 _LANCAMENTOS_TABLE_SELECTOR = "table.w-full"
+
+
+async def _wait_for_lancamentos_populated(page, timeout_ms: int = 15_000) -> bool:
+    """Aguarda a tabela de lançamentos receber a primeira row.
+
+    `wait_for_loading_overlay()` retorna assim que o overlay some, mas a
+    `table.w-full` pode ficar mais alguns segundos vazia enquanto Vue
+    popula via fetch. Sem este wait, o loop de categorização sai
+    imediatamente reportando `lines_categorized=0` mesmo com 30 linhas
+    pendentes na lista.
+
+    Retorna `True` se ao menos uma row apareceu; `False` se timeout
+    (caso legítimo: filtro de período vazio).
+    """
+    try:
+        await page.locator(
+            f"{_LANCAMENTOS_TABLE_SELECTOR} tbody tr"
+        ).first.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception as exc:
+        logger.info(
+            "lançamentos: tabela vazia após %dms (%s) — nada a categorizar",
+            timeout_ms,
+            type(exc).__name__,
+        )
+        return False
 
 
 async def _find_next_uncategorized_row(page):
