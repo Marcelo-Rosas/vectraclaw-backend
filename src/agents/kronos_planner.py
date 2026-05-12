@@ -55,12 +55,17 @@ PLANNER_LANCAMENTOS_URL = (
 # Botão de abrir o modal de import é um ícone com tooltip — texto não está
 # no DOM, só em `data-tip`. Usar o id estável é mais robusto.
 SELECTOR_IMPORT_BUTTON = "#import-file-btn"
-SELECTOR_IMPORT_MODAL_HEADING = 'h2:has-text("Importar Arquivo")'
-SELECTOR_INSTITUICAO_COMBOBOX = 'select[name="partitionId"]'
-SELECTOR_FILE_TYPE_STATEMENT = 'input[name="fileType"][value="statement"]'
-SELECTOR_FILE_EXTENSION_OFX = 'input[name="fileExtension"][value="ofx"]'
+# Todos os selectors do modal usam `:visible` porque o Meu Planner (Vue+
+# daisyUI) renderiza um container "fantasma" off-screen permanentemente,
+# além do modal ativo. `.first` sem `:visible` pegava o fantasma e dava
+# timeout em "element is not visible". Confirmado via DOM probe 2026-05-12.
+SELECTOR_IMPORT_MODAL_HEADING = 'h2:has-text("Importar Arquivo"):visible'
+SELECTOR_INSTITUICAO_COMBOBOX = 'select[name="partitionId"]:visible'
+SELECTOR_FILE_TYPE_STATEMENT = 'input[name="fileType"][value="statement"]:visible'
+SELECTOR_FILE_EXTENSION_OFX = 'input[name="fileExtension"][value="ofx"]:visible'
+# File input fica display:none por padrão (wrapper visual cuida) — não usar `:visible`.
 SELECTOR_FILE_INPUT = 'input[type="file"][accept*="ofx"]'
-SELECTOR_IMPORTAR_SUBMIT = 'button[type="submit"]:has-text("Importar")'
+SELECTOR_IMPORTAR_SUBMIT = 'button[type="submit"]:has-text("Importar"):visible'
 
 
 # ── Entry point (sync wrapper) ────────────────────────────────────────────
