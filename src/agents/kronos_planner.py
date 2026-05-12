@@ -167,10 +167,14 @@ async def _run_planner_import_async(
         async with KronosPlannerSession() as session:
             await _do_import_flow(session, target_file, instituicao)
             toast_text = await _capture_post_import_toast(session)
-            shot = await session.screenshot(f"import-{target_file.stem}")
-            screenshot_path = str(shot)
 
-            # VEC-423: após import OK, categoriza linhas com "Sem Categoria"
+            # VEC-423 fix: o Meu Planner mostra um modal "Importação realizada
+            # com sucesso!" sobrepondo a tabela. Categorize precisa dele
+            # fechado pra acessar as rows recém-importadas.
+            await _dismiss_import_success_modal(session)
+            await session.wait_for_loading_overlay()
+
+            # VEC-423: após import OK + modal fechado, categoriza linhas
             if rules:
                 try:
                     categorization_stats = await _categorize_pending_lines(
@@ -186,6 +190,10 @@ async def _run_planner_import_async(
                         "lines_failed": 0,
                         "error": str(exc)[:200],
                     }
+
+            # Screenshot DEPOIS da categorização (estado final)
+            shot = await session.screenshot(f"import-{target_file.stem}")
+            screenshot_path = str(shot)
     except KronosSaveTimeout as exc:
         return _errored(
             str(exc),
@@ -414,6 +422,58 @@ async def _capture_post_import_toast(
         return ""
 
 
+async def _dismiss_import_success_modal(session: KronosPlannerSession) -> None:
+    """Fecha o modal 'Importação realizada com sucesso!' que aparece após
+    `_do_import_flow` salvar o OFX.
+
+    Estratégias em ordem:
+    1. Botão `X` (close header).
+    2. Tecla Escape.
+    3. Best-effort log warning.
+
+    Não usar "Categorizar transações" — navega pra `/controle/pendencias`
+    que só tem 3 colunas (sem Categoria) e quebra a categorização inline.
+    """
+    page = session.page
+    assert page is not None
+
+    # Detecta presença do modal pelo heading
+    heading = page.locator(
+        'h2:has-text("Importação realizada com sucesso"):visible'
+    ).first
+    try:
+        if await heading.count() == 0:
+            return  # modal já não está aberto
+    except Exception:
+        return
+
+    # 1. Tenta botão X (close header — pattern daisyUI btn-circle)
+    try:
+        close_btn = page.locator(
+            'div:has(> h2:has-text("Importação realizada com sucesso")) button.btn-circle:visible'
+        ).first
+        if await close_btn.count() > 0:
+            await close_btn.click(timeout=2_000)
+            await heading.wait_for(state="hidden", timeout=3_000)
+            logger.debug("modal 'Importação realizada' fechado via X")
+            return
+    except PlaywrightTimeoutError:
+        logger.debug("close button X falhou, tentando Escape")
+    except Exception as exc:
+        logger.debug("close button X exception: %s", exc)
+
+    # 2. Fallback: Escape
+    try:
+        await page.keyboard.press("Escape")
+        await heading.wait_for(state="hidden", timeout=2_000)
+        logger.debug("modal 'Importação realizada' fechado via Escape")
+        return
+    except PlaywrightTimeoutError:
+        logger.warning(
+            "modal 'Importação realizada' não fechou após Escape — categorize pode falhar"
+        )
+
+
 # ── VEC-423: categorização inline pós-import ─────────────────────────
 
 
@@ -560,8 +620,26 @@ async def _categorize_pending_lines(
     return stats
 
 
+_UNCATEGORIZED_CATEGORIA_MARKERS = ("sem categoria", "**", "verificar")
+
+
+def _is_uncategorized_cell(cat_text: str) -> bool:
+    """Detecta se uma célula Categoria está marcada como não-categorizada.
+
+    Cobre 3 casos do Meu Planner:
+    - Texto vazio (placeholder default sem texto, só fundo vermelho)
+    - "Sem Categoria - Despesas" / "Sem Categoria - Receitas"
+    - Marker `**` ou "Verificar" (padrão histórico do usuário)
+    """
+    stripped = (cat_text or "").strip()
+    if not stripped:
+        return True
+    lowered = stripped.lower()
+    return any(marker in lowered for marker in _UNCATEGORIZED_CATEGORIA_MARKERS)
+
+
 async def _find_next_uncategorized_row(page):
-    """Encontra a próxima linha com Categoria 'Sem Categoria' não marcada.
+    """Encontra a próxima linha com Categoria não-categorizada e não marcada.
 
     Como o filtro `:not([data-kronos-processed])` deixa de fora as já tocadas
     nesta execução, o loop sempre avança.
@@ -579,7 +657,7 @@ async def _find_next_uncategorized_row(page):
         cat_text = (
             await cells.nth(_CATEGORIA_CELL_INDEX).text_content()
         ) or ""
-        if "sem categoria" in cat_text.strip().lower():
+        if _is_uncategorized_cell(cat_text):
             return row
     return None
 

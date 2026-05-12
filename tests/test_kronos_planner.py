@@ -532,6 +532,24 @@ def test_categorize_pending_lines_respects_max_lines():
     assert stats["lines_unclassified"] == 5
 
 
+def test_is_uncategorized_cell_detects_variants():
+    """Empty / 'Sem Categoria' / '**' / 'Verificar' devem ser uncategorized."""
+    from src.agents.kronos_planner import _is_uncategorized_cell
+
+    assert _is_uncategorized_cell("") is True
+    assert _is_uncategorized_cell("   ") is True
+    assert _is_uncategorized_cell("Sem Categoria - Despesas") is True
+    assert _is_uncategorized_cell("Sem Categoria - Receitas") is True
+    assert _is_uncategorized_cell("sem categoria") is True
+    assert _is_uncategorized_cell("**") is True
+    assert _is_uncategorized_cell("Verificar") is True
+
+    # Categorias válidas → False
+    assert _is_uncategorized_cell("Despesa Administrativa") is False
+    assert _is_uncategorized_cell("Despesas Pessoais") is False
+    assert _is_uncategorized_cell("Receita Operacional – Frete") is False
+
+
 def test_handler_includes_categorization_in_output(tmp_path):
     """Integration: handler completo com categorização mockada injetada."""
     from src.agents import kronos_planner
