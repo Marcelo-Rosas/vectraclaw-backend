@@ -791,14 +791,24 @@ def _is_uncategorized_cell(cat_text: str) -> bool:
     return any(marker in lowered for marker in _UNCATEGORIZED_CATEGORIA_MARKERS)
 
 
+_LANCAMENTOS_TABLE_SELECTOR = "table.w-full"
+
+
 async def _find_next_uncategorized_row(page):
     """Encontra a próxima linha com Categoria não-categorizada e não marcada.
 
     Como o filtro `:not([data-kronos-processed])` deixa de fora as já tocadas
     nesta execução, o loop sempre avança.
+
+    ⚠️ Importante: o seletor é qualificado por `table.w-full` para evitar
+    pegar rows do react-day-picker (`table.rdp-table`) que aparece quando o
+    seletor de período do filtro está aberto. Sem essa qualificação, as
+    primeiras `tbody tr` da página são células do calendário e o clique no
+    botão da última coluna acaba clicando em `<button name="day">` de um
+    dia, deixando o fluxo travado.
     """
     rows = page.locator(
-        'tbody tr:not([data-kronos-processed])'
+        f'{_LANCAMENTOS_TABLE_SELECTOR} tbody tr:not([data-kronos-processed])'
     )
     count = await rows.count()
     for i in range(count):
