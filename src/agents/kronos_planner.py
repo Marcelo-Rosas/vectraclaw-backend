@@ -64,6 +64,10 @@ logger = logging.getLogger("KronosPlanner")
 PLANNER_LANCAMENTOS_URL = (
     "https://web.meuplannerfinanceiro.com.br/controle/lancamentos"
 )
+# VEC-428: relatório SMTP pós-import via HermesReporter
+_HERMESREPORTER_AGENT_ID = "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"
+_DEFAULT_REPORT_RECIPIENT = "marcelo.rosas@vectracargo.com.br"
+
 # VEC-423: categorização inline pós-import
 _DEFAULT_RULES_PATH = Path(__file__).parent / "kronos_category_rules.yaml"
 _CATEGORIA_CELL_INDEX = 3       # 0-indexed: Categoria
@@ -262,6 +266,26 @@ async def _run_planner_import_async(
     if categorization_stats is not None:
         output_json["categorization"] = categorization_stats
 
+    # VEC-428: dispara relatório por e-mail via HermesReporter.
+    # Só roda no fluxo de import (rotina semanal); categorize-only não envia.
+    recipient = inputs.get("RECIPIENT") or _DEFAULT_REPORT_RECIPIENT
+    subject = f"Kronos — Lançamentos Meu Planner: {target_file.name}"
+    markdown = _build_kronos_report_markdown(
+        file_processed=target_file.name,
+        stats=categorization_stats,
+        screenshot_path=screenshot_path,
+        toast_text=toast_text,
+    )
+    report_task_id = _create_hermesreporter_task(
+        supabase_client,
+        parent_task=task,
+        recipient=recipient,
+        subject=subject,
+        markdown=markdown,
+    )
+    if report_task_id:
+        output_json["report_task_id"] = report_task_id
+
     return {"status": "done", "output_json": output_json}
 
 
@@ -350,6 +374,146 @@ def _write_cursor(
         update_routine_ofx_cursor(supabase_client, routine_id, basename)
     except Exception as exc:
         logger.warning("update_routine_ofx_cursor falhou: %s", exc)
+
+
+def _build_kronos_report_markdown(
+    file_processed: str,
+    stats: Optional[dict[str, Any]],
+    screenshot_path: Optional[str],
+    toast_text: str,
+) -> str:
+    """Constrói o markdown do relatório que vai pro HermesReporter.
+
+    Formato esperado pelo HermesReporter:
+    - Seção `## Resumo` com tabela markdown (vira tabela de badges no HTML).
+    - Demais `##` viram seções com tabelas ou parágrafos.
+    """
+    stats = stats or {}
+    details = stats.get("details") or []
+    cat = int(stats.get("lines_categorized", 0))
+    un = int(stats.get("lines_unclassified", 0))
+    failed = int(stats.get("lines_failed", 0))
+
+    categorized_rows: list[str] = []
+    pending_rows: list[str] = []
+    failed_rows: list[str] = []
+    for d in details:
+        desc = (d.get("desc") or "").strip()
+        if "categoria" in d:
+            categorized_rows.append(
+                f"| {desc} | {d.get('categoria', '')} | {d.get('subcategoria', '')} |"
+            )
+        elif d.get("action") == "skipped":
+            pending_rows.append(f"- {desc}")
+        elif "error" in d:
+            failed_rows.append(f"- {desc} — `{(d.get('error') or '')[:80]}`")
+
+    md_parts: list[str] = []
+    md_parts.append("## Resumo")
+    md_parts.append("")
+    md_parts.append("| Métrica | Valor |")
+    md_parts.append("|---------|-------|")
+    md_parts.append(f"| Arquivo OFX | {file_processed} |")
+    md_parts.append(
+        f"| Importação | {toast_text or 'sem confirmação de toast'} |"
+    )
+    md_parts.append(f"| Linhas categorizadas | {cat} |")
+    md_parts.append(f"| Linhas pendentes (sem regra) | {un} |")
+    md_parts.append(f"| Linhas com falha | {failed} |")
+    if screenshot_path:
+        md_parts.append(f"| Screenshot | {screenshot_path} |")
+    md_parts.append("")
+
+    if categorized_rows:
+        md_parts.append("## Categorizadas")
+        md_parts.append("")
+        md_parts.append("| Descrição | Categoria | Subcategoria |")
+        md_parts.append("|-----------|-----------|--------------|")
+        md_parts.extend(categorized_rows)
+        md_parts.append("")
+
+    if pending_rows:
+        md_parts.append("## Pendentes (sem regra no YAML)")
+        md_parts.append("")
+        md_parts.extend(pending_rows)
+        md_parts.append("")
+        md_parts.append(
+            "Adicione regras em `src/agents/kronos_category_rules.yaml` "
+            "para automatizar essas descrições na próxima rodada."
+        )
+        md_parts.append("")
+
+    if failed_rows:
+        md_parts.append("## Falhas")
+        md_parts.append("")
+        md_parts.extend(failed_rows)
+        md_parts.append("")
+
+    return "\n".join(md_parts)
+
+
+def _create_hermesreporter_task(
+    supabase_client: Any,
+    *,
+    parent_task: dict,
+    recipient: str,
+    subject: str,
+    markdown: str,
+) -> Optional[str]:
+    """Cria task derivada `oracle-report` para o HermesReporter enviar e-mail.
+
+    Retorna o `id` da task criada, ou `None` se falhar (não fatal).
+    """
+    if supabase_client is None:
+        logger.warning("supabase_client None — pulando criação de oracle-report")
+        return None
+
+    parent_task_id = parent_task.get("id")
+    company_id = parent_task.get("company_id")
+    if not company_id:
+        logger.warning("parent_task sem company_id — pulando oracle-report")
+        return None
+
+    description = (
+        f"RECIPIENT: {recipient}\n"
+        f"SUBJECT: {subject}\n"
+        f"PARENT_TASK_ID: {parent_task_id or '(sem id)'}\n"
+        f"\n"
+        f"---\n"
+        f"\n"
+        f"{markdown}"
+    )
+
+    payload = {
+        "company_id": company_id,
+        "assigned_to_agent_id": _HERMESREPORTER_AGENT_ID,
+        "title": subject,
+        "description": description,
+        "status": "queued",
+        "operation_type": "oracle-report",
+        "input_json": {
+            "parent_task_id": parent_task_id,
+            "source_agent": "Kronos",
+        },
+        "output_json": {},
+        "parent_task_id": parent_task_id,
+        "budget_limit": 0,
+        "spent": 0,
+        "cost_usd": 0,
+    }
+    try:
+        res = supabase_client.table("tasks").insert(payload).execute()
+        new_id = (res.data or [{}])[0].get("id")
+        logger.info(
+            "oracle-report task criada: id=%s recipient=%s subject=%s",
+            new_id,
+            recipient,
+            subject,
+        )
+        return new_id
+    except Exception as exc:
+        logger.warning("falha ao criar oracle-report task (não fatal): %s", exc)
+        return None
 
 
 def _pick_target_file(
