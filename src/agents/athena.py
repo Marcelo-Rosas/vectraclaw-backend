@@ -2496,7 +2496,7 @@ async def _handle_recommend(prompt: str, input_data: Dict[str, Any]) -> Dict[str
 
     try:
         from src.ws_manager import manager as _ws
-        await _ws.broadcast_company(company_id, {
+        await _ws.broadcast(company_id, {
             "type": "athena_recommendation_created",
             "recommendation_id": rec_id,
             "target_agent_id": target_agent_id,
