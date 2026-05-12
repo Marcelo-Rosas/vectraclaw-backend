@@ -49,6 +49,9 @@ revisao_duplo_asterisco_*.csv
 audit-results/
 audit-preview.html
 
+# --- Kronos browser session ---
+.kronos-browser-storage/
+
 # --- Supabase ephemeral ---
 supabase/.branches/
 supabase/.temp/
