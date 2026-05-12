@@ -517,6 +517,7 @@ class Routine(CamelModel):
     status: Literal["active", "paused", "error"]
     schedule: RoutineSchedule
     agent_id: Optional[str] = None
+    operation_type: Optional[str] = None
     metadata: Optional[dict] = None
     prompt_template: Optional[str] = None
     next_run_at: Optional[datetime] = None

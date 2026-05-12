@@ -77,7 +77,7 @@ def parse_ofx(path: str) -> list:
     """
     import io
     import re as _re
-    import ofxparse  # lazy import — evita custo na subida do daemon
+    import ofxparse  # pyright: ignore[reportMissingImports]  # lazy import — evita custo na subida do daemon
 
     with open(path, "rb") as f:
         raw = f.read()
@@ -106,6 +106,15 @@ def parse_ofx(path: str) -> list:
                 memo=str(t.memo or "").strip(),
             ))
     return txns
+
+
+def infer_period_from_ofx_path(path: str) -> tuple[str, str]:
+    """Deriva PERIODO_INICIO/FIM (YYYY-MM-DD) a partir das datas do extrato OFX."""
+    txns = scan_ofx_directory(path)
+    if not txns:
+        raise ValueError(f"Nenhuma transação OFX em {path}")
+    dates = sorted(txn.dtposted for txn in txns)
+    return dates[0].isoformat(), dates[-1].isoformat()
 
 
 def scan_ofx_directory(
@@ -168,7 +177,7 @@ def parse_planner_export(path: str) -> list:
     Colunas esperadas (case-insensitive, sem acentos):
       data, descricao, valor, tipo, categoria, subcategoria
     """
-    import pandas as pd  # lazy import
+    import pandas as pd  # pyright: ignore[reportMissingImports]  # lazy import — evita custo na subida do daemon
 
     p = Path(path)
     ext = p.suffix.lower()
@@ -1093,7 +1102,7 @@ def dispatch_to_hermes_reporter(
         if child_id:
             logger.info("Kronos: Hermes task via TaskFactory — id=%s", child_id)
         return child_id
-    except TaskFactoryError as exc:
+    except Exception as exc:
         logger.warning("Kronos TaskFactory failed, fallback insert: %s", exc)
     payload: dict = {
         "title": f"Audit Kronos {period_label} — enviar para {recipient}".strip(),
@@ -1129,16 +1138,112 @@ def _parse_env_line(desc: str, key: str, default: str = "") -> str:
     return m.group(1).strip() if m else default
 
 
+_KRONOS_INPUT_KEYS = (
+    "OFX_PATH",
+    "PLANNER_PATH",
+    "PERIODO_INICIO",
+    "PERIODO_FIM",
+    "RECIPIENT",
+    "APPLY_BAIXA",
+)
+
+# Parâmetros persistidos na rotina (template); APPLY_BAIXA fica só na task.
+KRONOS_ROUTINE_PARAM_KEYS = tuple(
+    key for key in _KRONOS_INPUT_KEYS if key != "APPLY_BAIXA"
+)
+
+
+def _normalize_kronos_input_key(key: str) -> str:
+    raw = str(key).strip()
+    if raw in _KRONOS_INPUT_KEYS:
+        return raw
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", raw).upper().replace("-", "_")
+    return snake if snake in _KRONOS_INPUT_KEYS else raw.upper()
+
+
+def resolve_kronos_inputs(task: dict) -> dict[str, str]:
+    """Resolve parâmetros Kronos de input_json, description e variáveis de ambiente."""
+    resolved: dict[str, str] = {}
+    input_json = task.get("input_json") or {}
+    if isinstance(input_json, dict):
+        for key, value in input_json.items():
+            if value is None:
+                continue
+            normalized = _normalize_kronos_input_key(key)
+            if normalized in _KRONOS_INPUT_KEYS:
+                resolved[normalized] = str(value).strip()
+
+    desc = task.get("description", "") or ""
+    for key in _KRONOS_INPUT_KEYS:
+        if not resolved.get(key):
+            value = _parse_env_line(desc, key)
+            if value:
+                resolved[key] = value
+
+    for key in _KRONOS_INPUT_KEYS:
+        if not resolved.get(key):
+            env_value = os.getenv(f"KRONOS_{key}") or (
+                os.getenv(key) if key in ("OFX_PATH", "PLANNER_PATH") else ""
+            )
+            if env_value:
+                resolved[key] = env_value.strip()
+
+    return resolved
+
+
+def extract_routine_execution_params(metadata: Optional[dict[str, Any]]) -> dict[str, str]:
+    """Extrai parâmetros Kronos persistidos em routines.metadata."""
+    if not isinstance(metadata, dict):
+        return {}
+    params: dict[str, str] = {}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        normalized = _normalize_kronos_input_key(key)
+        if normalized in KRONOS_ROUTINE_PARAM_KEYS:
+            params[normalized] = str(value).strip()
+    return params
+
+
+def merge_routine_execution_params(
+    metadata: Optional[dict[str, Any]],
+    execution_params: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Mescla executionParams do editor de rotina em routines.metadata."""
+    merged: dict[str, Any] = dict(metadata) if isinstance(metadata, dict) else {}
+    if not isinstance(execution_params, dict):
+        return merged
+    for key, value in execution_params.items():
+        normalized = _normalize_kronos_input_key(key)
+        if normalized not in KRONOS_ROUTINE_PARAM_KEYS:
+            continue
+        if value is None or str(value).strip() == "":
+            merged.pop(normalized, None)
+            merged.pop(key, None)
+            continue
+        merged[normalized] = str(value).strip()
+    return merged
+
+
+def build_kronos_input_json(
+    description: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, str]:
+    """Monta input_json de task Kronos a partir da rotina (metadata + prompt)."""
+    source: dict[str, Any] = extract_routine_execution_params(metadata)
+    return resolve_kronos_inputs({"description": description, "input_json": source})
+
+
 def entrypoint(task: dict, supabase_client: Any) -> dict:
     """Ponto de entrada chamado pelo agent_daemon para operation_type='financial-audit'."""
-    desc = task.get("description", "")
     task_id = task.get("id", "unknown")
     company_id = task.get("company_id", "")
+    inputs = resolve_kronos_inputs(task)
 
-    ofx_path     = _parse_env_line(desc, "OFX_PATH")
-    planner_path = _parse_env_line(desc, "PLANNER_PATH")
-    recipient    = _parse_env_line(desc, "RECIPIENT", DEFAULT_RECIPIENT)
-    apply_baixa  = _parse_env_line(desc, "APPLY_BAIXA", "false").lower() in ("true", "1", "yes")
+    ofx_path     = inputs.get("OFX_PATH", "")
+    planner_path = inputs.get("PLANNER_PATH", "")
+    recipient    = inputs.get("RECIPIENT", DEFAULT_RECIPIENT)
+    apply_baixa  = inputs.get("APPLY_BAIXA", "false").lower() in ("true", "1", "yes")
 
     if not ofx_path or not planner_path:
         msg = "Kronos: OFX_PATH e/ou PLANNER_PATH ausentes na descrição da task."
@@ -1264,13 +1369,12 @@ def entrypoint_backlog(task: dict, supabase_client: Any) -> dict:
       - Retorna {"output_json": {"phase": "baixas_applied", ...}}
     """
     input_json = task.get("input_json") or {}
-    inp = {k.upper(): v for k, v in input_json.items()}  # normaliza para MAIÚSCULO
-    desc = task.get("description", "")
+    inputs = resolve_kronos_inputs(task)
 
-    ofx_path       = inp.get("OFX_PATH")       or _parse_env_line(desc, "OFX_PATH")
-    periodo_inicio = inp.get("PERIODO_INICIO")  or _parse_env_line(desc, "PERIODO_INICIO")
-    periodo_fim    = inp.get("PERIODO_FIM")     or _parse_env_line(desc, "PERIODO_FIM")
-    recipient      = inp.get("RECIPIENT")       or _parse_env_line(desc, "RECIPIENT", DEFAULT_RECIPIENT)
+    ofx_path       = inputs.get("OFX_PATH", "")
+    periodo_inicio = inputs.get("PERIODO_INICIO", "")
+    periodo_fim    = inputs.get("PERIODO_FIM", "")
+    recipient      = inputs.get("RECIPIENT", DEFAULT_RECIPIENT)
     task_id        = task.get("id", "unknown")
     company_id     = task.get("company_id", "")
 
@@ -1315,14 +1419,26 @@ def entrypoint_backlog(task: dict, supabase_client: Any) -> dict:
 
     # Validações obrigatórias
     if not ofx_path:
-        msg = "entrypoint_backlog: OFX_PATH ausente"
+        msg = (
+            "entrypoint_backlog: OFX_PATH ausente "
+            "(informe em input_json, metadata da rotina, description ou KRONOS_OFX_PATH)"
+        )
         logger.error(msg)
         return {"status": "errored", "error": msg}
 
     if not periodo_inicio or not periodo_fim:
-        msg = "entrypoint_backlog: PERIODO_INICIO e/ou PERIODO_FIM ausentes"
-        logger.error(msg)
-        return {"status": "errored", "error": msg}
+        try:
+            periodo_inicio, periodo_fim = infer_period_from_ofx_path(ofx_path)
+            logger.info(
+                "entrypoint_backlog: período inferido do OFX %s → %s a %s",
+                ofx_path,
+                periodo_inicio,
+                periodo_fim,
+            )
+        except Exception as exc:
+            msg = f"entrypoint_backlog: PERIODO_INICIO/FIM ausentes e inferência falhou: {exc}"
+            logger.error(msg)
+            return {"status": "errored", "error": msg}
 
     # 1. Scrape MPF
     try:

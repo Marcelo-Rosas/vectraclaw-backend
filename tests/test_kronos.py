@@ -10,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
+import pytest  # pyright: ignore[reportMissingImports]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ def test_parse_planner_csv():
 def test_parse_planner_xlsx():
     pytest.importorskip("pandas")
     pytest.importorskip("openpyxl")
-    import pandas as pd
+    import pandas as pd  # pyright: ignore[reportMissingImports]
     from src.agents.kronos import parse_planner_export
 
     df = pd.DataFrame({
@@ -275,3 +275,48 @@ def test_dispatch_to_hermes_reporter_creates_task():
     assert call_args["assigned_to_agent_id"] == HERMES_REPORTER_UUID
     assert call_args["status"] == "queued"
     assert "RECIPIENT: marcelo.rosas@vectracargo.com.br" in call_args["description"]
+
+
+def test_resolve_kronos_inputs_prefers_input_json_over_description():
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "input_json": {"OFX_PATH": r"C:\ofx\abril.ofx"},
+        "description": "OFX_PATH=C:\\ofx\\fallback.ofx",
+    })
+
+    assert inputs["OFX_PATH"] == r"C:\ofx\abril.ofx"
+
+
+def test_build_kronos_input_json_reads_routine_metadata():
+    from src.agents.kronos import build_kronos_input_json
+
+    inputs = build_kronos_input_json(
+        description="Conciliação mensal",
+        metadata={"ofxPath": r"C:\Users\marce\OFX-C6"},
+    )
+
+    assert inputs["OFX_PATH"] == r"C:\Users\marce\OFX-C6"
+
+
+def test_merge_routine_execution_params_updates_metadata():
+    from src.agents.kronos import merge_routine_execution_params
+
+    merged = merge_routine_execution_params(
+        {"blueprint": "kronos_backlog"},
+        {"OFX_PATH": r"C:\Users\marce\OFX-C6", "RECIPIENT": "ops@example.com"},
+    )
+
+    assert merged["blueprint"] == "kronos_backlog"
+    assert merged["OFX_PATH"] == r"C:\Users\marce\OFX-C6"
+    assert merged["RECIPIENT"] == "ops@example.com"
+
+
+def test_extract_routine_execution_params_ignores_apply_baixa():
+    from src.agents.kronos import extract_routine_execution_params
+
+    params = extract_routine_execution_params(
+        {"OFX_PATH": r"C:\ofx", "APPLY_BAIXA": "true", "blueprint": "x"},
+    )
+
+    assert params == {"OFX_PATH": r"C:\ofx"}
