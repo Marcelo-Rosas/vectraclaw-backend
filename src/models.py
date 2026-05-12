@@ -130,6 +130,9 @@ class Task(CamelModel):
         "athena-audit",
         "athena-recommend",
         "athena-prioritize",
+        # VEC-416: Kronos pivot — Meu Planner Financeiro via Playwright
+        "planner-import-ofx",
+        "planner-categorize-pendings",
         "other",
     ] = "other"
     budget_limit: int

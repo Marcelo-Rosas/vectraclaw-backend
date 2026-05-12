@@ -3291,6 +3291,7 @@ _KRONOS_ROUTINE_OPERATIONS = (
     "financial-bookkeeping",
     "conciliacao-backlog",
     "planner-import-ofx",
+    "planner-categorize-pendings",
 )
 
 
