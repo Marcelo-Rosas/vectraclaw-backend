@@ -71,8 +71,15 @@ _SUBCATEGORIA_CELL_INDEX = 4    # 0-indexed: Subcategoria
 _DESC_CELL_INDEX = 7            # 0-indexed: Descrição
 _DATA_EVENTO_CELL_INDEX = 1     # 0-indexed: Data do evento
 _VALOR_CELL_INDEX = 8           # 0-indexed: Valor
-_SELECT_CATEGORY = 'select[name="category"]'
-_SELECT_SUBCATEGORY = 'select[name="subcategory"]'
+_SELECT_CATEGORY = 'select#category'
+_SELECT_SUBCATEGORY = 'select#subcategory'
+# VEC-426 fix #3: quando o user clica no edit-btn, Vue substitui a <tr>
+# original por uma TR especial com a class abaixo, que contém os <select>
+# de categoria/subcategoria/status/etc. Os `id`s dos selects são estáveis
+# (`category`, `subcategory`, ...). Como a TR original é destruída no
+# swap, o `pinned_row.locator(...)` antigo falhava — precisa buscar na
+# edit row global.
+_EDIT_ROW_SELECTOR = "tr.EditTransactionRow_editRow__fNWmG"
 _MAX_CATEGORIZE_LINES = 200
 _CATEGORIZATION_DETAILS_CAP = 30  # output_json fica enxuto
 # Botão de abrir o modal de import é um ícone com tooltip — texto não está
@@ -760,11 +767,21 @@ async def _categorize_pending_lines(
             _append_detail(
                 stats, {"desc": enriched_desc[:60], "error": str(exc)[:100]}
             )
-            # Tenta cancelar o edit caso tenha ficado aberto
+            # Cleanup: cancel edit-row global (não na pinned_row, que pode ter
+            # sido destruída no swap Vue → edit-row)
             try:
-                cancel = pinned_row.locator('button[type="button"]:visible').first
+                cancel = page.locator(
+                    f'{_EDIT_ROW_SELECTOR} button[type="button"]'
+                ).first
                 if await cancel.count() > 0:
-                    await cancel.click(timeout=1_000)
+                    await cancel.click(timeout=2_000)
+                # Confirma que a edit-row sumiu antes de continuar
+                try:
+                    await page.locator(_EDIT_ROW_SELECTOR).first.wait_for(
+                        state="hidden", timeout=3_000
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:
@@ -940,45 +957,56 @@ async def _apply_categorization_to_row(
     result: MatchResult,
 ) -> None:
     """Entra em edit mode, seta categoria + subcategoria, submete, aguarda
-    toast. Marca row processada ao final.
+    save. Opera na edit-row criada pelo Vue após o click.
+
+    ⚠️ Após click no edit-btn, Vue REMOVE a `row` original do DOM e
+    insere uma `tr.EditTransactionRow_editRow__fNWmG` no lugar. Logo, a
+    partir do step 2 toda busca DEVE ser feita em `page` (com filtro
+    pela edit row), não em `row` (Locator stale).
     """
     page = session.page
     assert page is not None
 
-    # 1. Clicar no edit (último td)
+    # 1. Clicar no edit (último td) — row ainda existe aqui
     cells = row.locator("td")
     ncells = await cells.count()
     edit_btn = cells.nth(ncells - 1).locator("button").first
     await edit_btn.click()
 
-    # 2. Aguardar select category aparecer DENTRO da row
-    cat_select = row.locator(_SELECT_CATEGORY).first
-    await cat_select.wait_for(state="visible", timeout=5_000)
+    # 2. Aguardar a edit-row (substituta) aparecer
+    edit_row = page.locator(_EDIT_ROW_SELECTOR).first
+    await edit_row.wait_for(state="visible", timeout=5_000)
 
-    # 3. Aplicar categoria
+    # 3. Aplicar categoria — select#category dentro da edit-row
+    cat_select = edit_row.locator(_SELECT_CATEGORY).first
+    await cat_select.wait_for(state="visible", timeout=5_000)
     await _set_select_by_label(cat_select, result.categoria)
 
-    # 4. Aguardar subcategoria repopular (delay curto cobre 95%)
+    # 4. Aguardar subcategoria repopular (Vue reactivity)
     await asyncio.sleep(0.5)
-
-    sub_select = row.locator(_SELECT_SUBCATEGORY).first
+    sub_select = edit_row.locator(_SELECT_SUBCATEGORY).first
     await sub_select.wait_for(state="visible", timeout=5_000)
 
     # 5. Aplicar subcategoria
     await _set_select_by_label(sub_select, result.subcategoria)
 
-    # 6. Submit (último td, type=submit)
-    submit_btn = row.locator('button[type="submit"]:visible').first
+    # 6. Submit (último td da edit-row, type=submit)
+    submit_btn = edit_row.locator('button[type="submit"]').first
     await submit_btn.click()
 
-    # 7. Aguarda toast de sucesso (ou ignora se ausente — modal saindo do edit já é sinal)
+    # 7. Aguarda save: edit-row some quando Vue volta pra display row
     try:
-        await session.wait_for_save_toast(timeout=5_000)
-    except KronosSaveTimeout:
-        logger.debug("categorize: sem toast de success — ignorando")
+        await edit_row.wait_for(state="hidden", timeout=10_000)
+    except Exception:
+        # Toast pode aparecer antes de a edit-row sumir; tenta toast
+        try:
+            await session.wait_for_save_toast(timeout=3_000)
+        except KronosSaveTimeout:
+            logger.debug("categorize: sem toast nem edit-row hidden — best-effort OK")
 
-    # 8. Marca como processada
-    await _mark_row(row, "categorized")
+    # Não chama `_mark_row(row, ...)` aqui: a `row` original foi
+    # destruída no swap. O loop confia em `_is_uncategorized_cell`
+    # (categoria deixa de ser pendente após save) para não revisitar.
 
 
 def _append_detail(stats: dict[str, Any], entry: dict[str, Any]) -> None:
