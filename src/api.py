@@ -28,7 +28,7 @@ from postgrest.exceptions import APIError as PostgrestAPIError
 from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
-    AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, Routine,
+    AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentDomain, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
     Project, Run, RunTranscriptEntry,
 )
@@ -6287,6 +6287,32 @@ async def delete_llm_model(request: Request, model_id: str):
         return Response(status_code=204)
     except Exception as e:
         logger.error(f"delete_llm_model failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/agent-domains")
+@app.get("/agent-domains")
+async def list_agent_domains(request: Request):
+    """PR-DB — catálogo canônico de domínios (substitui texto livre).
+
+    Lido pela tab Skills (agrupar specialties por domínio) e pelo NAV ADMIN
+    (filtros + dropdowns nos formulários de specialty). Retorna apenas
+    domains ativos, ordenados por `display_order`.
+    """
+    if not supabase:
+        # Mock fallback: lista vazia em dev sem Supabase
+        return []
+    try:
+        res = (
+            supabase.table("agent_domains")
+            .select("id,name,description,icon,color,display_order,is_active")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        return [AgentDomain(**row).to_zod_dict() for row in (res.data or [])]
+    except Exception as e:
+        logger.error(f"list_agent_domains failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
