@@ -352,6 +352,57 @@ class ResilientHarnessDaemon:
         except Exception as e:
             logger.warning(f"_complete_task failed task={task_id}: {e}")
 
+    def _populate_resolved_specialty(self, task: Dict[str, Any]) -> None:
+        """VEC-XXX PR3 — Anexa specialty + config resolvidos em `task`.
+
+        Atribui dois campos para os handlers consultarem:
+        - `task["_resolved_specialty"]`: ResolvedSpecialty | None
+        - `task["_resolved_config"]`: dict (values de agent_specialty_configs)
+
+        Match: slug da specialty == operation_type da task (ver
+        `services.specialty_resolver`). Falha silenciosa — handler que não
+        encontre `_resolved_*` segue com fallback legado (`task.description`
+        em KEY=VALUE, `agents.system_prompt`).
+        """
+        op_type = task.get("operation_type")
+        if not self.agent_id or not op_type:
+            return
+
+        client = self._get_supabase()
+        if not client:
+            return
+
+        try:
+            from src.services.specialty_resolver import (
+                resolve_config,
+                resolve_specialty,
+            )
+
+            spec = resolve_specialty(client, self.agent_id, op_type)
+            if spec is None:
+                return
+
+            company_id = task.get("company_id") or self._agent_config.get("company_id")
+            values = resolve_config(
+                client, self.agent_id, spec.id, company_id=company_id
+            )
+
+            task["_resolved_specialty"] = spec
+            task["_resolved_config"] = values
+            logger.info(
+                "specialty resolved task=%s op=%s slug=%s config_keys=%s",
+                task.get("id"),
+                op_type,
+                spec.slug,
+                list(values.keys()),
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-quiet por design
+            logger.warning(
+                "_populate_resolved_specialty failed task=%s: %s",
+                task.get("id"),
+                exc,
+            )
+
     def execute_task(self, task: dict) -> str:
         import asyncio
         import json as _json
@@ -359,6 +410,11 @@ class ResilientHarnessDaemon:
         op_type = task.get("operation_type", "other")
         task_id = task.get("id", "?")
         logger.info("execute_task: id=%s op_type=%s", task_id, op_type)
+
+        # VEC-XXX PR3 — resolve specialty + config antes do dispatch.
+        # Handlers que ignorarem `task["_resolved_*"]` seguem funcionando
+        # com seu fluxo legado (backcompat 100%).
+        self._populate_resolved_specialty(task)
 
         # Deterministic branches for native Python agents
         if op_type == "financial-audit":
