@@ -288,6 +288,100 @@ def test_resolve_kronos_inputs_prefers_input_json_over_description():
     assert inputs["OFX_PATH"] == r"C:\ofx\abril.ofx"
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# VEC-XXX PR4 — _resolved_config (specialty config) tem maior precedência
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_resolve_kronos_inputs_prefers_resolved_config_over_input_json():
+    """specialty config (PR3 hook) > input_json > description > env."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_config": {"ofx_path": r"C:\ofx\specialty.ofx"},
+        "input_json": {"OFX_PATH": r"C:\ofx\input_json.ofx"},
+        "description": "OFX_PATH=C:\\ofx\\desc.ofx",
+    })
+
+    assert inputs["OFX_PATH"] == r"C:\ofx\specialty.ofx"
+
+
+def test_resolve_kronos_inputs_normalizes_snake_case_from_resolved_config():
+    """`agent_specialties.config_schema` usa snake_case (JSON Schema). Resolver
+    deve normalizar para UPPER_SNAKE consumido internamente."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_config": {
+            "ofx_path": "/data/abril.ofx",
+            "recipient": "ops@vectra.com",
+            "planner_instituicao": "C6",
+        },
+    })
+
+    assert inputs["OFX_PATH"] == "/data/abril.ofx"
+    assert inputs["RECIPIENT"] == "ops@vectra.com"
+    assert inputs["PLANNER_INSTITUICAO"] == "C6"
+
+
+def test_resolve_kronos_inputs_resolved_config_partial_fallback_to_input_json():
+    """specialty config preenche o que tem; resto cai pro input_json/desc/env."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_config": {"ofx_path": "/data/abril.ofx"},
+        "input_json": {"RECIPIENT": "ops@vectra.com"},
+        "description": "PERIODO_INICIO=2026-04-01",
+    })
+
+    assert inputs["OFX_PATH"] == "/data/abril.ofx"      # specialty
+    assert inputs["RECIPIENT"] == "ops@vectra.com"       # input_json
+    assert inputs["PERIODO_INICIO"] == "2026-04-01"      # description
+
+
+def test_resolve_kronos_inputs_resolved_config_none_value_skipped():
+    """None em `_resolved_config[key]` deve cair pro próximo nível."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_config": {"ofx_path": None},
+        "input_json": {"OFX_PATH": "/from-input.ofx"},
+    })
+
+    assert inputs["OFX_PATH"] == "/from-input.ofx"
+
+
+def test_resolve_kronos_inputs_backcompat_no_resolved_config():
+    """Tasks sem `_resolved_config` (legacy) seguem cadeia antiga sem mudança."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "input_json": {"OFX_PATH": r"C:\ofx\abril.ofx"},
+        "description": "RECIPIENT=fallback@x.com",
+    })
+
+    assert inputs["OFX_PATH"] == r"C:\ofx\abril.ofx"
+    assert inputs["RECIPIENT"] == "fallback@x.com"
+    assert "_resolved_config" not in inputs  # internal field não vaza
+
+
+def test_resolve_kronos_inputs_resolved_config_ignores_unknown_keys():
+    """Chaves fora de _KRONOS_INPUT_KEYS não devem virar entradas espúrias."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_config": {
+            "ofx_path": "/data/x.ofx",
+            "completely_unknown_field": "ignore me",
+            "downloads_dir": "/downloads",  # não é _KRONOS_INPUT_KEYS
+        },
+    })
+
+    assert inputs["OFX_PATH"] == "/data/x.ofx"
+    assert "completely_unknown_field" not in inputs
+    assert "DOWNLOADS_DIR" not in inputs
+
+
 def test_build_kronos_input_json_reads_routine_metadata():
     from src.agents.kronos import build_kronos_input_json
 
