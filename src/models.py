@@ -722,11 +722,41 @@ class AgentSpecialtyConfig(CamelModel):
     created_at: datetime
     updated_at: datetime
 
+
+class AgentSharedConfig(CamelModel):
+    """Modelo C — PR-A/B: campos compartilhados entre specialties do agente.
+
+    1 row por (company_id, agent_id). Substitui duplicação de fields
+    `ofx_path`, `recipient`, `pdf_path`, `planner_instituicao` entre as
+    specialties do Kronos (e padrão para os demais agentes futuramente).
+
+    Cadeia de precedência no resolver (PR-C):
+        payload (task.input_json)
+            > specialty.values
+            > agent_shared_config.values   ← este model
+            > task.description KEY=VALUE
+            > env vars
+
+    `schema_` é o nome Python (sufixo evita colisão com BaseModel.schema()).
+    O CamelModel.alias_generator converte automaticamente `schema_` → `schema`
+    para entrada/saída JSON, alinhado com a coluna jsonb `schema` no DB.
+    """
+
+    id: str
+    company_id: str
+    agent_id: str
+    values: Dict[str, Any]
+    schema_: List[Dict[str, Any]] = []
+    created_at: datetime
+    updated_at: datetime
+
     def to_zod_dict(self):
         d = self.dict(by_alias=True)
-        d["updatedAt"] = self.updated_at.isoformat().replace("+00:00", "Z")
-        d.pop("createdAt", None)
-        d.pop("companyId", None)
+        # `schema` jsonb pode vir None do DB se não foi seedado
+        if d.get("schema") is None:
+            d["schema"] = []
+        if d.get("values") is None:
+            d["values"] = {}
         return d
 
 

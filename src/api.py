@@ -28,7 +28,8 @@ from postgrest.exceptions import APIError as PostgrestAPIError
 from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
-    AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentDomain, Routine,
+    AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
+    AgentDomain, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
     Project, Run, RunTranscriptEntry,
 )
@@ -4453,6 +4454,126 @@ async def put_agent_specialty_config(request: Request, agent_id: str, payload: S
         raise
     except Exception as e:
         logger.error(f"put_agent_specialty_config failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/agents/{agent_id}/shared-config")
+@app.get("/agents/{agent_id}/shared-config")
+async def get_agent_shared_config(request: Request, agent_id: str):
+    """Modelo C — PR-B: campos compartilhados entre specialties do agente.
+
+    Retorna a row de `agent_shared_config` para (company_id, agent_id). Se
+    a row ainda não existe, devolve estrutura vazia com `schema=[]` e
+    `values={}` — frontend renderiza o form em branco e o save subsequente
+    cria a row.
+    """
+    if not supabase:
+        # Mock dev: vazio
+        return {
+            "id": "",
+            "companyId": "",
+            "agentId": agent_id,
+            "values": {},
+            "schema": [],
+            "createdAt": None,
+            "updatedAt": None,
+        }
+
+    try:
+        caller_company = _resolve_company_id(request)
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("agent_shared_config")
+            .select("*")
+            .eq("agent_id", agent_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return {
+                "id": "",
+                "companyId": caller_company or "",
+                "agentId": agent_id,
+                "values": {},
+                "schema": [],
+                "createdAt": None,
+                "updatedAt": None,
+            }
+        row = res.data[0]
+        if caller_company and row.get("company_id") and str(row["company_id"]) != str(caller_company):
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+        return AgentSharedConfig(**row).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_agent_shared_config failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SaveAgentSharedConfigInput(BaseModel):
+    """PUT payload: usuário envia apenas `values` (preenchimento do form).
+    Schema é seedado por migration e não editável pela UI (read-only)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+    values: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.put("/api/agents/{agent_id}/shared-config")
+@app.put("/agents/{agent_id}/shared-config")
+async def put_agent_shared_config(
+    request: Request, agent_id: str, payload: SaveAgentSharedConfigInput
+):
+    """Upsert de `values` na agent_shared_config. Schema é read-only
+    (definido por migration). Se a row não existir, cria com schema=[]
+    e values=payload — pra evitar quebrar, o ideal é que a migration
+    PR-A já tenha seedado a row com schema vazio se for um agent novo.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if not supabase:
+        return {
+            "id": "tmp",
+            "companyId": "",
+            "agentId": agent_id,
+            "values": payload.values,
+            "schema": [],
+            "createdAt": now_iso,
+            "updatedAt": now_iso,
+        }
+
+    try:
+        caller_company = _resolve_company_id(request)
+        agent_row = supabase.table("agents").select("id,company_id").eq("id", agent_id).limit(1).execute()
+        if not agent_row.data:
+            raise HTTPException(status_code=404, detail="agent_not_found")
+
+        agent_company = agent_row.data[0]["company_id"]
+        if caller_company and str(agent_company) != str(caller_company):
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+
+        # Upsert preservando schema existente (não toca schema via PUT — só values)
+        row_payload = {
+            "company_id": agent_company,
+            "agent_id": agent_id,
+            "values": payload.values,
+            "updated_at": now_iso,
+        }
+
+        res = (
+            supabase.table("agent_shared_config")
+            .upsert(row_payload, on_conflict="company_id,agent_id")
+            .execute()
+        )
+
+        if not res.data:
+            logger.error(f"put_agent_shared_config: upsert returned no data for agent {agent_id}")
+            raise HTTPException(status_code=500, detail="database_upsert_failed")
+
+        return AgentSharedConfig(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"put_agent_shared_config failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
