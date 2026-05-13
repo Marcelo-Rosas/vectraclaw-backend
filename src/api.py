@@ -29,7 +29,7 @@ from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
-    AgentDomain, AgentExecutionMode, Routine,
+    AgentDomain, AgentExecutionMode, WorkflowLogicPattern, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
     Project, Run, RunTranscriptEntry,
 )
@@ -6474,6 +6474,39 @@ async def list_agent_domains(request: Request):
         return [AgentDomain(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_agent_domains failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/workflow-logic-patterns")
+@app.get("/workflow-logic-patterns")
+async def list_workflow_logic_patterns(request: Request):
+    """Task #49 — catálogo canônico de logic_patterns para workflow_steps.
+
+    Espelha os 8 patterns (7 do FlowLogic.tsx + SIMPLE default) que
+    alimentam: tela /flow-logic (catálogo educativo), Tab Orquestração no
+    form Nova Etapa (#48 frontend) e FK em workflow_steps.logic_pattern.
+
+    Read-only para todos; mutações via migration apenas. Retorna patterns
+    ativos ordenados por `display_order`.
+    """
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("workflow_logic_patterns")
+            .select(
+                "id,category,taxonomy,name,description,heuristics,icon,color,"
+                "display_order,json_skeleton,engine_handler,is_active"
+            )
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        return [
+            WorkflowLogicPattern(**row).to_zod_dict() for row in (res.data or [])
+        ]
+    except Exception as e:
+        logger.error(f"list_workflow_logic_patterns failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
