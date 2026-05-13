@@ -90,9 +90,13 @@ rules:
   categoria: Custos Operacionais - Frete e Transporte
   subcategoria: 'Frete - Adiantamento de Frete'
 - pattern: Pix enviado para DIEGO ADRIANO ALVES
-  # Diego: motorista — saldo de frete (acerto pós-viagem)
-  categoria: Custos Operacionais - Frete e Transporte
-  subcategoria: 'Frete - Saldo de Frete'
+  # Diego: motorista agregado/frota terceira — saldo de frete pós-viagem.
+  # User confirmou em 2026-05-12 que 'Saldo de Frete' mora nesta categoria
+  # mãe específica (não em 'Custos Operacionais - Frete e Transporte').
+  # Pattern de label da categoria segue o já usado em rules de bootstrap:
+  # 'Frete Agregado – X' (com em-dash).
+  categoria: Custos Operacionais - Frete (agregado/frota terceira)
+  subcategoria: 'Frete Agregado – Saldo de Frete'
 - pattern: Pix enviado para CAMILLA AZEVEDO SERRAN VIEIRA
   # Camilla: uso pessoal (familiar)
   categoria: Despesas Pessoais
