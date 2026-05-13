@@ -713,6 +713,34 @@ class AgentDomain(CamelModel):
         return d
 
 
+class AgentExecutionMode(CamelModel):
+    """PR-EA/EB — catálogo canônico de modos de execução.
+
+    Substitui CHECK hardcoded `('REALTIME','CRON','TRIGGER')` por tabela
+    com `config_schema` declarado por modo (field descriptors). UI da tab
+    Configuration lê e renderiza form condicional: ao selecionar modo, lê
+    `config_schema` daquele modo e renderiza os campos filhos.
+    """
+
+    id: str
+    name: str
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    display_order: int = 100
+    config_schema: List[Dict[str, Any]] = []
+    is_active: bool = True
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        for key in ("description", "icon", "color"):
+            if d.get(key) is None:
+                d[key] = ""
+        if d.get("configSchema") is None:
+            d["configSchema"] = []
+        return d
+
+
 class AgentSpecialtyConfig(CamelModel):
     id: str
     company_id: str
