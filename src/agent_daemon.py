@@ -353,23 +353,45 @@ class ResilientHarnessDaemon:
             logger.warning(f"_complete_task failed task={task_id}: {e}")
 
     def _populate_resolved_specialty(self, task: Dict[str, Any]) -> None:
-        """VEC-XXX PR3 — Anexa specialty + config resolvidos em `task`.
+        """PR3 + PR-C — Anexa specialty + configs (specialty + shared) em `task`.
 
-        Atribui dois campos para os handlers consultarem:
+        Atribui três campos para os handlers consultarem:
         - `task["_resolved_specialty"]`: ResolvedSpecialty | None
-        - `task["_resolved_config"]`: dict (values de agent_specialty_configs)
+        - `task["_resolved_config"]`:    dict (agent_specialty_configs.values)
+        - `task["_resolved_shared"]`:    dict (agent_shared_config.values — PR-C)
 
-        Match: slug da specialty == operation_type da task (ver
-        `services.specialty_resolver`). Falha silenciosa — handler que não
-        encontre `_resolved_*` segue com fallback legado (`task.description`
-        em KEY=VALUE, `agents.system_prompt`).
+        Match da specialty: slug == operation_type da task. Shared NÃO depende
+        de match — é populado mesmo sem specialty match (defaults do agente
+        independentes do skill).
+
+        Falha silenciosa — handler que não encontre `_resolved_*` segue com
+        fallback legado (`task.description` em KEY=VALUE).
         """
-        op_type = task.get("operation_type")
-        if not self.agent_id or not op_type:
+        if not self.agent_id:
             return
 
         client = self._get_supabase()
         if not client:
+            return
+
+        company_id = task.get("company_id") or self._agent_config.get("company_id")
+
+        # 1. Shared config sempre populado (defaults do agente)
+        try:
+            from src.services.specialty_resolver import resolve_shared_config
+
+            shared = resolve_shared_config(client, self.agent_id, company_id=company_id)
+            task["_resolved_shared"] = shared
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_populate_resolved_specialty: shared lookup failed task=%s: %s",
+                task.get("id"),
+                exc,
+            )
+
+        # 2. Specialty + values só quando há match por op_type
+        op_type = task.get("operation_type")
+        if not op_type:
             return
 
         try:
@@ -382,7 +404,6 @@ class ResilientHarnessDaemon:
             if spec is None:
                 return
 
-            company_id = task.get("company_id") or self._agent_config.get("company_id")
             values = resolve_config(
                 client, self.agent_id, spec.id, company_id=company_id
             )
@@ -390,11 +411,12 @@ class ResilientHarnessDaemon:
             task["_resolved_specialty"] = spec
             task["_resolved_config"] = values
             logger.info(
-                "specialty resolved task=%s op=%s slug=%s config_keys=%s",
+                "specialty resolved task=%s op=%s slug=%s config_keys=%s shared_keys=%s",
                 task.get("id"),
                 op_type,
                 spec.slug,
                 list(values.keys()),
+                list((task.get("_resolved_shared") or {}).keys()),
             )
         except Exception as exc:  # noqa: BLE001 — fail-quiet por design
             logger.warning(

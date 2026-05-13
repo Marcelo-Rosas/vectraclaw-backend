@@ -19,6 +19,7 @@ from src.services.specialty_resolver import (  # noqa: E402
     ResolvedSpecialty,
     render_system_prompt,
     resolve_config,
+    resolve_shared_config,
     resolve_specialty,
     resolve_value,
 )
@@ -66,11 +67,12 @@ class _FakeQuery:
 
 
 class FakeSupabase:
-    """Minimal fake — only the two tables the resolver touches."""
+    """Minimal fake — só as tabelas que o resolver toca."""
 
     def __init__(self) -> None:
         self.specialties: List[Dict[str, Any]] = []
         self.configs: List[Dict[str, Any]] = []
+        self.shared: List[Dict[str, Any]] = []
         self._raise_on_table: Optional[str] = None
 
     def table(self, name: str):  # noqa: ANN201
@@ -88,6 +90,8 @@ class FakeSupabase:
                 row["agent_specialties"] = spec  # dict (PostgREST 1:1 join)
                 joined.append(row)
             return _FakeQuery(joined)
+        if name == "agent_shared_config":
+            return _FakeQuery(list(self.shared))
         raise AssertionError(f"FakeSupabase: unexpected table {name!r}")
 
 
@@ -295,6 +299,62 @@ class ResolveConfigTests(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# resolve_shared_config (PR-C — agent_shared_config.values)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class ResolveSharedConfigTests(unittest.TestCase):
+    def _setup(self) -> FakeSupabase:
+        fake = FakeSupabase()
+        fake.shared = [
+            {
+                "company_id": "vectra-cargo",
+                "agent_id": "kronos",
+                "values": {
+                    "ofx_path": "/data/abril.ofx",
+                    "recipient": "ops@vectra.com",
+                },
+            },
+            {
+                "company_id": "outra-empresa",
+                "agent_id": "kronos",
+                "values": {"ofx_path": "/other/maio.ofx"},
+            },
+        ]
+        return fake
+
+    def test_returns_empty_when_client_missing(self) -> None:
+        self.assertEqual(resolve_shared_config(None, "kronos"), {})
+
+    def test_returns_empty_when_agent_id_missing(self) -> None:
+        fake = self._setup()
+        self.assertEqual(resolve_shared_config(fake, None), {})
+        self.assertEqual(resolve_shared_config(fake, ""), {})
+
+    def test_returns_values_without_company_filter(self) -> None:
+        """Sem company_id, pega a primeira row do agente."""
+        fake = self._setup()
+        out = resolve_shared_config(fake, "kronos")
+        # FakeQuery preserva ordem do array
+        self.assertEqual(out["ofx_path"], "/data/abril.ofx")
+
+    def test_filters_by_company_id(self) -> None:
+        fake = self._setup()
+        out = resolve_shared_config(fake, "kronos", company_id="outra-empresa")
+        self.assertEqual(out["ofx_path"], "/other/maio.ofx")
+        self.assertNotIn("recipient", out)
+
+    def test_returns_empty_when_no_row(self) -> None:
+        fake = self._setup()
+        self.assertEqual(resolve_shared_config(fake, "agent-without-shared"), {})
+
+    def test_returns_empty_on_exception(self) -> None:
+        fake = self._setup()
+        fake._raise_on_table = "agent_shared_config"
+        self.assertEqual(resolve_shared_config(fake, "kronos"), {})
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # render_system_prompt
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -361,6 +421,7 @@ class ResolveValueTests(unittest.TestCase):
             "ofx_path",
             payload={"ofx_path": "/from-payload.ofx"},
             config_values={"ofx_path": "/from-config.ofx"},
+            shared_values={"ofx_path": "/from-shared.ofx"},
             specialty_defaults={"ofx_path": "/from-default.ofx"},
             env_default="/from-env.ofx",
         )
@@ -371,15 +432,28 @@ class ResolveValueTests(unittest.TestCase):
             "ofx_path",
             payload={},
             config_values={"ofx_path": "/from-config.ofx"},
+            shared_values={"ofx_path": "/from-shared.ofx"},
             specialty_defaults={"ofx_path": "/from-default.ofx"},
             env_default="/from-env.ofx",
         )
         self.assertEqual(out, "/from-config.ofx")
 
-    def test_specialty_default_wins_when_no_config(self) -> None:
+    def test_shared_wins_when_no_config(self) -> None:
+        """PR-C — shared entre config e specialty_defaults."""
         out = resolve_value(
             "ofx_path",
             config_values={},
+            shared_values={"ofx_path": "/from-shared.ofx"},
+            specialty_defaults={"ofx_path": "/from-default.ofx"},
+            env_default="/from-env.ofx",
+        )
+        self.assertEqual(out, "/from-shared.ofx")
+
+    def test_specialty_default_wins_when_no_shared(self) -> None:
+        out = resolve_value(
+            "ofx_path",
+            config_values={},
+            shared_values={},
             specialty_defaults={"ofx_path": "/from-default.ofx"},
             env_default="/from-env.ofx",
         )
