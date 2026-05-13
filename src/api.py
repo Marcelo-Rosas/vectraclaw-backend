@@ -29,7 +29,7 @@ from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
-    AgentDomain, AgentExecutionMode, WorkflowLogicPattern, Routine,
+    AgentDomain, AgentExecutionMode, WorkflowLogicPattern, OperationType, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
     Project, Run, RunTranscriptEntry,
 )
@@ -6518,6 +6518,36 @@ async def list_agent_domains(request: Request):
         return [AgentDomain(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_agent_domains failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/operation-types")
+@app.get("/operation-types")
+async def list_operation_types(request: Request):
+    """Task #52 — catálogo canônico dos operation_types.
+
+    Substitui enum hardcoded no Zod schema do frontend. Espelha o
+    Literal[...] do Pydantic Task com metadata rica (name, description,
+    category, icon, color, primary_agent_id, default_specialty_slug).
+
+    Read-only para usuário autenticado. Mutações via migration.
+    """
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("operation_types_catalog")
+            .select(
+                "id,name,description,category,icon,color,display_order,"
+                "primary_agent_id,default_specialty_slug,is_active"
+            )
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        return [OperationType(**row).to_zod_dict() for row in (res.data or [])]
+    except Exception as e:
+        logger.error(f"list_operation_types failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
