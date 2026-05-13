@@ -80,25 +80,27 @@ rules:
   subcategoria: 'Receita - Pagamento à vista'
 
 # -- Pix enviado: classificação confirmada pelo user (2026-05-12) --
+# Labels EXATOS do Planner (incluindo typo 'Oparacionais' e hyphens normais)
 - pattern: Pix enviado para MAYCOM CARGA E DESCARGA
-  categoria: Custos Operacionais
-  subcategoria: 'Carga e Descarga'
+  # Categoria mãe usa typo 'Oparacionais' (é assim no Planner do user)
+  categoria: Custos Oparacionais
+  subcategoria: 'Custos Operacionais - Carga e Descarga'
 - pattern: Pix enviado para Sérgio Ferreira Silva
   # Sérgio: motorista — adiantamento de frete (não despesa pessoal)
   categoria: Custos Operacionais - Frete e Transporte
   subcategoria: 'Frete - Adiantamento de Frete'
 - pattern: Pix enviado para DIEGO ADRIANO ALVES
   # Diego: motorista — saldo de frete (acerto pós-viagem)
-  categoria: Custos Operacionais
-  subcategoria: 'Frete – Saldo de Frete'
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: 'Frete - Saldo de Frete'
 - pattern: Pix enviado para CAMILLA AZEVEDO SERRAN VIEIRA
   # Camilla: uso pessoal (familiar)
   categoria: Despesas Pessoais
   subcategoria: 'Despesas Pessoais: Uso Pessoal (Camilla)'
 - pattern: Pix enviado para VECTRA CARGO
-  # Pix da PF para a própria empresa = movimentação bancária
-  categoria: Movimentação bancária
-  subcategoria: 'Empresa'
+  # Pix da PF para a própria empresa = transferência entre empresa/PF
+  categoria: Transferências / Movimentações Internas
+  subcategoria: 'Movimentação bancária - Empresa'
 - pattern: Pix enviado para GOOGLE CLOUD BRASIL
   categoria: Despesa Administrativa
   subcategoria: 'Despesa Administrativa – Sistema IA'
