@@ -382,6 +382,110 @@ def test_resolve_kronos_inputs_resolved_config_ignores_unknown_keys():
     assert "DOWNLOADS_DIR" not in inputs
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# PR-C (Modelo C) — _resolved_shared entre input_json e description
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_resolve_kronos_inputs_resolved_shared_below_input_json():
+    """input_json (override por task) tem precedência sobre shared (defaults
+    do agente)."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "input_json": {"OFX_PATH": "/from-input.ofx"},
+        "_resolved_shared": {"ofx_path": "/from-shared.ofx"},
+    })
+
+    assert inputs["OFX_PATH"] == "/from-input.ofx"
+
+
+def test_resolve_kronos_inputs_resolved_shared_above_description():
+    """shared (defaults do agente) tem precedência sobre description KEY=VALUE
+    (legacy). Substitui hardcoded por config editada via tab Skills."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_shared": {"recipient": "config@vectra.com"},
+        "description": "RECIPIENT=hardcoded@x.com",
+    })
+
+    assert inputs["RECIPIENT"] == "config@vectra.com"
+
+
+def test_resolve_kronos_inputs_full_chain_5_levels():
+    """Cadeia completa: specialty > input_json > shared > description > env.
+
+    Cada nível preenche um campo distinto pra verificar que todos os 5
+    são alcançados quando os anteriores não preenchem."""
+    import os
+    from src.agents.kronos import resolve_kronos_inputs
+
+    os.environ.pop("KRONOS_PERIODO_FIM", None)
+    os.environ["KRONOS_PERIODO_FIM"] = "2026-04-30"
+    try:
+        inputs = resolve_kronos_inputs({
+            "_resolved_config": {"ofx_path": "/specialty.ofx"},      # nível 1
+            "input_json": {"PLANNER_INSTITUICAO": "C6"},              # nível 2
+            "_resolved_shared": {"recipient": "shared@vectra.com"},   # nível 3
+            "description": "PERIODO_INICIO=2026-04-01",               # nível 4
+            # nível 5: env KRONOS_PERIODO_FIM
+        })
+
+        assert inputs["OFX_PATH"] == "/specialty.ofx"
+        assert inputs["PLANNER_INSTITUICAO"] == "C6"
+        assert inputs["RECIPIENT"] == "shared@vectra.com"
+        assert inputs["PERIODO_INICIO"] == "2026-04-01"
+        assert inputs["PERIODO_FIM"] == "2026-04-30"
+    finally:
+        os.environ.pop("KRONOS_PERIODO_FIM", None)
+
+
+def test_resolve_kronos_inputs_resolved_shared_normalizes_keys():
+    """shared usa snake_case (JSON Schema) → deve normalizar para UPPER_SNAKE."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_shared": {
+            "ofx_path": "/data/x.ofx",
+            "planner_instituicao": "Inter",
+            "pdf_path": "/data/x.pdf",
+            "recipient": "ops@vectra.com",
+        },
+    })
+
+    assert inputs["OFX_PATH"] == "/data/x.ofx"
+    assert inputs["PLANNER_INSTITUICAO"] == "Inter"
+    assert inputs["PDF_PATH"] == "/data/x.pdf"
+    assert inputs["RECIPIENT"] == "ops@vectra.com"
+
+
+def test_resolve_kronos_inputs_resolved_shared_none_value_skipped():
+    """None em _resolved_shared deve cair para description/env."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "_resolved_shared": {"recipient": None},
+        "description": "RECIPIENT=fallback@x.com",
+    })
+
+    assert inputs["RECIPIENT"] == "fallback@x.com"
+
+
+def test_resolve_kronos_inputs_backcompat_no_resolved_shared():
+    """Tasks sem _resolved_shared (legacy/sem hook) seguem cadeia 4-nível."""
+    from src.agents.kronos import resolve_kronos_inputs
+
+    inputs = resolve_kronos_inputs({
+        "input_json": {"OFX_PATH": "/x.ofx"},
+        "description": "RECIPIENT=fallback@x.com",
+    })
+
+    assert inputs["OFX_PATH"] == "/x.ofx"
+    assert inputs["RECIPIENT"] == "fallback@x.com"
+    assert "_resolved_shared" not in inputs
+
+
 def test_build_kronos_input_json_reads_routine_metadata():
     from src.agents.kronos import build_kronos_input_json
 

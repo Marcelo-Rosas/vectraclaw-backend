@@ -137,6 +137,42 @@ def resolve_specialty(
         return None
 
 
+def resolve_shared_config(
+    client: Any,
+    agent_id: Optional[str],
+    company_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """PR-C — Lê `agent_shared_config.values` para (company, agent).
+
+    Campos compartilhados entre as specialties do agente. Entra na cadeia
+    de precedência ABAIXO de `specialty.values` (mais específico ganha)
+    mas ACIMA de `task.description` KEY=VALUE legacy.
+
+    Retorna `{}` se não há row em `agent_shared_config` para esse agente.
+    Falha silenciosa em erros (log warning + return vazio).
+    """
+    if not client or not agent_id:
+        return {}
+    try:
+        q = (
+            client.table("agent_shared_config")
+            .select("values, company_id")
+            .eq("agent_id", agent_id)
+        )
+        if company_id:
+            q = q.eq("company_id", company_id)
+        res = q.limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if not rows:
+            return {}
+        return rows[0].get("values") or {}
+    except Exception as exc:
+        logger.warning(
+            "resolve_shared_config failed agent=%s: %s", agent_id, exc
+        )
+        return {}
+
+
 def resolve_config(
     client: Any,
     agent_id: Optional[str],
@@ -227,6 +263,7 @@ def resolve_value(
     *,
     payload: Optional[Dict[str, Any]] = None,
     config_values: Optional[Dict[str, Any]] = None,
+    shared_values: Optional[Dict[str, Any]] = None,
     specialty_defaults: Optional[Dict[str, Any]] = None,
     env_default: Any = _MISSING,
 ) -> Any:
@@ -234,13 +271,14 @@ def resolve_value(
 
         1. payload[key]              (override por execução — task.input_json)
         2. config_values[key]        (agent_specialty_configs.values)
-        3. specialty_defaults[key]   (agent_specialties.config_schema defaults)
-        4. env_default               (literal passado pelo handler; opcional)
+        3. shared_values[key]        (agent_shared_config.values — PR-C)
+        4. specialty_defaults[key]   (agent_specialties.config_schema defaults)
+        5. env_default               (literal passado pelo handler; opcional)
 
     Considera `None` em qualquer fonte como "não preenchido" e segue para a
     próxima. Retorna `None` se nada bater e `env_default` não foi fornecido.
     """
-    for source in (payload, config_values, specialty_defaults):
+    for source in (payload, config_values, shared_values, specialty_defaults):
         if source and key in source and source[key] is not None:
             return source[key]
     if env_default is not _MISSING:

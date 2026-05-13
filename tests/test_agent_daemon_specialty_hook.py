@@ -65,6 +65,7 @@ class FakeSupabase:
     def __init__(self) -> None:
         self.specialties: List[Dict[str, Any]] = []
         self.configs: List[Dict[str, Any]] = []
+        self.shared: List[Dict[str, Any]] = []
         self.fail_on_table: Optional[str] = None
 
     def table(self, name: str):  # noqa: ANN201
@@ -79,6 +80,8 @@ class FakeSupabase:
                 )
                 joined.append({**cfg, "agent_specialties": spec})
             return _FakeQuery(joined)
+        if name == "agent_shared_config":
+            return _FakeQuery(list(self.shared))
         raise AssertionError(f"unexpected table {name!r}")
 
 
@@ -242,6 +245,104 @@ class PopulateResolvedSpecialtyTests(unittest.TestCase):
         self.assertEqual(
             task["_resolved_config"]["ofx_path"], "/data/abril.ofx"
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PR-C — _resolved_shared (agent_shared_config) populado sempre que possível
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _seed_kronos_shared(fake: FakeSupabase) -> None:
+    """Mock de agent_shared_config para o Kronos (4 campos canon do PR-A)."""
+    fake.shared = [
+        {
+            "company_id": "vectra-cargo",
+            "agent_id": "kronos-uuid",
+            "values": {
+                "ofx_path": "/data/abril.ofx",
+                "planner_instituicao": "C6",
+                "pdf_path": "/data/abril.pdf",
+                "recipient": "ops@vectra.com",
+            },
+        }
+    ]
+
+
+class PopulateResolvedSharedTests(unittest.TestCase):
+    def test_populates_resolved_shared_when_match_exists(self) -> None:
+        fake = FakeSupabase()
+        _seed_kronos_planner(fake)
+        _seed_kronos_shared(fake)
+        d = _make_daemon()
+
+        with patch.object(d, "_get_supabase", return_value=fake):
+            task = {
+                "id": "t",
+                "operation_type": "planner-import-ofx",
+                "company_id": "vectra-cargo",
+            }
+            d._populate_resolved_specialty(task)
+
+        self.assertIn("_resolved_shared", task)
+        shared = task["_resolved_shared"]
+        self.assertEqual(shared["ofx_path"], "/data/abril.ofx")
+        self.assertEqual(shared["planner_instituicao"], "C6")
+        self.assertEqual(shared["pdf_path"], "/data/abril.pdf")
+        self.assertEqual(shared["recipient"], "ops@vectra.com")
+
+    def test_populates_shared_even_without_specialty_match(self) -> None:
+        """shared não depende de op_type → populado mesmo quando specialty
+        não tem match (ou op_type não existe).
+        """
+        fake = FakeSupabase()
+        _seed_kronos_shared(fake)  # só shared, sem specialties
+        d = _make_daemon()
+
+        with patch.object(d, "_get_supabase", return_value=fake):
+            task = {
+                "id": "t",
+                "operation_type": "unknown-op",
+                "company_id": "vectra-cargo",
+            }
+            d._populate_resolved_specialty(task)
+
+        self.assertIn("_resolved_shared", task)
+        self.assertEqual(task["_resolved_shared"]["ofx_path"], "/data/abril.ofx")
+        # specialty não deve ter sido populada
+        self.assertNotIn("_resolved_specialty", task)
+        self.assertNotIn("_resolved_config", task)
+
+    def test_shared_empty_when_no_row_for_agent(self) -> None:
+        """Agente sem row em agent_shared_config → shared = {}."""
+        fake = FakeSupabase()  # sem shared
+        d = _make_daemon()
+
+        with patch.object(d, "_get_supabase", return_value=fake):
+            task = {"id": "t", "operation_type": "any-op"}
+            d._populate_resolved_specialty(task)
+
+        # shared chave existe mas dict vazio
+        self.assertEqual(task.get("_resolved_shared"), {})
+
+    def test_shared_silent_failure_does_not_block_specialty(self) -> None:
+        """Falha em shared_config NÃO deve impedir specialty de carregar."""
+        fake = FakeSupabase()
+        _seed_kronos_planner(fake)
+        # _seed_kronos_shared NÃO chamado — shared vazio
+        d = _make_daemon()
+
+        with patch.object(d, "_get_supabase", return_value=fake):
+            task = {
+                "id": "t",
+                "operation_type": "planner-import-ofx",
+                "company_id": "vectra-cargo",
+            }
+            d._populate_resolved_specialty(task)
+
+        # specialty popula normalmente
+        self.assertIn("_resolved_specialty", task)
+        # shared = {} (não None)
+        self.assertEqual(task.get("_resolved_shared"), {})
 
 
 if __name__ == "__main__":
