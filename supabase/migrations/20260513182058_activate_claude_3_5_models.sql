@@ -20,9 +20,11 @@
 
 set search_path to vectraclip, public;
 
+-- Nota: vectraclip.llm_models não tem coluna updated_at (PK composta por
+-- (id, effective_from); novas versões viram INSERTs, não UPDATEs).
+-- Por isso este UPDATE só toca o flag is_active.
 update vectraclip.llm_models
-   set is_active = true,
-       updated_at = now()
+   set is_active = true
  where id in (
    'claude-3-5-haiku-20241022',
    'claude-3-5-sonnet-20241022'
