@@ -3423,6 +3423,43 @@ async def run_routine_now(request: Request, routine_id: str):
         }
         if input_json is not None:
             task_payload["input_json"] = input_json
+
+        # Task #44 — Se routine está vinculada a um workflow_definition, propaga
+        # workflow_step_id do primeiro step (step_order=1). Isso habilita
+        # TaskFactory.promote_successors_after_completion a avançar o DAG
+        # quando a task termina e o engine_v2.advance_v2 a interpretar logic_pattern.
+        # Sem isso, task fica órfã do grafo (comportamento legado).
+        wf_def_id = routine_row.get("workflow_definition_id")
+        if wf_def_id:
+            try:
+                step_res = (
+                    supabase.table("workflow_steps")
+                    .select("id")
+                    .eq("workflow_id", wf_def_id)
+                    .eq("active", True)
+                    .order("step_order")
+                    .limit(1)
+                    .execute()
+                )
+                first_step_id = (step_res.data[0]["id"] if step_res.data else None)
+                if first_step_id:
+                    task_payload["workflow_step_id"] = first_step_id
+                    logger.info(
+                        "run_routine_now: vinculou task ao workflow_step_id=%s "
+                        "(workflow_definition_id=%s)",
+                        first_step_id, wf_def_id,
+                    )
+                else:
+                    logger.warning(
+                        "run_routine_now: workflow_definition_id=%s não tem steps "
+                        "ativos — task criada sem workflow_step_id",
+                        wf_def_id,
+                    )
+            except Exception as wf_err:
+                logger.warning(
+                    "run_routine_now: falha ao resolver first step (não fatal): %s",
+                    wf_err,
+                )
         task_id = None
         task_err_msg = None
         try:
