@@ -750,9 +750,27 @@ def test_build_kronos_report_markdown_has_all_sections():
     assert "BUG ROW" in md
 
 
-def test_planner_import_creates_oracle_report_task(tmp_path):
-    """Após import OK + categorize, cria task derivada `oracle-report`."""
+def test_planner_import_does_NOT_create_oracle_report_task_anymore(tmp_path):
+    """Task #43 — handoff Hermes Reporter NÃO é mais criado neste handler.
+
+    Antes: `_create_hermesreporter_task` era chamado ao final, com UUID
+    `_HERMESREPORTER_AGENT_ID` hardcoded.
+    Agora: handoff é Step 3 do workflow `kronos-planner-flow` (declarativo).
+    TaskFactory.materialize_workflow cria a child em backlog;
+    promote_successors_after_completion avança quando este step termina.
+
+    O handler retorna `output_json["handoff"] = "via workflow_step Step 3"`
+    como marker da migração.
+    """
     from src.agents import kronos_planner
+
+    # Garantia: a constante hardcoded foi removida (task #43)
+    assert not hasattr(kronos_planner, "_HERMESREPORTER_AGENT_ID"), (
+        "_HERMESREPORTER_AGENT_ID deveria ter sido removido pelo task #43"
+    )
+    assert not hasattr(kronos_planner, "_create_hermesreporter_task"), (
+        "_create_hermesreporter_task deveria ter sido removido pelo task #43"
+    )
 
     ofx_file = tmp_path / "semana-1-maio-26.ofx"
     ofx_file.write_text("dummy")
@@ -766,13 +784,14 @@ def test_planner_import_creates_oracle_report_task(tmp_path):
     client = MagicMock()
     fake_session = _make_mock_session()
 
-    inserted_payload = {}
+    # Conta INSERTs no client — se algo tentar criar oracle-report
+    # task derivada, captura.
+    insert_calls = []
 
     def fake_insert(payload):
-        inserted_payload["last"] = payload
-        # mimic supabase chainable .execute()
+        insert_calls.append(payload)
         out = MagicMock()
-        out.execute = MagicMock(return_value=MagicMock(data=[{"id": "report-task-id"}]))
+        out.execute = MagicMock(return_value=MagicMock(data=[{"id": "x"}]))
         return out
 
     client.table = MagicMock(return_value=MagicMock(insert=fake_insert))
@@ -795,24 +814,42 @@ def test_planner_import_creates_oracle_report_task(tmp_path):
         result = kronos_planner.entrypoint_planner_import(task, client)
 
     assert result["status"] == "done"
-    assert result["output_json"].get("report_task_id") == "report-task-id"
+    # Marker da migração: handoff vai via workflow_step
+    assert result["output_json"].get("handoff") == "via workflow_step Step 3 (hermes-report)"
+    # Não há mais report_task_id (foi removido)
+    assert "report_task_id" not in result["output_json"]
 
-    payload = inserted_payload["last"]
-    assert payload["operation_type"] == "oracle-report"
-    assert payload["assigned_to_agent_id"] == kronos_planner._HERMESREPORTER_AGENT_ID
-    assert payload["company_id"] == "comp-id-123"
-    assert payload["parent_task_id"] == "parent-task-id"
-    assert "RECIPIENT: marcelo.rosas@vectracargo.com.br" in payload["description"]
-    assert "semana-1-maio-26.ofx" in payload["description"]
+    # Garantia: handler NÃO insere nenhuma task `oracle-report` derivada
+    oracle_report_inserts = [
+        p for p in insert_calls if p.get("operation_type") == "oracle-report"
+    ]
+    assert oracle_report_inserts == [], (
+        f"handler não pode mais criar oracle-report; encontradas: "
+        f"{oracle_report_inserts}"
+    )
 
 
 def test_categorize_only_does_NOT_create_oracle_report_task(tmp_path):
-    """Smoke iterativo (categorize-only) NÃO dispara e-mail — só rotina."""
+    """Smoke iterativo (categorize-only) NÃO dispara e-mail — só rotina.
+
+    Após task #43, NENHUM handler do kronos_planner cria oracle-report;
+    handoff é Step 3 do workflow.
+    """
     from src.agents import kronos_planner
 
     task = {"id": "t-categ", "company_id": "comp", "input_json": {}, "description": ""}
     client = MagicMock()
     fake_session = _make_mock_session()
+
+    insert_calls = []
+
+    def fake_insert(payload):
+        insert_calls.append(payload)
+        out = MagicMock()
+        out.execute = MagicMock(return_value=MagicMock(data=[{"id": "x"}]))
+        return out
+
+    client.table = MagicMock(return_value=MagicMock(insert=fake_insert))
 
     async def fake_categorize(_session, _rules, **kw):
         return {
@@ -828,9 +865,10 @@ def test_categorize_only_does_NOT_create_oracle_report_task(tmp_path):
         kronos_planner, "KronosPlannerSession", return_value=fake_session
     ), patch.object(
         kronos_planner, "_categorize_pending_lines", side_effect=fake_categorize
-    ), patch.object(
-        kronos_planner, "_create_hermesreporter_task"
-    ) as mock_create:
+    ):
         kronos_planner.entrypoint_categorize_pendings(task, client)
 
-    mock_create.assert_not_called()
+    oracle_report_inserts = [
+        p for p in insert_calls if p.get("operation_type") == "oracle-report"
+    ]
+    assert oracle_report_inserts == []
