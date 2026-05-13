@@ -3424,40 +3424,90 @@ async def run_routine_now(request: Request, routine_id: str):
         if input_json is not None:
             task_payload["input_json"] = input_json
 
-        # Task #44 — Se routine está vinculada a um workflow_definition, propaga
-        # workflow_step_id do primeiro step (step_order=1). Isso habilita
-        # TaskFactory.promote_successors_after_completion a avançar o DAG
-        # quando a task termina e o engine_v2.advance_v2 a interpretar logic_pattern.
-        # Sem isso, task fica órfã do grafo (comportamento legado).
+        # Task #43 — Se routine está vinculada a um workflow_definition,
+        # MATERIALIZA a árvore inteira via TaskFactory.materialize_workflow.
+        # Substitui o INSERT single (task standalone). Resultado:
+        #   • Parent task (status=in_progress, operation_type=orchestration)
+        #   • N child tasks, primeira queued (entrypoint), demais backlog
+        #   • Cada child com workflow_step_id + assigned_to_agent_id resolvido
+        #     via step.specialty_slug (TaskFactory usa MorpheusDispatcher
+        #     pra _find_agent pelo specialty).
+        #   • dependency_step_codes / successor_step_codes alimentam
+        #     TaskFactory.promote_successors_after_completion → avança DAG
+        #     quando uma child termina.
+        # Acordo arquitetural: "nada hardcoded". Handoff Kronos → Hermes
+        # Reporter agora é Step 3 do workflow, não constante em código.
         wf_def_id = routine_row.get("workflow_definition_id")
         if wf_def_id:
             try:
-                step_res = (
-                    supabase.table("workflow_steps")
-                    .select("id")
-                    .eq("workflow_id", wf_def_id)
-                    .eq("active", True)
-                    .order("step_order")
+                wf_slug_res = (
+                    supabase.table("workflow_definitions")
+                    .select("slug")
+                    .eq("id", wf_def_id)
                     .limit(1)
                     .execute()
                 )
-                first_step_id = (step_res.data[0]["id"] if step_res.data else None)
-                if first_step_id:
-                    task_payload["workflow_step_id"] = first_step_id
-                    logger.info(
-                        "run_routine_now: vinculou task ao workflow_step_id=%s "
-                        "(workflow_definition_id=%s)",
-                        first_step_id, wf_def_id,
+                wf_slug = (
+                    (wf_slug_res.data or [{}])[0].get("slug")
+                    if wf_slug_res.data else None
+                )
+                if wf_slug:
+                    from src.services.task_factory import TaskFactory, TaskFactoryError
+                    from src.models import TaskBlueprint
+
+                    blueprint = TaskBlueprint(
+                        title=f"[Rotina] {routine_row.get('name', 'Rotina')}",
+                        description=description,
+                        budget_limit=0,
                     )
+                    factory = TaskFactory(supabase)
+                    try:
+                        materialized = factory.materialize_workflow(
+                            company_id=routine_row.get("company_id"),
+                            workflow_slug=wf_slug,
+                            parent_input=blueprint,
+                            step_inputs={
+                                # Aplica o input_json normalizado em todos os
+                                # steps (cada handler escolhe quais chaves usa).
+                                # Granularidade por step pode entrar em PR futuro.
+                                "import-ofx": input_json or {},
+                                "categorize-pendings": input_json or {},
+                                "hermes-report": {"recipient_default": True},
+                            },
+                        )
+                        parent_task = materialized.parent
+                        subtasks = materialized.subtasks
+                        # Marca routine.last_run_at já que materialize não fez.
+                        # Não precisamos task_payload singular daqui em diante —
+                        # o materialize criou tudo.
+                        logger.info(
+                            "run_routine_now: materialized workflow=%s parent=%s subtasks=%d",
+                            wf_slug, parent_task.id, len(subtasks),
+                        )
+                        return {
+                            "triggered": True,
+                            "routineId": routine_id,
+                            "parentTaskId": parent_task.id,
+                            "subtaskIds": [t.id for t in subtasks],
+                            "workflowSlug": wf_slug,
+                        }
+                    except TaskFactoryError as tf_err:
+                        logger.error(
+                            "run_routine_now: materialize_workflow falhou (%s) — "
+                            "fallback para task standalone",
+                            tf_err,
+                        )
+                        # Continua para o fluxo legado (INSERT single)
                 else:
                     logger.warning(
-                        "run_routine_now: workflow_definition_id=%s não tem steps "
-                        "ativos — task criada sem workflow_step_id",
+                        "run_routine_now: workflow_definition_id=%s sem slug "
+                        "— fallback standalone",
                         wf_def_id,
                     )
             except Exception as wf_err:
                 logger.warning(
-                    "run_routine_now: falha ao resolver first step (não fatal): %s",
+                    "run_routine_now: materialize_workflow erro inesperado (%s) "
+                    "— fallback standalone",
                     wf_err,
                 )
         task_id = None

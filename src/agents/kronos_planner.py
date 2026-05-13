@@ -64,8 +64,9 @@ logger = logging.getLogger("KronosPlanner")
 PLANNER_LANCAMENTOS_URL = (
     "https://web.meuplannerfinanceiro.com.br/controle/lancamentos"
 )
-# VEC-428: relatório SMTP pós-import via HermesReporter
-_HERMESREPORTER_AGENT_ID = "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"
+# Task #43 — Default recipient mantido como fallback do shared_config.
+# `_HERMESREPORTER_AGENT_ID` REMOVIDO — handoff agora é Step 3 do workflow
+# kronos-planner-flow (relacional, via specialty_slug='oracle-report').
 _DEFAULT_REPORT_RECIPIENT = "marcelo.rosas@vectracargo.com.br"
 
 # VEC-423: categorização inline pós-import
@@ -266,25 +267,19 @@ async def _run_planner_import_async(
     if categorization_stats is not None:
         output_json["categorization"] = categorization_stats
 
-    # VEC-428: dispara relatório por e-mail via HermesReporter.
-    # Só roda no fluxo de import (rotina semanal); categorize-only não envia.
-    recipient = inputs.get("RECIPIENT") or _DEFAULT_REPORT_RECIPIENT
-    subject = f"Kronos — Lançamentos Meu Planner: {target_file.name}"
-    markdown = _build_kronos_report_markdown(
-        file_processed=target_file.name,
-        stats=categorization_stats,
-        screenshot_path=screenshot_path,
-        toast_text=toast_text,
-    )
-    report_task_id = _create_hermesreporter_task(
-        supabase_client,
-        parent_task=task,
-        recipient=recipient,
-        subject=subject,
-        markdown=markdown,
-    )
-    if report_task_id:
-        output_json["report_task_id"] = report_task_id
+    # Task #43 — Acordo arquitetural "nada hardcoded": handoff Hermes Reporter
+    # NÃO é mais feito aqui via constante _HERMESREPORTER_AGENT_ID.
+    # Agora é Step 3 do workflow `kronos-planner-flow` (specialty_slug=
+    # 'oracle-report', resolve Hermes Reporter via _find_agent). TaskFactory
+    # cria a child Step 3 em backlog na materialização (run_routine_now) e
+    # promove para queued via promote_successors_after_completion quando este
+    # Step 1 termina (output_json["categorization"] vai pro Step 3 via
+    # parent context se necessário no futuro).
+    #
+    # O markdown do relatório é gerado pelo handler do Hermes Reporter
+    # (agents/hermes_reporter.py) consumindo `parent_task.output_json` e o
+    # `input_json` do Step 3 — não mais por este handler.
+    output_json["handoff"] = "via workflow_step Step 3 (hermes-report)"
 
     return {"status": "done", "output_json": output_json}
 
@@ -452,68 +447,12 @@ def _build_kronos_report_markdown(
     return "\n".join(md_parts)
 
 
-def _create_hermesreporter_task(
-    supabase_client: Any,
-    *,
-    parent_task: dict,
-    recipient: str,
-    subject: str,
-    markdown: str,
-) -> Optional[str]:
-    """Cria task derivada `oracle-report` para o HermesReporter enviar e-mail.
-
-    Retorna o `id` da task criada, ou `None` se falhar (não fatal).
-    """
-    if supabase_client is None:
-        logger.warning("supabase_client None — pulando criação de oracle-report")
-        return None
-
-    parent_task_id = parent_task.get("id")
-    company_id = parent_task.get("company_id")
-    if not company_id:
-        logger.warning("parent_task sem company_id — pulando oracle-report")
-        return None
-
-    description = (
-        f"RECIPIENT: {recipient}\n"
-        f"SUBJECT: {subject}\n"
-        f"PARENT_TASK_ID: {parent_task_id or '(sem id)'}\n"
-        f"\n"
-        f"---\n"
-        f"\n"
-        f"{markdown}"
-    )
-
-    payload = {
-        "company_id": company_id,
-        "assigned_to_agent_id": _HERMESREPORTER_AGENT_ID,
-        "title": subject,
-        "description": description,
-        "status": "queued",
-        "operation_type": "oracle-report",
-        "input_json": {
-            "parent_task_id": parent_task_id,
-            "source_agent": "Kronos",
-        },
-        "output_json": {},
-        "parent_task_id": parent_task_id,
-        "budget_limit": 0,
-        "spent": 0,
-        "cost_usd": 0,
-    }
-    try:
-        res = supabase_client.table("tasks").insert(payload).execute()
-        new_id = (res.data or [{}])[0].get("id")
-        logger.info(
-            "oracle-report task criada: id=%s recipient=%s subject=%s",
-            new_id,
-            recipient,
-            subject,
-        )
-        return new_id
-    except Exception as exc:
-        logger.warning("falha ao criar oracle-report task (não fatal): %s", exc)
-        return None
+# Task #43 — `_create_hermesreporter_task` REMOVIDO. Hand-off Hermes Reporter
+# agora é declarativo: Step 3 do workflow `kronos-planner-flow` com
+# specialty_slug='oracle-report'. TaskFactory.materialize_workflow cria a
+# subtask em backlog, MorpheusDispatcher._find_agent resolve dono via
+# specialty (= Hermes Reporter), TaskFactory.promote_successors_after_completion
+# promove para queued quando Step 2 (categorize-pendings) termina.
 
 
 def _pick_target_file(
