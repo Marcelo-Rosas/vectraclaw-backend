@@ -194,7 +194,28 @@ class ResolveSpecialtyTests(unittest.TestCase):
         fake._raise_on_table = "agent_specialty_configs"
         self.assertIsNone(resolve_specialty(fake, "kronos", "financial-audit"))
 
-    def test_specialty_defaults_property(self) -> None:
+    def test_specialty_defaults_list_format(self) -> None:
+        """Convenção VectraClaw: config_schema é lista de field descriptors."""
+        spec = ResolvedSpecialty(
+            id="x",
+            slug="x",
+            name="x",
+            domain="x",
+            system_prompt_template="",
+            config_schema=[
+                {"key": "ofx_path", "type": "text", "default": "/tmp/a.ofx"},
+                {"key": "recipient", "type": "text"},  # sem default
+                {"key": "categorize_after_import", "type": "boolean", "default": True},
+                {"label": "sem key — ignorado"},  # sem key, deve ser pulado
+            ],
+        )
+        self.assertEqual(
+            spec.defaults,
+            {"ofx_path": "/tmp/a.ofx", "categorize_after_import": True},
+        )
+
+    def test_specialty_defaults_json_schema_dict_backcompat(self) -> None:
+        """Formato JSON Schema (legacy) também é aceito."""
         spec = ResolvedSpecialty(
             id="x",
             slug="x",
@@ -205,15 +226,17 @@ class ResolveSpecialtyTests(unittest.TestCase):
                 "type": "object",
                 "properties": {
                     "ofx_path": {"type": "string", "default": "/tmp/a.ofx"},
-                    "recipient": {"type": "string"},  # sem default
-                    "categorize_after_import": {"type": "boolean", "default": True},
+                    "recipient": {"type": "string"},
                 },
             },
         )
-        self.assertEqual(
-            spec.defaults,
-            {"ofx_path": "/tmp/a.ofx", "categorize_after_import": True},
+        self.assertEqual(spec.defaults, {"ofx_path": "/tmp/a.ofx"})
+
+    def test_specialty_defaults_empty_when_no_schema(self) -> None:
+        spec = ResolvedSpecialty(
+            id="x", slug="x", name="x", domain="x", system_prompt_template=""
         )
+        self.assertEqual(spec.defaults, {})
 
 
 # ════════════════════════════════════════════════════════════════════════════

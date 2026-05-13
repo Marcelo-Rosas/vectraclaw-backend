@@ -33,27 +33,55 @@ logger = logging.getLogger("SpecialtyResolver")
 
 @dataclass
 class ResolvedSpecialty:
-    """Specialty enriquecida com defaults extraídos do config_schema."""
+    """Specialty enriquecida com defaults extraídos do config_schema.
+
+    `config_schema` segue a convenção do VectraClaw: **lista** de field
+    descriptors `{key, label, type, required, default, description}`
+    (ver `MOCK_AGENT_SPECIALTIES` em `src/api.py` e o model
+    `AgentSpecialty.config_schema: Optional[List[Dict[str, Any]]]`).
+
+    Também aceita formato JSON Schema dict (`{type, properties}`) por
+    backcompat com specialties hipotéticas que tenham sido salvas nesse
+    formato no passado.
+    """
 
     id: str
     slug: str
     name: str
     domain: str
     system_prompt_template: str
-    config_schema: Dict[str, Any] = field(default_factory=dict)
+    config_schema: Any = field(default_factory=list)
 
     @property
     def defaults(self) -> Dict[str, Any]:
-        """Defaults declarados em `config_schema.properties[*].default`.
+        """Extrai defaults do config_schema.
 
-        Convenção JSON Schema: cada campo editável pode declarar um `default`.
-        Devolve dict `{key: default_value}` para uso em `resolve_value`.
+        Aceita os 2 formatos:
+        - Lista de field descriptors (convenção VectraClaw):
+          `[{"key": "ofx_path", "default": "/tmp/x.ofx"}, ...]`
+        - JSON Schema dict (legacy):
+          `{"properties": {"ofx_path": {"default": "/tmp/x.ofx"}}}`
+
+        Devolve `{key: default_value}` para uso em `resolve_value`.
         """
-        props = (self.config_schema or {}).get("properties") or {}
         out: Dict[str, Any] = {}
-        for key, spec in props.items():
-            if isinstance(spec, dict) and "default" in spec:
-                out[key] = spec["default"]
+        schema = self.config_schema
+
+        if isinstance(schema, list):
+            for item in schema:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("key")
+                if not key:
+                    continue
+                if "default" in item:
+                    out[key] = item["default"]
+        elif isinstance(schema, dict):
+            props = schema.get("properties") or {}
+            for key, spec in props.items():
+                if isinstance(spec, dict) and "default" in spec:
+                    out[key] = spec["default"]
+
         return out
 
 
@@ -99,7 +127,7 @@ def resolve_specialty(
                     name=spec_data.get("name") or "",
                     domain=spec_data.get("domain") or "",
                     system_prompt_template=spec_data.get("system_prompt_template") or "",
-                    config_schema=spec_data.get("config_schema") or {},
+                    config_schema=spec_data.get("config_schema") or [],
                 )
         return None
     except Exception as exc:
