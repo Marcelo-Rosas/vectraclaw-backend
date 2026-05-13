@@ -713,6 +713,46 @@ class AgentDomain(CamelModel):
         return d
 
 
+class WorkflowLogicPattern(CamelModel):
+    """Task #49 — catálogo canônico dos logic_patterns para workflow_steps.
+
+    Espelha o conteúdo do FlowLogic.tsx do frontend (que era hardcoded em
+    MOCK_PATTERNS). Backend passa a ser fonte de verdade; UI lê via
+    GET /api/workflow-logic-patterns.
+
+    Campos:
+    - taxonomy: chave canônica (SIMPLE, SPLIT-IF, SPLIT-SWITCH, MERGE,
+      LOOP-BATCH, WAIT-EVENT, SUBFLOW, ERROR-HANDLER). FK em
+      workflow_steps.logic_pattern.
+    - category: agrupamento UI (splitting, merging, looping, waiting,
+      subworkflows, error-handling, simple).
+    - engine_handler: nome do módulo Python que interpreta o pattern em
+      runtime. Hoje só SIMPLE tem handler real (WorkflowEngine.advance);
+      demais ficam 'pending' até Engine v2 implementar.
+    - json_skeleton: skeleton n8n para referência educativa.
+    """
+
+    id: str
+    category: str
+    taxonomy: str
+    name: str
+    description: Optional[str] = None
+    heuristics: List[str] = Field(default_factory=list)
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    display_order: int = 100
+    json_skeleton: Optional[Dict[str, Any]] = None
+    engine_handler: str = "pending"
+    is_active: bool = True
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        for key in ("description", "icon", "color"):
+            if d.get(key) is None:
+                d[key] = ""
+        return d
+
+
 class AgentExecutionMode(CamelModel):
     """PR-EA/EB — catálogo canônico de modos de execução.
 
