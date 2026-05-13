@@ -742,8 +742,48 @@ async def _dismiss_import_success_modal(session: KronosPlannerSession) -> None:
         logger.debug("modal 'Importação realizada' fechado via Escape")
         return
     except PlaywrightTimeoutError:
+        logger.debug("Escape falhou, tentando dialog.close() JS")
+
+    # 3. Fallback robusto: HTML5 <dialog>.close() via JS.
+    # O modal é um `<dialog class="modal w-full z-50" open>` nativo. Escape só
+    # funciona se aberto via `dialog.showModal()`; quando aberto via `.show()`
+    # ou atribuição direta do attr `open`, Escape é no-op. Native `.close()`
+    # remove o atributo `open` independente de como foi aberto.
+    try:
+        closed = await page.evaluate(
+            """() => {
+                const dlg = document.querySelector('dialog.modal[open]');
+                if (dlg && typeof dlg.close === 'function') {
+                    dlg.close();
+                    return true;
+                }
+                return false;
+            }"""
+        )
+        if closed:
+            await heading.wait_for(state="hidden", timeout=3_000)
+            logger.debug("modal 'Importação realizada' fechado via dialog.close() JS")
+            return
+    except Exception as exc:
+        logger.debug("dialog.close() JS falhou: %s", exc)
+
+    # 4. Fallback final: força remoção do atributo `open`. Funciona mesmo se
+    # `close()` não existir (impl Vue customizada, polyfill antigo, etc).
+    try:
+        await page.evaluate(
+            """() => {
+                document.querySelectorAll('dialog.modal[open]').forEach(d => {
+                    try { d.removeAttribute('open'); } catch (e) {}
+                });
+            }"""
+        )
+        await heading.wait_for(state="hidden", timeout=2_000)
+        logger.debug("modal 'Importação realizada' fechado via removeAttribute('open')")
+        return
+    except Exception as exc:
         logger.warning(
-            "modal 'Importação realizada' não fechou após Escape — categorize pode falhar"
+            "modal 'Importação realizada' não fechou após 4 estratégias (X/Escape/close/removeAttr) — categorize vai falhar com pointer-event intercept: %s",
+            exc,
         )
 
 
