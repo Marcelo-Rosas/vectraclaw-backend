@@ -29,7 +29,7 @@ from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
-    AgentDomain, Routine,
+    AgentDomain, AgentExecutionMode, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
     Project, Run, RunTranscriptEntry,
 )
@@ -6434,6 +6434,35 @@ async def list_agent_domains(request: Request):
         return [AgentDomain(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_agent_domains failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/agent-execution-modes")
+@app.get("/agent-execution-modes")
+async def list_agent_execution_modes(request: Request):
+    """PR-EB — catálogo canônico de modos de execução.
+
+    Substitui CHECK hardcoded ('REALTIME','CRON','TRIGGER') por tabela com
+    config_schema declarado por modo. Frontend da tab Configuration usa
+    para popular o dropdown de Modo e renderizar form condicional dos
+    campos filhos quando o usuário seleciona um modo. Retorna apenas modos
+    ativos, ordenados por `display_order`.
+    """
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("agent_execution_modes")
+            .select(
+                "id,name,description,icon,color,display_order,config_schema,is_active"
+            )
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        return [AgentExecutionMode(**row).to_zod_dict() for row in (res.data or [])]
+    except Exception as e:
+        logger.error(f"list_agent_execution_modes failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
