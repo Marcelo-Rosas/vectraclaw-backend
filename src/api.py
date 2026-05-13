@@ -3719,6 +3719,26 @@ def _normalize_5w2h_payload(body: dict) -> dict:
     return result
 
 
+def _coerce_sipoc_responsavel(meta: dict) -> None:
+    """UI pode enviar `agente:<uuid>` para fixar o agente; contrato canônico e CHECK
+    em `workflow_steps.responsavel` aceitam só `agente` | `humano` | `sistema`.
+    Normaliza in-place: grava `responsibleAgentId` e redefine `responsavel` para o enum."""
+    raw = meta.get("responsavel")
+    if not isinstance(raw, str):
+        return
+    if raw in ("agente", "humano", "sistema"):
+        return
+    if raw.startswith("agente:"):
+        tail = raw.split(":", 1)[1].strip()
+        if tail:
+            meta["responsibleAgentId"] = tail
+        meta["responsavel"] = "agente"
+    elif raw.startswith("humano:"):
+        meta["responsavel"] = "humano"
+    elif raw.startswith("sistema:"):
+        meta["responsavel"] = "sistema"
+
+
 def _validate_5w2h(normalized: dict) -> dict:
     """Validate required 5W2H fields and return a status + error list (never blocks save).
 
@@ -3873,6 +3893,7 @@ async def create_workflow_step(company_id: str, request: Request):
         next_order = (max_res.data[0]["step_order"] + 1) if max_res.data else 1
 
         normalized = _normalize_5w2h_payload(body)
+        _coerce_sipoc_responsavel(normalized)
         validation = _validate_5w2h(normalized)
         nome = normalized.get("nome") or "Etapa"
         slug = _wf_slugify(nome)
@@ -3886,6 +3907,7 @@ async def create_workflow_step(company_id: str, request: Request):
             "slug": slug,
             "specialty_slug": specialty_slug,
             "requires_approval": requires_approval,
+            "responsavel": normalized.get("responsavel"),
             "sipoc_meta": normalized,
             "contract_version": "v2",
             "validation_status": validation["status"],
@@ -3914,6 +3936,7 @@ async def update_workflow_step(step_id: str, request: Request):
             raise HTTPException(404, "Workflow step not found")
 
         normalized = _normalize_5w2h_payload(body)
+        _coerce_sipoc_responsavel(normalized)
         validation = _validate_5w2h(normalized)
         nome = normalized.get("nome") or row.get("name") or "Etapa"
         requires_approval = normalized.get("responsavel") == "humano"
@@ -3924,6 +3947,7 @@ async def update_workflow_step(step_id: str, request: Request):
             "slug": _wf_slugify(nome),
             "specialty_slug": specialty_slug,
             "requires_approval": requires_approval,
+            "responsavel": normalized.get("responsavel"),
             "sipoc_meta": normalized,
             "contract_version": "v2",
             "validation_status": validation["status"],
