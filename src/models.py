@@ -24,7 +24,11 @@ class Agent(CamelModel):
     token_budget: int
     current_burn_rate: float
     adapter_type: str
+    # Task #2 — agente pode ter N specialties (relação 1:N via agent_specialty_configs).
+    # `specialty_id` mantido por backcompat (primeira da lista); `specialty_ids` é o
+    # array canônico. Frontend novo consome specialtyIds; antigo continua com specialtyId.
     specialty_id: Optional[str] = None
+    specialty_ids: List[str] = Field(default_factory=list)
     system_prompt: Optional[str] = None
     requires_approval: bool = False
     platform_url: Optional[str] = None

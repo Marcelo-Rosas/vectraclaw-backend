@@ -1776,20 +1776,27 @@ async def get_agents(request: Request, company_id: str = None):
             query = query.eq("company_id", company_id)
         res = query.execute()
 
-        # Fetch specialty_ids separately to avoid PostgREST join issues
+        # Task #2 — fetch specialty_ids (lista, N:1) via lookup separado.
+        # Bug anterior: `specialty_map[agent_id] = sc[specialty_id]` SOBRESCREVIA
+        # quando havia múltiplas specialties por agente (Oracle hoje tem 3:
+        # oracle-extract, oracle-rag, etc.). Agora acumula em lista.
         agent_ids = [r["id"] for r in res.data]
-        specialty_map: Dict[str, str] = {}
+        specialty_map: Dict[str, List[str]] = {}
         if agent_ids:
             try:
                 sc_res = client.table("agent_specialty_configs").select("agent_id,specialty_id").in_("agent_id", agent_ids).execute()
                 for sc in sc_res.data:
-                    specialty_map[sc["agent_id"]] = sc["specialty_id"]
+                    agent_id = sc["agent_id"]
+                    specialty_map.setdefault(agent_id, []).append(sc["specialty_id"])
             except Exception as sc_err:
                 logger.warning(f"specialty_configs lookup failed (non-fatal): {sc_err}")
 
         rows = []
         for row in res.data:
-            row["specialty_id"] = specialty_map.get(row["id"])
+            ids = specialty_map.get(row["id"], [])
+            row["specialty_ids"] = ids
+            # Backcompat: campo singular = primeira da lista (None se vazio)
+            row["specialty_id"] = ids[0] if ids else None
             rows.append(Agent(**row).to_zod_dict())
         return rows
     except Exception as e:
