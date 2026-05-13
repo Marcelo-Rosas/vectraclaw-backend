@@ -717,6 +717,40 @@ class AgentDomain(CamelModel):
         return d
 
 
+class OperationType(CamelModel):
+    """Task #52 — catálogo canônico dos operation_types.
+
+    Espelha o conteúdo do `Literal[...]` em Task.operation_type. Frontend
+    consome GET /api/operation-types para popular dropdowns dinamicamente
+    (em vez de hardcodar enum no Zod schema, que ficou desatualizado e
+    causou o bug do Edit Task com `planner-import-ofx`).
+
+    primary_agent_id é o "dono primário" do op_type — pode aparecer como
+    valor default no campo `assigned_to_agent_id` ao criar task. NULL
+    significa "qualquer agente".
+    """
+
+    id: str
+    name: str
+    description: Optional[str] = None
+    category: str
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    display_order: int = 100
+    primary_agent_id: Optional[str] = None
+    default_specialty_slug: Optional[str] = None
+    is_active: bool = True
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        for key in ("description", "icon", "color", "defaultSpecialtySlug"):
+            if d.get(key) is None:
+                d[key] = ""
+        if d.get("primaryAgentId") is None:
+            d["primaryAgentId"] = ""
+        return d
+
+
 class WorkflowLogicPattern(CamelModel):
     """Task #49 — catálogo canônico dos logic_patterns para workflow_steps.
 
