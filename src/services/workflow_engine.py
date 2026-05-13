@@ -77,6 +77,12 @@ class WorkflowStep(BaseModel):
     on_failure_step_id: UUID | None = None
     on_failure_action: FailureAction = FailureAction.BLOCK
 
+    # Engine v2 (Task #42 PoC SPLIT-IF) — interpretadores dos logic_patterns
+    # consomem estes campos. Mantidos opcionais para não quebrar steps SIMPLE
+    # do engine v1.
+    logic_pattern: str | None = None              # 'SIMPLE' | 'SPLIT-IF' | ...
+    decisions: list[dict] | None = None           # jsonb — só relevante p/ SPLIT/SWITCH
+
 
 # ---------- Exceptions ----------
 
@@ -194,3 +200,173 @@ class WorkflowEngine:
 def get_engine(client) -> WorkflowEngine:
     """Factory — wires SupabaseWorkflowRepository into the engine."""
     return WorkflowEngine(SupabaseWorkflowRepository(client))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Engine v2 — PoC do interpretador SPLIT-IF (Task #42)
+#
+# Permite que workflow_steps com logic_pattern='SPLIT-IF' resolvam
+# dinamicamente o próximo step baseado em uma condição contra o output_json
+# da task atual (task_context).
+#
+# Estrutura esperada de `decisions[0]`:
+#
+#     {
+#       "condition": {"field": "score", "op": "gt", "value": 80},
+#       "true_step_id":  "uuid-do-step-aprovado",
+#       "false_step_id": "uuid-do-step-reprovado"
+#     }
+#
+# `field` aceita dot notation: "score" ou "metadata.priority" ou
+# "categorization.lines_categorized".
+#
+# Ops suportados: eq, neq, gt, lt, gte, lte, in, not_in, exists.
+#
+# Demais patterns (SPLIT-SWITCH, MERGE, LOOP-BATCH, WAIT-EVENT, SUBFLOW,
+# ERROR-HANDLER) retornam NotImplementedError("pending") — task #42 escalará
+# para os demais após este PoC validar a abordagem.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class ConditionEvaluationError(WorkflowEngineError):
+    """Decision condition mal-formada ou field inacessível."""
+
+
+def _resolve_field(context: dict, path: str) -> object:
+    """Lê `context[a][b][c]` a partir de path com dot notation 'a.b.c'.
+
+    Retorna o sentinela `_MISSING` se algum nível não existe — caller decide
+    se isso é erro ou fallback.
+    """
+    parts = path.split(".") if path else []
+    cur: object = context
+    for p in parts:
+        if not isinstance(cur, dict):
+            return _MISSING
+        if p not in cur:
+            return _MISSING
+        cur = cur[p]
+    return cur
+
+
+_MISSING = object()
+
+
+def _evaluate_condition(condition: dict, context: dict) -> bool:
+    """Avalia uma condição contra um dict de contexto.
+
+    Suporta ops: eq, neq, gt, lt, gte, lte, in, not_in, exists.
+    Levanta ConditionEvaluationError se field ausente em ops que precisam
+    de valor (exceto `exists`/`not_in` que toleram).
+    """
+    if not isinstance(condition, dict):
+        raise ConditionEvaluationError(f"condition must be dict, got {type(condition).__name__}")
+
+    field = condition.get("field")
+    op = condition.get("op")
+    expected = condition.get("value")
+
+    if not field or not op:
+        raise ConditionEvaluationError(f"condition missing field/op: {condition!r}")
+
+    actual = _resolve_field(context, field)
+
+    if op == "exists":
+        return actual is not _MISSING
+    if op == "not_exists":
+        return actual is _MISSING
+
+    if actual is _MISSING:
+        raise ConditionEvaluationError(f"field {field!r} not found in context")
+
+    if op == "eq":
+        return actual == expected
+    if op == "neq":
+        return actual != expected
+    if op == "gt":
+        return _safe_compare(actual, expected, lambda a, b: a > b)
+    if op == "lt":
+        return _safe_compare(actual, expected, lambda a, b: a < b)
+    if op == "gte":
+        return _safe_compare(actual, expected, lambda a, b: a >= b)
+    if op == "lte":
+        return _safe_compare(actual, expected, lambda a, b: a <= b)
+    if op == "in":
+        if not isinstance(expected, (list, tuple, set)):
+            raise ConditionEvaluationError(f"op=in requires list value, got {type(expected).__name__}")
+        return actual in expected
+    if op == "not_in":
+        if not isinstance(expected, (list, tuple, set)):
+            raise ConditionEvaluationError(f"op=not_in requires list value, got {type(expected).__name__}")
+        return actual not in expected
+
+    raise ConditionEvaluationError(f"unsupported op: {op!r}")
+
+
+def _safe_compare(a: object, b: object, fn) -> bool:
+    """Aplica fn(a, b) coercendo numérico quando possível."""
+    try:
+        return fn(a, b)
+    except TypeError:
+        # tenta coerção numérica
+        try:
+            return fn(float(a), float(b))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise ConditionEvaluationError(f"cannot compare {a!r} {fn.__name__} {b!r}")
+
+
+def advance_v2(
+    engine: WorkflowEngine,
+    current: WorkflowStep,
+    outcome: StepOutcome,
+    task_context: dict | None = None,
+) -> WorkflowStep | None:
+    """Engine v2 PoC: interpreta logic_pattern do step para resolver próximo.
+
+    - SIMPLE (ou None): delega para `engine.advance(current, outcome)`.
+    - SPLIT-IF: avalia `current.decisions[0].condition` contra `task_context`,
+      retorna step apontado por `true_step_id` ou `false_step_id`.
+    - Outros patterns: NotImplementedError("pending") — task #42 escalará.
+
+    `task_context` é o `output_json` da task que executou o step atual
+    (ou input_json em casos especiais). Vem do daemon após `_complete_task`.
+    """
+    pattern = current.logic_pattern
+
+    # Failure: sempre usa fluxo legado (handler de exceção ou block)
+    if outcome is StepOutcome.FAILURE:
+        return engine.advance(current, outcome)
+
+    # SIMPLE ou ausente: comportamento engine v1
+    if pattern in (None, "SIMPLE"):
+        return engine.advance(current, outcome)
+
+    if pattern == "SPLIT-IF":
+        decisions = current.decisions or []
+        if not decisions:
+            raise ConditionEvaluationError(
+                f"step {current.step_code} é SPLIT-IF mas decisions[] vazio"
+            )
+        decision = decisions[0]
+        condition = decision.get("condition")
+        if not condition:
+            raise ConditionEvaluationError(
+                f"step {current.step_code} SPLIT-IF sem condition em decisions[0]"
+            )
+        outcome_bool = _evaluate_condition(condition, task_context or {})
+
+        target_id_str = decision.get("true_step_id" if outcome_bool else "false_step_id")
+        if not target_id_str:
+            logger.info(
+                "step %s SPLIT-IF outcome=%s sem target — workflow termina",
+                current.step_code, outcome_bool,
+            )
+            return None
+
+        return engine.get_step(UUID(target_id_str))
+
+    # Patterns ainda não implementados (task #42 escala depois)
+    raise NotImplementedError(
+        f"logic_pattern={pattern!r} ainda não tem handler (engine_handler='pending'). "
+        f"Veja task #42 e workflow_logic_patterns."
+    )
