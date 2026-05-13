@@ -689,6 +689,30 @@ class AgentSpecialty(CamelModel):
         return d
 
 
+class AgentDomain(CamelModel):
+    """PR-DA/DB — categorização canônica de skills.
+
+    Substitui o campo texto livre `agent_specialties.domain` por catálogo
+    com FK. Lido pela tab Skills (UI agrupa por domínio) e pelo NAV ADMIN
+    (filtros + dropdowns nos formulários de specialty).
+    """
+
+    id: str
+    name: str
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    display_order: int = 100
+    is_active: bool = True
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        for key in ("description", "icon", "color"):
+            if d.get(key) is None:
+                d[key] = ""
+        return d
+
+
 class AgentSpecialtyConfig(CamelModel):
     id: str
     company_id: str
