@@ -133,10 +133,26 @@ class AgentStatus:
 
 
 class AgentPatch(BaseModel):
+    """PATCH /api/agents/{id} — partial update.
+
+    Inclui campos editáveis via UI das tabs:
+    - instructions: system_prompt
+    - configuration: token_budget, platform_url
+    - misc (header do agente): name, role, reports_to_id, requires_approval
+
+    `extra = "ignore"` significa que campos enviados mas não declarados aqui
+    são SILENCIOSAMENTE descartados — se a UI envia algo que não vira UPDATE,
+    o endpoint retorna 400 `empty_patch` (todos os campos viraram None).
+    Quando adicionar suporte a um campo novo, lembre de declará-lo aqui.
+    """
+
     name: Optional[str] = None
     role: Optional[str] = None
     token_budget: Optional[int] = Field(default=None, alias="tokenBudget")
     reports_to_id: Optional[str] = Field(default=None, alias="reportsToId")
+    system_prompt: Optional[str] = Field(default=None, alias="systemPrompt")
+    platform_url: Optional[str] = Field(default=None, alias="platformUrl")
+    requires_approval: Optional[bool] = Field(default=None, alias="requiresApproval")
 
     class Config:
         populate_by_name = True
