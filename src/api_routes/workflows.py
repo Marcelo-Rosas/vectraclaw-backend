@@ -308,6 +308,19 @@ async def _save_workflow_definition_and_steps(
 @router.get("/api/companies/{company_id}/workflows")
 @router.get("/companies/{company_id}/workflows")
 async def list_company_workflows(request: Request, company_id: str):
+    """List workflows visíveis para a company: específicos dela + globais (company_id NULL).
+
+    Task #45 (consolidação): endpoint era duplicado em src/api.py:6755 (versão
+    monolítica) e aqui (versão moderna com steps_count + JWT validation). Versões
+    divergiam: a monolítica incluía workflows globais (company_id IS NULL) mas
+    não validava JWT nem populava steps_count; esta validava JWT e populava
+    steps_count mas filtrava só por company_id. Consolidado aqui — preserva todos
+    os comportamentos:
+      • company_id = X OR company_id IS NULL (globais visíveis a todas)
+      • is_active = true
+      • steps_count populado
+      • JWT validation
+    """
     from src.api import supabase, validate_jwt_company_id
 
     validate_jwt_company_id(request.state.token, company_id)
@@ -316,7 +329,8 @@ async def list_company_workflows(request: Request, company_id: str):
     res = (
         supabase.table("workflow_definitions")
         .select("*")
-        .eq("company_id", company_id)
+        .or_(f"company_id.eq.{company_id},company_id.is.null")
+        .eq("is_active", True)
         .order("name")
         .execute()
     )

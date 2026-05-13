@@ -6775,19 +6775,11 @@ async def approve_task(task_id: str, request: Request, body: ApproveTaskBody = A
 # ─────────────────────────────────────────────────────────────────────────────
 # VEC-237-I  Workflow CRUD
 # ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/companies/{company_id}/workflows")
-async def list_workflows(company_id: str, request: Request):
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Supabase não disponível")
-    res = (
-        supabase.table("workflow_definitions")
-        .select("*")
-        .or_(f"company_id.eq.{company_id},company_id.is.null")
-        .eq("is_active", True)
-        .execute()
-    )
-    return res.data or []
+#
+# Task #45 (consolidação): `GET /api/companies/{company_id}/workflows` foi
+# movido para src/api_routes/workflows.py (versão canônica do submodule),
+# que mescla os 2 comportamentos divergentes: visibility company+global,
+# is_active filter, steps_count enrichment e JWT validation.
 
 
 @app.get("/api/workflows/{workflow_id}/steps")
