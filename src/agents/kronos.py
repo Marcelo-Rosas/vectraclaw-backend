@@ -1409,17 +1409,43 @@ def _normalize_kronos_input_key(key: str) -> str:
 
 
 def resolve_kronos_inputs(task: dict) -> dict[str, str]:
-    """Resolve parâmetros Kronos de input_json, description e variáveis de ambiente."""
+    """Resolve parâmetros Kronos com cadeia de precedência.
+
+    VEC-XXX PR4: `task["_resolved_config"]` (preenchido pelo hook do
+    `agent_daemon._populate_resolved_specialty`) tem prioridade sobre as
+    fontes legadas. Permite que `agent_specialty_configs.values` seja a
+    fonte de verdade quando preenchido, mantendo backcompat 100% para
+    tasks sem specialty resolvida.
+
+    Cadeia (maior → menor precedência):
+        1. task["_resolved_config"]     (specialty config, snake_case)
+        2. task.input_json              (override por task)
+        3. task.description KEY=VALUE   (formato legacy)
+        4. env vars                     (default global)
+    """
     resolved: dict[str, str] = {}
-    input_json = task.get("input_json") or {}
-    if isinstance(input_json, dict):
-        for key, value in input_json.items():
+
+    # 1. specialty config (PR4)
+    resolved_config = task.get("_resolved_config") or {}
+    if isinstance(resolved_config, dict):
+        for key, value in resolved_config.items():
             if value is None:
                 continue
             normalized = _normalize_kronos_input_key(key)
             if normalized in _KRONOS_INPUT_KEYS:
                 resolved[normalized] = str(value).strip()
 
+    # 2. input_json
+    input_json = task.get("input_json") or {}
+    if isinstance(input_json, dict):
+        for key, value in input_json.items():
+            if value is None:
+                continue
+            normalized = _normalize_kronos_input_key(key)
+            if normalized in _KRONOS_INPUT_KEYS and not resolved.get(normalized):
+                resolved[normalized] = str(value).strip()
+
+    # 3. description KEY=VALUE
     desc = task.get("description", "") or ""
     for key in _KRONOS_INPUT_KEYS:
         if not resolved.get(key):
@@ -1427,6 +1453,7 @@ def resolve_kronos_inputs(task: dict) -> dict[str, str]:
             if value:
                 resolved[key] = value
 
+    # 4. env vars
     for key in _KRONOS_INPUT_KEYS:
         if not resolved.get(key):
             env_value = os.getenv(f"KRONOS_{key}") or (
