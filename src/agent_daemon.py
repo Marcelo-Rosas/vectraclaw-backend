@@ -157,7 +157,10 @@ class ResilientHarnessDaemon:
         try:
             res = (
                 client.table("tasks")
-                .select("id,company_id,title,description,operation_type,budget_limit,executor_type,input_json")
+                .select(
+                    "id,company_id,title,description,operation_type,budget_limit,"
+                    "executor_type,input_json,parent_task_id"
+                )
                 .eq("assigned_to_agent_id", self.agent_id)
                 .eq("status", "queued")
                 .neq("executor_type", "managed_agent")  # ignora CMA tasks
