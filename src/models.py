@@ -137,6 +137,10 @@ class Task(CamelModel):
         # VEC-416: Kronos pivot — Meu Planner Financeiro via Playwright
         "planner-import-ofx",
         "planner-categorize-pendings",
+        # Task #18 (sessão 2026-05-14): workflow kronos-audit-historico
+        "kronos-audit-historico",
+        "audit-review",
+        "planner-apply-corrections",
         "other",
     ] = "other"
     budget_limit: int
@@ -855,6 +859,18 @@ class AgentSpecialtyConfig(CamelModel):
     values: Dict[str, Any]
     created_at: datetime
     updated_at: datetime
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        if d.get("values") is None:
+            d["values"] = {}
+        for k in ("createdAt", "updatedAt"):
+            v = d.get(k)
+            if isinstance(v, datetime):
+                d[k] = v.isoformat().replace("+00:00", "Z")
+            elif isinstance(v, str):
+                d[k] = v.replace("+00:00", "Z")
+        return d
 
 
 class AgentSharedConfig(CamelModel):
