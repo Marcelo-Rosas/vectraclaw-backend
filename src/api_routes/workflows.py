@@ -368,16 +368,37 @@ async def _save_workflow_definition_and_steps(
     if not supabase:
         raise HTTPException(status_code=503, detail="supabase_required")
 
-    existing = (
+    # postgrest-py 0.13.2: maybe_single() retorna None ao invés de
+    # {"data": None} quando não acha. Usamos .limit(1) e tratamos como lista.
+    #
+    # Lookup duplo: 1) workflow company-specific 2) workflow global (company_id NULL).
+    # Edita o que aparecer (global continua editável pra company que o vê);
+    # se nenhum existir, INSERT cria company-specific novo.
+    # Restaura HOTFIX-7 perdido em merge posterior.
+    existing_co = (
         supabase.table("workflow_definitions")
         .select("*")
         .eq("company_id", company_id)
         .eq("slug", slug)
-        .maybe_single()
+        .limit(1)
         .execute()
     )
+    co_rows = list(existing_co.data or [])
+    wf_row: Optional[Dict[str, Any]] = co_rows[0] if co_rows else None
+    if wf_row is None:
+        existing_global = (
+            supabase.table("workflow_definitions")
+            .select("*")
+            .is_("company_id", "null")
+            .eq("slug", slug)
+            .limit(1)
+            .execute()
+        )
+        gl_rows = list(existing_global.data or [])
+        if gl_rows:
+            wf_row = gl_rows[0]
+
     now = datetime.now(timezone.utc).isoformat()
-    wf_row = existing.data
     sector_fallback = None
 
     # PR-T1: trigger fields opcionais — só propaga ao DB quando vieram no payload
