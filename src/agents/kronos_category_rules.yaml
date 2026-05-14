@@ -103,9 +103,11 @@ rules:
   categoria: Despesas Pessoais
   subcategoria: 'Despesas Pessoais: Uso Pessoal (Camilla)'
 - pattern: Pix enviado para VECTRA CARGO
-  # Pix da PF para a própria empresa = transferência entre empresa/PF
-  categoria: Transferências / Movimentações Internas
-  subcategoria: 'Movimentação bancária - Empresa'
+  # User clarificou em 2026-05-14: alinhar com VECTRA HUB (transferência
+  # entre contas próprias do grupo). Categoria sem prefixo "Receita" pra
+  # saídas.
+  categoria: Movimentações Internas
+  subcategoria: 'Transferência entre C/C'
 - pattern: Pix enviado para GOOGLE CLOUD BRASIL
   categoria: Despesa Administrativa
   subcategoria: 'Despesa Administrativa – Sistema IA'
@@ -113,26 +115,59 @@ rules:
   categoria: Despesa Administrativa
   subcategoria: 'Despesa Administrativa – Sistema IA'
 
-# ── TODO: casos ambíguos remanescentes (não resolvidos pelo user) ──
-#
-# Familiares — categoria pessoal mas subcategoria depende do uso:
-#   Carolina Azevedo Serran Vieira
-#   CRISTINA AZEVEDO SERRAN VIEIRA
-#   Andryelle Vargas Coimbra
-#   Renné Junior Rodrigues dos Santos
-#   JOSE BATINGA PEREIRA
-#   LEANDRO DE OLIVEIRA
-#
-# Operacional/empresarial — categoria depende do contexto:
+# ── Batch resolvido pelo user em 2026-05-14 (smoke iter 2) ──
+# Patterns que estavam pendentes nesse bloco TODO até hoje. Ditados após
+# 19 lançamentos do extrato semana-1-maio-26 ficaram unclassified.
+
+# -- Familiares (Pix enviado para) --
+- pattern: Pix enviado para Carolina Azevedo Serran Vieira
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Pix enviado para CRISTINA AZEVEDO SERRAN VIEIRA
+  # User confirmou: empréstimo, não uso normal
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Empréstimo Pessoal'
+- pattern: Pix enviado para Andryelle Vargas Coimbra
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal (Camilla)'
+- pattern: Pix enviado para Rennã Junior Rodrigues dos Santos
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal (Camilla)'
+- pattern: Pix enviado para JOSE BATINGA PEREIRA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# -- Operacionais (frete e administrativo) --
+- pattern: Pix enviado para LEANDRO DE OLIVEIRA
+  # Motorista — adiantamento de frete pagamento à vista
+  categoria: Custos Operacionais - Frete e Transporte
+  subcategoria: 'Frete – Pagamento à Vista'
+- pattern: Pix enviado para UNIFIQUE TELECOMUNICACOES
+  # Internet do escritório (2 linhas — fixo + redundância)
+  categoria: Custos Operacionais – Escritório Itajaí
+  subcategoria: 'Escritório - Internet 2x'
+
+# -- Estabelecimentos / serviços (uso pessoal mesmo quando pj-like) --
+- pattern: Pix enviado para ZOOP BRASIL
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Pix enviado para CAPPTA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Pix enviado para HAVAN FUNDO DE INVESTIMENTO
+  # Compra na Havan (varejo) — não é investimento
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal (Camilla)'
+- pattern: POSTO DE COMBUSTIVEIS TIO GUSTA
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: 226 LIV CTBA
+  # Débito cartão livraria curitiba (descrição nativa OFX, não enriquecida)
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
+
+# ── TODO remanescente ──
 #   Centro Educacional Sinergia Ltda  (escola: filhos? alunos?)
-#   UNIFIQUE TELECOMUNICACOES         (internet: galpão? pessoal?)
-#   ZOOP BRASIL                        (payment processor)
-#   CAPPTA                             (POS / pagamentos)
-#   FRETEBRAS INTERNET E SERVICOS      (frete: Custos Operacionais?)
-#   J L CESCON ME (Pagamento)          (fornecedor: Despesas Operacionais?)
-#   HAVAN FUNDO DE INVESTIMENTO        (investimento?)
-#   VECTRA HUB LTDA (saída/entrada)    (transferência entre empresas?)
-#   226 LIV CTBA                       (livraria?)
 
 # ── 2. Regras bootstrap do CSV histórico ──
 - pattern: FAST MARKET            NAVEGANTES    BRA
