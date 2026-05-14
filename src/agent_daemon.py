@@ -462,6 +462,31 @@ class ResilientHarnessDaemon:
             result = entrypoint_categorize_pendings(task, self._get_supabase())
             return _json.dumps(result)
 
+        # Task #18 (sessão 2026-05-14): workflow kronos-audit-historico
+        if op_type == "kronos-audit-historico":
+            from src.agents.kronos_audit import entrypoint_kronos_audit
+            result = entrypoint_kronos_audit(task, self._get_supabase())
+            return _json.dumps(result)
+
+        if op_type == "planner-apply-corrections":
+            from src.agents.kronos_apply_corrections import entrypoint_apply_corrections
+            result = entrypoint_apply_corrections(task, self._get_supabase())
+            return _json.dumps(result)
+
+        # audit-review NÃO tem handler que executa lógica — ao ser pegada
+        # da fila, transiciona a task pra `review` (o endpoint POST
+        # /api/tasks/{id}/approve em api.py:6888 só aceita status='review'
+        # ou 'blocked'). Quando user aprova, endpoint promove pra `queued`
+        # e o sucessor planner-apply-corrections roda via promote_successors.
+        if op_type == "audit-review":
+            return _json.dumps({
+                "status": "review",
+                "output_json": {
+                    "info": "task aguarda aprovação humana — POST /api/tasks/{id}/approve",
+                    "approval_endpoint": "/api/tasks/{task_id}/approve",
+                },
+            })
+
         if op_type == "oracle-report":
             from src.agents.hermes_reporter import entrypoint as hr_entry
             result = hr_entry(task)

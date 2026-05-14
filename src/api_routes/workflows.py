@@ -246,7 +246,10 @@ _ROUTINE_OP_TYPE_WHITELIST = {
     "email_lead", "route-cost-calculation", "freight-quotation",
     "crm-fill", "crm-fill-precheck", "financial-audit",
     "financial-bookkeeping", "planner-import-ofx",
-    "planner-categorize-pendings", "other",
+    "planner-categorize-pendings",
+    # Task #18 (sessão 2026-05-14): audit histórico
+    "kronos-audit-historico", "planner-apply-corrections",
+    "other",
 }
 
 
