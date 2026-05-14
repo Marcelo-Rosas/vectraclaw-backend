@@ -355,9 +355,15 @@ async def _save_workflow_definition_and_steps(
     meta = body.workflow
     slug = _slugify_workflow(meta.name, slug_from_path or meta.slug)
     graph_steps = _steps_for_validation(body.steps)
-    violations = validate_workflow_steps(graph_steps)
-    if violations:
-        raise HTTPException(status_code=422, detail={"violations": violations})
+    # Workflow vazio é permitido (rascunho n8n-style): user cria a
+    # definição primeiro, depois adiciona steps pelo canvas. Validação só
+    # roda quando HÁ steps. A materialização (TaskFactory) faz validação
+    # estrita depois — não dá pra rodar workflow vazio mesmo.
+    # Restaurando comportamento do commit e319fed (regressão posterior).
+    if graph_steps:
+        violations = validate_workflow_steps(graph_steps)
+        if violations:
+            raise HTTPException(status_code=422, detail={"violations": violations})
 
     if not supabase:
         raise HTTPException(status_code=503, detail="supabase_required")
