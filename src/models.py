@@ -791,6 +791,34 @@ class WorkflowLogicPattern(CamelModel):
         return d
 
 
+class WorkflowTriggerType(CamelModel):
+    """PR-T1 — catálogo canônico de trigger types para workflow_definitions.
+
+    Define COMO um workflow é disparado. FK em workflow_definitions.trigger_type.
+
+    Slugs canônicos (4):
+    - manual:  disparo humano via UI ou API
+    - cron:    agendado por cron expression (daemon cron faz dispatch)
+    - webhook: disparado por POST externo (URL única — não implementado ainda)
+    - event:   disparado por evento interno (heartbeat, task done — não impl ainda)
+
+    Read-only via GET /api/workflow-trigger-types. Mutações por migration apenas.
+    """
+
+    slug: str
+    name: str
+    description: str
+    icon: Optional[str] = None
+    display_order: int = 100
+    is_active: bool = True
+
+    def to_zod_dict(self):
+        d = self.dict(by_alias=True)
+        if d.get("icon") is None:
+            d["icon"] = ""
+        return d
+
+
 class AgentExecutionMode(CamelModel):
     """PR-EA/EB — catálogo canônico de modos de execução.
 
