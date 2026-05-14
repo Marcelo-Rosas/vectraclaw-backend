@@ -796,6 +796,60 @@ async def _set_select_by_label(combobox_locator, label: str) -> None:
     await _set_select_value_robust(combobox_locator, match["value"])
 
 
+async def _maximize_rows_per_page(page) -> None:
+    """Tenta selecionar o maior valor no select 'Mostrar lançamentos por página'.
+
+    Sem isso, _find_next_uncategorized_row só lê a 1ª página da tabela e o
+    loop sai antes de cobrir todas as linhas pendentes (smoke 2026-05-14
+    confirmou tabela com 6 páginas × 25 linhas).
+
+    Estratégias em ordem (best-effort):
+    1. select[name='per_page'] → select 150 ou max
+    2. select próximo ao texto "lançamentos por página"
+    3. último <select> da página
+
+    Falha silenciosamente — se nada casar, loop atual roda só primeira
+    página (comportamento pré-patch).
+    """
+    candidates = [
+        "select[name='per_page']",
+        "select[name='perPage']",
+        "select[id*='per-page' i]",
+        "select[id*='perPage' i]",
+        "select[aria-label*='página' i]",
+        "select[aria-label*='page' i]",
+    ]
+    for sel in candidates:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count() == 0:
+                continue
+            options = await loc.locator("option").all_inner_texts()
+            numeric = []
+            for opt in options:
+                try:
+                    numeric.append((int("".join(c for c in opt if c.isdigit())), opt))
+                except ValueError:
+                    continue
+            if not numeric:
+                continue
+            numeric.sort(reverse=True)
+            target_label = numeric[0][1]
+            await loc.select_option(label=target_label)
+            logger.info(
+                "_maximize_rows_per_page: selector=%s set='%s'",
+                sel, target_label,
+            )
+            await asyncio.sleep(0.8)  # aguarda tabela re-renderizar
+            return
+        except Exception as exc:
+            logger.debug("_maximize_rows_per_page tentativa falhou (%s): %s", sel, exc)
+            continue
+    logger.warning(
+        "_maximize_rows_per_page: nenhum select casou — categorize roda só 1ª página"
+    )
+
+
 async def _categorize_pending_lines(
     session: KronosPlannerSession,
     rules: list[Rule],
@@ -816,6 +870,14 @@ async def _categorize_pending_lines(
     """
     page = session.page
     assert page is not None, "KronosPlannerSession sem page ativa"
+
+    # Tabela do Meu Planner pagina (default 25 linhas/página, 6 páginas pro
+    # OFX semanal). _find_next_uncategorized_row só lê rows da página visível,
+    # então sem maximizar o rows-per-page o loop quebra após a 1ª página.
+    # Fix: escolher 150 (cobre todos os lançamentos de uma semana num único
+    # OFX). Best-effort: se o select não existir ou label divergir, segue
+    # mesmo assim e loga warning.
+    await _maximize_rows_per_page(page)
 
     stats: dict[str, Any] = {
         "lines_categorized": 0,
