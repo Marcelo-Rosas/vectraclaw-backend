@@ -570,6 +570,90 @@ async def upsert_company_workflow_put(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.delete("/api/companies/{company_id}/workflows/{slug}")
+@router.delete("/companies/{company_id}/workflows/{slug}")
+async def delete_company_workflow(
+    request: Request, company_id: str, slug: str
+):
+    """Remove um workflow definition + steps.
+
+    Semântica alinhada com upsert/list:
+    - Lookup company-specific PRIMEIRO; se não achar, fallback global
+      (company_id IS NULL).
+    - Pausa routines vinculadas (não DELETE — preserva histórico de
+      runs/agendamento). PR-T3 futuro vai deprecar essas routines.
+    - DELETE workflow_steps + workflow_definitions (FK on delete cascade
+      cobriria steps, mas executamos explícito para garantir ordem +
+      facilitar telemetria).
+
+    Retorna 204 No Content em sucesso, 404 se workflow não existe.
+    """
+    from src.api import supabase, validate_jwt_company_id
+    from fastapi import Response
+
+    validate_jwt_company_id(request.state.token, company_id)
+    if not supabase:
+        raise HTTPException(status_code=503, detail="supabase_required")
+
+    # Lookup company-specific primeiro
+    co_res = (
+        supabase.table("workflow_definitions")
+        .select("id, slug, name, company_id")
+        .eq("company_id", company_id)
+        .eq("slug", slug)
+        .limit(1)
+        .execute()
+    )
+    wf_row: Optional[Dict[str, Any]] = (co_res.data or [None])[0]
+
+    # Fallback global
+    if wf_row is None:
+        gl_res = (
+            supabase.table("workflow_definitions")
+            .select("id, slug, name, company_id")
+            .is_("company_id", "null")
+            .eq("slug", slug)
+            .limit(1)
+            .execute()
+        )
+        wf_row = (gl_res.data or [None])[0]
+
+    if wf_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "workflow_not_found", "slug": slug},
+        )
+
+    wf_id = str(wf_row["id"])
+
+    # Pausa routines vinculadas (preserva histórico)
+    try:
+        supabase.table("routines").update({"status": "paused"}).eq(
+            "workflow_definition_id", wf_id
+        ).execute()
+    except Exception as exc:
+        logger.warning(
+            "delete_workflow: pause routines failed wf=%s err=%s", wf_id, exc
+        )
+
+    # DELETE steps + workflow
+    try:
+        supabase.table("workflow_steps").delete().eq("workflow_id", wf_id).execute()
+        supabase.table("workflow_definitions").delete().eq("id", wf_id).execute()
+    except PostgrestAPIError as exc:
+        logger.error("delete_workflow failed wf=%s err=%s", wf_id, exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("delete_workflow unexpected wf=%s err=%s", wf_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    logger.info(
+        "delete_workflow OK wf=%s slug=%s scope=%s",
+        wf_id, slug, "company" if wf_row.get("company_id") else "global",
+    )
+    return Response(status_code=204)
+
+
 @router.post("/api/companies/{company_id}/workflows/import")
 @router.post("/companies/{company_id}/workflows/import")
 async def import_company_workflow(
