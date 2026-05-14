@@ -209,8 +209,9 @@ async def _run_planner_import_async(
     rules = _load_categorization_rules()
 
     # VEC-425: carrega PDF lookup pra enriquecer descrições genéricas (TRANSF
-    # ENVIADA PIX → "Pix enviado para NOME") quando PDF_PATH é informado.
-    pdf_lookup = _load_pdf_lookup(inputs.get("PDF_PATH"))
+    # ENVIADA PIX → "Pix enviado para NOME"). Fallback: se PDF_PATH ausente,
+    # usa OFX_PATH (auto-detect picka .pdf mais recente do mesmo dir).
+    pdf_lookup = _load_pdf_lookup(inputs.get("PDF_PATH") or inputs.get("OFX_PATH"))
 
     screenshot_path: Optional[str] = None
     toast_text = ""
@@ -307,7 +308,9 @@ async def _run_categorize_only_async(
             },
         }
 
-    pdf_lookup = _load_pdf_lookup(inputs.get("PDF_PATH"))
+    # VEC-425 (auto-detect): se PDF_PATH ausente, cai no OFX_PATH e picka o
+    # .pdf mais recente do diretório.
+    pdf_lookup = _load_pdf_lookup(inputs.get("PDF_PATH") or inputs.get("OFX_PATH"))
 
     logger.info(
         "task=%s: categorize-only — %d regras carregadas, PDF lookup=%s",
@@ -1061,6 +1064,9 @@ def _load_pdf_lookup(
 ) -> Optional[dict[tuple[str, int], str]]:
     """Carrega lookup do PDF do extrato (best-effort).
 
+    Aceita `pdf_path_str` como arquivo `.pdf` direto OU diretório — neste
+    último caso, picka o `.pdf` mais recente por mtime (VEC-425 spec).
+
     Retorna `None` se path ausente, file não existe, ou parse falha. Quando
     `None`, categorize roda sem enrichment (comportamento pré-VEC-425).
     """
@@ -1070,6 +1076,19 @@ def _load_pdf_lookup(
     if not pdf_path.exists():
         logger.warning("PDF_PATH não existe: %s — sem enrichment", pdf_path)
         return None
+    if pdf_path.is_dir():
+        candidates = sorted(
+            pdf_path.glob("*.pdf"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            logger.info(
+                "PDF_PATH=%s é diretório sem .pdf — sem enrichment", pdf_path
+            )
+            return None
+        pdf_path = candidates[0]
+        logger.info("PDF auto-detect: usando %s (mais recente)", pdf_path.name)
     try:
         entries = parse_c6_pdf(pdf_path)
     except Exception as exc:
