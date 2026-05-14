@@ -160,6 +160,39 @@ def entrypoint_categorize_pendings(task: dict, supabase_client: Any) -> dict:
 # ── Flow real ─────────────────────────────────────────────────────────────
 
 
+def _workflow_has_categorize_step(task: dict, supabase_client: Any) -> bool:
+    """Detecta se a task atual pertence a um workflow com sibling step de
+    operation_type='planner-categorize-pendings'.
+
+    Quando True, o handler de import OFX pula o categorize inline pós-import
+    porque o Step 2 já vai cobrir (e mais rápido, com página fresca sem o
+    modal Importação residual).
+
+    Best-effort: erro de query → retorna False (preserva inline). Tasks
+    ad-hoc sem parent_task_id retornam False imediatamente.
+    """
+    parent_id = task.get("parent_task_id")
+    if not parent_id or supabase_client is None:
+        return False
+    try:
+        sib = (
+            supabase_client.table("tasks")
+            .select("id")
+            .eq("parent_task_id", parent_id)
+            .eq("operation_type", "planner-categorize-pendings")
+            .neq("id", task.get("id"))
+            .limit(1)
+            .execute()
+        )
+        return bool(sib.data)
+    except Exception as exc:
+        logger.warning(
+            "_workflow_has_categorize_step falhou (%s) — mantendo categorize inline",
+            exc,
+        )
+        return False
+
+
 async def _run_planner_import_async(
     task: dict, supabase_client: Any
 ) -> dict:
@@ -236,8 +269,25 @@ async def _run_planner_import_async(
                 await session.wait_for_loading_overlay()
                 await _wait_for_lancamentos_populated(session.page)
 
-            # VEC-423: após import OK + modal fechado, categoriza linhas
-            if rules:
+            # VEC-423: após import OK + modal fechado, categoriza linhas.
+            # Em workflow context (parent_task_id) com Step 2 declarado
+            # (operation_type='planner-categorize-pendings'), pula o
+            # categorize inline: Step 2 abre página fresca (sem modal
+            # Importação residual) e cobre o mesmo trabalho ~10x mais rápido.
+            # Mantém inline pra tasks ad-hoc sem workflow (retrocompat).
+            skip_inline = _workflow_has_categorize_step(task, supabase_client)
+            if skip_inline:
+                logger.info(
+                    "task=%s: pulando categorize inline — workflow tem Step 2 categorize-pendings",
+                    task_id,
+                )
+                categorization_stats = {
+                    "lines_categorized": 0,
+                    "lines_unclassified": 0,
+                    "lines_failed": 0,
+                    "skipped": "delegated_to_workflow_step",
+                }
+            elif rules:
                 try:
                     categorization_stats = await _categorize_pending_lines(
                         session, rules, pdf_lookup=pdf_lookup
