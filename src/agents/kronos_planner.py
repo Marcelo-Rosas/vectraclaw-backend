@@ -228,6 +228,14 @@ async def _run_planner_import_async(
             await session.wait_for_loading_overlay()
             await _wait_for_lancamentos_populated(session.page)
 
+            # Filtra tabela pelo período do OFX antes de categorizar — reduz
+            # de ~112 páginas (todo o histórico) para 1-3 páginas (só o batch).
+            ofx_period = _extract_ofx_period(target_file)
+            if ofx_period:
+                await _apply_period_filter(session.page, ofx_period[0], ofx_period[1])
+                await session.wait_for_loading_overlay()
+                await _wait_for_lancamentos_populated(session.page)
+
             # VEC-423: após import OK + modal fechado, categoriza linhas
             if rules:
                 try:
@@ -329,6 +337,28 @@ async def _run_categorize_only_async(
             await session.dismiss_known_modals()
             await session.wait_for_loading_overlay()
             await _wait_for_lancamentos_populated(page)
+
+            # Filtra por período do OFX (categorize-only): resolve via cursor
+            # last_processed_ofx. Sem cursor não há como saber o batch — segue
+            # sem filtro (cai no maximize_rows_per_page como fallback).
+            ofx_path_str = inputs.get("OFX_PATH", "")
+            if ofx_path_str:
+                ofx_root = Path(ofx_path_str)
+                target_file: Optional[Path] = None
+                if ofx_root.is_file():
+                    target_file = ofx_root
+                elif ofx_root.is_dir():
+                    cursor = _read_cursor(supabase_client, routine_id)
+                    if cursor:
+                        candidate = ofx_root / cursor
+                        if candidate.exists():
+                            target_file = candidate
+                if target_file is not None:
+                    ofx_period = _extract_ofx_period(target_file)
+                    if ofx_period:
+                        await _apply_period_filter(page, ofx_period[0], ofx_period[1])
+                        await session.wait_for_loading_overlay()
+                        await _wait_for_lancamentos_populated(page)
 
             categorization_stats = await _categorize_pending_lines(
                 session, rules, pdf_lookup=pdf_lookup
@@ -794,6 +824,150 @@ async def _set_select_by_label(combobox_locator, label: str) -> None:
         )
 
     await _set_select_value_robust(combobox_locator, match["value"])
+
+
+
+_PT_BR_MONTHS = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3,
+    "abril": 4, "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
+    "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+
+
+def _extract_ofx_period(ofx_file: Path) -> Optional[tuple]:
+    """Parse DTSTART/DTEND do header OFX. Retorna (start_date, end_date) ou None.
+
+    Tolerância ±1 dia aplicada pra cobrir DTPOSTED UTC vs BRT.
+    """
+    import re as _re
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        text = ofx_file.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning("_extract_ofx_period: leitura falhou (%s)", exc)
+        return None
+
+    m_start = _re.search(r"<DTSTART>\s*(\d{8})", text)
+    m_end = _re.search(r"<DTEND>\s*(\d{8})", text)
+    if not (m_start and m_end):
+        logger.warning("_extract_ofx_period: DTSTART/DTEND ausentes em %s", ofx_file.name)
+        return None
+
+    try:
+        s = m_start.group(1)
+        e = m_end.group(1)
+        start = _date(int(s[:4]), int(s[4:6]), int(s[6:8])) - _td(days=1)
+        end = _date(int(e[:4]), int(e[4:6]), int(e[6:8])) + _td(days=1)
+    except (ValueError, IndexError) as exc:
+        logger.warning("_extract_ofx_period: parse falhou (%s)", exc)
+        return None
+
+    logger.info(
+        "_extract_ofx_period: %s → %s a %s (±1d tolerância)",
+        ofx_file.name, start.isoformat(), end.isoformat(),
+    )
+    return (start, end)
+
+
+async def _navigate_calendar_to_month(popup, target_year: int, target_month: int) -> bool:
+    """Navega prev/next no react-day-picker até o caption casar (year, month).
+
+    Limite de 24 cliques (2 anos) pra evitar loop infinito. Retorna True se
+    chegou, False se desistiu.
+    """
+    caption = popup.locator("#react-day-picker-1")
+    for _ in range(24):
+        try:
+            label = (await caption.inner_text()) or ""
+        except Exception:
+            return False
+        parts = label.lower().strip().split()
+        if len(parts) < 2:
+            return False
+        month_name, year_str = parts[0], parts[-1]
+        cur_month = _PT_BR_MONTHS.get(month_name)
+        try:
+            cur_year = int(year_str)
+        except ValueError:
+            return False
+        if cur_month is None:
+            return False
+        if cur_year == target_year and cur_month == target_month:
+            return True
+
+        # Decide direção
+        if (cur_year, cur_month) < (target_year, target_month):
+            await popup.locator('button[name="next-month"]').click()
+        else:
+            await popup.locator('button[name="previous-month"]').click()
+        await asyncio.sleep(0.25)
+    return False
+
+
+async def _apply_period_filter(page, start_date, end_date) -> bool:
+    """Aplica filtro de período no date-range picker da tabela de lançamentos.
+
+    Input é readonly (não aceita .fill) — fluxo: click pra abrir popup, navega
+    calendário até o mês inicial, clica no dia inicial, navega até mês final,
+    clica no dia final, fecha popup. Best-effort: retorna False se algo falhar.
+
+    Reduz a base da tabela de TODO o histórico do user (112 páginas) para
+    apenas o batch do OFX importado (1-3 páginas).
+    """
+    try:
+        date_input = page.locator(
+            'div.order-1.col-span-12 input[readonly]'
+        ).first
+        if await date_input.count() == 0:
+            # Fallback selector mais genérico
+            date_input = page.locator('input[readonly].cursor-pointer').first
+        if await date_input.count() == 0:
+            logger.warning("_apply_period_filter: date input não encontrado")
+            return False
+
+        await date_input.click()
+        popup = page.locator('div.absolute.dropdown-content.z-50').first
+        await popup.wait_for(state="visible", timeout=3_000)
+
+        # 1. Navega + clica início
+        ok = await _navigate_calendar_to_month(popup, start_date.year, start_date.month)
+        if not ok:
+            logger.warning(
+                "_apply_period_filter: não navegou pra mês inicial %d/%d",
+                start_date.month, start_date.year,
+            )
+            return False
+        await popup.locator('button[name="day"]').filter(
+            has_text=f"^{start_date.day}$"
+        ).first.click()
+        await asyncio.sleep(0.4)
+
+        # 2. Navega + clica fim
+        ok = await _navigate_calendar_to_month(popup, end_date.year, end_date.month)
+        if not ok:
+            logger.warning(
+                "_apply_period_filter: não navegou pra mês final %d/%d",
+                end_date.month, end_date.year,
+            )
+            return False
+        await popup.locator('button[name="day"]').filter(
+            has_text=f"^{end_date.day}$"
+        ).first.click()
+        await asyncio.sleep(0.4)
+
+        # 3. Fecha popup (Escape ou click fora)
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.8)  # aguarda tabela re-renderizar
+        logger.info(
+            "_apply_period_filter: aplicado %s → %s",
+            start_date.isoformat(), end_date.isoformat(),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("_apply_period_filter falhou: %s", exc)
+        return False
+
 
 
 async def _maximize_rows_per_page(page) -> None:
