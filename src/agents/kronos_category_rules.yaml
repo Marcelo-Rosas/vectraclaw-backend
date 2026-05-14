@@ -126,7 +126,11 @@ rules:
 - pattern: Pix enviado para CRISTINA AZEVEDO SERRAN VIEIRA
   # User confirmou: empréstimo, não uso normal
   categoria: Despesas Pessoais
-  subcategoria: 'Despesas Pessoais: Empréstimo Pessoal'
+  # User-confirmed (2026-05-14): Planner usa singular "Despesa" nessa
+  # subcategoria específica (typo do próprio Planner — diferente das outras
+  # que são "Despesas: ..."). Sem o fix, _apply_categorization falha e o
+  # loop entra em retry infinito (Task #17).
+  subcategoria: 'Despesa Pessoais: Empréstimo Pessoal'
 - pattern: Pix enviado para Andryelle Vargas Coimbra
   categoria: Despesas Pessoais
   subcategoria: 'Despesas Pessoais: Uso Pessoal (Camilla)'
