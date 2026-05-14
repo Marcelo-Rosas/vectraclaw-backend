@@ -462,15 +462,33 @@ async def list_company_workflows(request: Request, company_id: str):
     validate_jwt_company_id(request.state.token, company_id)
     if not supabase:
         raise HTTPException(status_code=503, detail="supabase_required")
-    res = (
+    # postgrest-py 0.13.2 não expõe .or_() no SyncSelectRequestBuilder.
+    # Fazemos union manual: workflows da company + globais (company_id IS NULL).
+    res_co = (
         supabase.table("workflow_definitions")
         .select("*")
-        .or_(f"company_id.eq.{company_id},company_id.is.null")
+        .eq("company_id", company_id)
         .eq("is_active", True)
         .order("name")
         .execute()
     )
-    rows = list(res.data or [])
+    res_global = (
+        supabase.table("workflow_definitions")
+        .select("*")
+        .is_("company_id", "null")
+        .eq("is_active", True)
+        .order("name")
+        .execute()
+    )
+    seen: set[str] = set()
+    rows: List[Dict[str, Any]] = []
+    for r in list(res_co.data or []) + list(res_global.data or []):
+        rid = str(r.get("id"))
+        if rid in seen:
+            continue
+        seen.add(rid)
+        rows.append(r)
+    rows.sort(key=lambda r: str(r.get("name") or "").lower())
     if not rows:
         return []
     wf_ids = [r["id"] for r in rows]
