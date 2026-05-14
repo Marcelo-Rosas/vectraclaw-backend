@@ -29,7 +29,8 @@ from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
-    AgentDomain, AgentExecutionMode, WorkflowLogicPattern, OperationType, Routine,
+    AgentDomain, AgentExecutionMode, WorkflowLogicPattern, WorkflowTriggerType,
+    OperationType, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
     Project, Run, RunTranscriptEntry,
 )
@@ -6631,6 +6632,33 @@ async def list_workflow_logic_patterns(request: Request):
         ]
     except Exception as e:
         logger.error(f"list_workflow_logic_patterns failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/workflow-trigger-types")
+@app.get("/workflow-trigger-types")
+async def list_workflow_trigger_types(request: Request):
+    """PR-T1 — catálogo canônico de trigger types para workflow_definitions.
+
+    Define COMO um workflow é disparado (manual/cron/webhook/event). FK em
+    workflow_definitions.trigger_type. Lido pelo /workflow frontend para
+    renderizar dropdown/chips + form da aba Trigger.
+
+    Read-only para autenticado. Mutações por migration.
+    """
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("workflow_trigger_types")
+            .select("slug,name,description,icon,display_order,is_active")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        return [WorkflowTriggerType(**row).to_zod_dict() for row in (res.data or [])]
+    except Exception as e:
+        logger.error(f"list_workflow_trigger_types failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

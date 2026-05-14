@@ -46,9 +46,21 @@ router = APIRouter(tags=["workflows"])
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WorkflowUpsertMeta(BaseModel):
+    """Metadata do workflow definition.
+
+    PR-T1: ganhou `trigger_type`, `cron_expression`, `is_scheduled` (workflow
+    vira fonte única de configuração de disparo — agendado ou manual). Quando
+    trigger_type='cron' e is_scheduled=true, o handler de save sincroniza
+    automaticamente uma row em `vectraclip.routines` (preserva compat com
+    daemon cron existente até PR-T3 deprecar o endpoint de routines).
+    """
+
     slug: Optional[str] = None
     name: str
     description: Optional[str] = None
+    trigger_type: Optional[str] = None       # default 'manual' aplicado no save
+    cron_expression: Optional[str] = None
+    is_scheduled: Optional[bool] = None
 
     class Config:
         populate_by_name = True
@@ -226,6 +238,111 @@ def _persist_workflow_steps(
     return inserted
 
 
+# PR-T1: tipos canon válidos pro CHECK em routines.operation_type
+# (snapshot pós migration 20260512190530). Quando o primeiro step do workflow
+# tem operation_type fora dessa lista, cai em 'other' para não bloquear o
+# UPSERT na routine sincronizada.
+_ROUTINE_OP_TYPE_WHITELIST = {
+    "email_lead", "route-cost-calculation", "freight-quotation",
+    "crm-fill", "crm-fill-precheck", "financial-audit",
+    "financial-bookkeeping", "planner-import-ofx",
+    "planner-categorize-pendings", "other",
+}
+
+
+def _sync_routine_for_workflow(
+    supabase: Any,
+    wf_id: str,
+    company_id: str,
+    wf_name: str,
+    trigger_type: Optional[str],
+    cron_expression: Optional[str],
+    is_scheduled: Optional[bool],
+    first_step: Optional[Dict[str, Any]],
+) -> None:
+    """PR-T2 — sincroniza row em vectraclip.routines a partir do workflow.
+
+    Comportamento:
+    - trigger_type='cron' AND is_scheduled=true AND cron_expression válido:
+        UPSERT routine vinculada (workflow_definition_id=wf_id). Status='active'.
+    - Qualquer outro caso (manual, paused, sem cron):
+        PAUSE routine vinculada se houver (preserva histórico — não DELETE).
+
+    Resolve agent_id via primeiro step.specialty_slug (MorpheusDispatcher).
+    Fallback operation_type='other' quando o primeiro step tem op_type fora do
+    CHECK em routines.operation_type.
+    """
+    is_cron_active = (
+        (trigger_type or "").strip() == "cron"
+        and bool(is_scheduled)
+        and bool((cron_expression or "").strip())
+    )
+
+    existing = (
+        supabase.table("routines")
+        .select("id")
+        .eq("workflow_definition_id", wf_id)
+        .limit(1)
+        .execute()
+    )
+    routine_id = existing.data[0]["id"] if existing.data else None
+
+    if not is_cron_active:
+        if routine_id:
+            try:
+                supabase.table("routines").update({"status": "paused"}).eq(
+                    "id", routine_id
+                ).execute()
+            except Exception as exc:
+                logger.warning(
+                    "sync_routine_for_workflow: pause failed wf=%s routine=%s err=%s",
+                    wf_id, routine_id, exc,
+                )
+        return
+
+    op_type = (first_step or {}).get("default_operation_type") or "other"
+    if op_type not in _ROUTINE_OP_TYPE_WHITELIST:
+        op_type = "other"
+
+    agent_id: Optional[str] = None
+    spec_slug = (first_step or {}).get("specialty_slug")
+    if spec_slug:
+        from src.services.morpheus_dispatcher import MorpheusDispatcher
+        try:
+            agent_id = MorpheusDispatcher(supabase)._find_agent(company_id, spec_slug)
+        except Exception as exc:
+            logger.warning(
+                "sync_routine_for_workflow: _find_agent failed spec=%s err=%s",
+                spec_slug, exc,
+            )
+
+    schedule_jsonb = {
+        "cron": (cron_expression or "").strip(),
+        "timezone": "America/Sao_Paulo",
+    }
+
+    row = {
+        "company_id": company_id,
+        "name": wf_name,
+        "status": "active",
+        "schedule": schedule_jsonb,
+        "agent_id": agent_id,
+        "operation_type": op_type,
+        "workflow_definition_id": wf_id,
+    }
+
+    try:
+        if routine_id:
+            supabase.table("routines").update(row).eq("id", routine_id).execute()
+        else:
+            supabase.table("routines").insert(row).execute()
+    except Exception as exc:
+        logger.error(
+            "sync_routine_for_workflow: write failed wf=%s op=%s err=%s",
+            wf_id, op_type, exc,
+        )
+
+
 async def _save_workflow_definition_and_steps(
     company_id: str, body: WorkflowUpsertBody, *, slug_from_path: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -254,6 +371,15 @@ async def _save_workflow_definition_and_steps(
     wf_row = existing.data
     sector_fallback = None
 
+    # PR-T1: trigger fields opcionais — só propaga ao DB quando vieram no payload
+    trigger_patch: Dict[str, Any] = {}
+    if meta.trigger_type is not None:
+        trigger_patch["trigger_type"] = meta.trigger_type
+    if meta.cron_expression is not None:
+        trigger_patch["cron_expression"] = meta.cron_expression
+    if meta.is_scheduled is not None:
+        trigger_patch["is_scheduled"] = bool(meta.is_scheduled)
+
     if wf_row:
         new_ver = int(wf_row.get("version") or 1) + 1
         upd = {
@@ -261,32 +387,42 @@ async def _save_workflow_definition_and_steps(
             "description": meta.description,
             "updated_at": now,
             "version": new_ver,
+            **trigger_patch,
         }
         supabase.table("workflow_definitions").update(upd).eq("id", wf_row["id"]).execute()
         wf_id = wf_row["id"]
     else:
-        ins = (
-            supabase.table("workflow_definitions")
-            .insert(
-                {
-                    "company_id": company_id,
-                    "name": meta.name,
-                    "slug": slug,
-                    "description": meta.description,
-                    "is_active": True,
-                    "version": 1,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-            )
-            .execute()
-        )
+        insert_row = {
+            "company_id": company_id,
+            "name": meta.name,
+            "slug": slug,
+            "description": meta.description,
+            "is_active": True,
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+            **trigger_patch,
+        }
+        ins = supabase.table("workflow_definitions").insert(insert_row).execute()
         if not ins.data:
             raise HTTPException(status_code=500, detail="workflow_insert_failed")
         wf_row = ins.data[0]
         wf_id = wf_row["id"]
 
     step_rows = _persist_workflow_steps(wf_id, body.steps, sector_fallback)
+
+    # PR-T2: sincroniza routine vinculada ao workflow (UPSERT ou PAUSE)
+    first_step = step_rows[0] if step_rows else None
+    _sync_routine_for_workflow(
+        supabase=supabase,
+        wf_id=wf_id,
+        company_id=company_id,
+        wf_name=meta.name,
+        trigger_type=meta.trigger_type,
+        cron_expression=meta.cron_expression,
+        is_scheduled=meta.is_scheduled,
+        first_step=first_step,
+    )
 
     detail = (
         supabase.table("workflow_definitions")
