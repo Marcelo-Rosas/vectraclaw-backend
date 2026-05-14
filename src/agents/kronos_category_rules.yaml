@@ -76,8 +76,9 @@ rules:
   categoria: Receita Operacional – Frete
   subcategoria: 'Receita - Saldo de cliente'
 - pattern: Pix recebido de VECTRA HUB
-  categoria: Receita Operacional – Frete
-  subcategoria: 'Receita - Pagamento à vista'
+  # VECTRA HUB LTDA é empresa do grupo — transferência entre C/C, não receita de frete
+  categoria: Receita - Movimentações Internas
+  subcategoria: 'Receita - Transferência entre C/C'
 
 # -- Pix enviado: classificação confirmada pelo user (2026-05-12) --
 # Labels EXATOS do Planner (incluindo typo 'Oparacionais' e hyphens normais)
@@ -201,8 +202,8 @@ rules:
   categoria: Receita Operacional – Frete
   subcategoria: Receita - Pagamento à vista
 - pattern: Pix recebido de VECTRA HUB LTDA
-  categoria: Receita Operacional – Frete
-  subcategoria: Receita - Pagamento à vista
+  categoria: Receita - Movimentações Internas
+  subcategoria: 'Receita - Transferência entre C/C'
 - pattern: Pix recebido de THIAGO MARCELO GARCIA RAGASSI
   categoria: Receita Operacional – Frete
   subcategoria: Receita - Pagamento à vista
@@ -213,8 +214,8 @@ rules:
   categoria: Receita Operacional – Frete
   subcategoria: Receita - Pagamento à vista
 - pattern: Pix recebido c6 de VECTRA HUB
-  categoria: Receita Operacional – Frete
-  subcategoria: Receita - Pagamento à vista
+  categoria: Receita - Movimentações Internas
+  subcategoria: 'Receita - Transferência entre C/C'
 - pattern: Pix recebido de FORMENTO ADMINISTRADORA DE BENS LTDA
   categoria: Receita Operacional – Frete
   subcategoria: Receita - Pagamento à vista
