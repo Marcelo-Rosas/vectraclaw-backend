@@ -826,6 +826,7 @@ async def _set_select_by_label(combobox_locator, label: str) -> None:
     await _set_select_value_robust(combobox_locator, match["value"])
 
 
+
 _PT_BR_MONTHS = {
     "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3,
     "abril": 4, "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
@@ -966,6 +967,7 @@ async def _apply_period_filter(page, start_date, end_date) -> bool:
     except Exception as exc:
         logger.warning("_apply_period_filter falhou: %s", exc)
         return False
+
 
 
 async def _maximize_rows_per_page(page) -> None:
