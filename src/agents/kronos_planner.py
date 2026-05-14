@@ -796,110 +796,74 @@ async def _set_select_by_label(combobox_locator, label: str) -> None:
     await _set_select_value_robust(combobox_locator, match["value"])
 
 
-async def _detect_total_lancamentos(page) -> Optional[int]:
-    """Tenta inferir o total de lançamentos visíveis (todas as páginas).
-
-    Estratégias:
-    1. Texto "Página 1/N" (N páginas × tamanho atual da página)
-    2. Texto "X resultados" ou "X lançamentos" no rodapé
-
-    Retorna None se nada casar. Best-effort: serve só pra dimensionar o
-    select de rows-per-page; se falhar, _maximize cai no fallback de max.
-    """
-    body_text = (await page.locator("body").inner_text()) or ""
-
-    # "Página 1/6" → 6 páginas
-    import re as _re
-
-    m = _re.search(r"P[áa]gina\s+\d+\s*/\s*(\d+)", body_text)
-    if m:
-        try:
-            pages = int(m.group(1))
-            # Conta linhas visíveis na 1ª página pra inferir rows-per-page atual
-            rows_now = await page.locator(
-                f"{_LANCAMENTOS_TABLE_SELECTOR} tbody tr"
-            ).count()
-            if rows_now > 0:
-                total = pages * rows_now
-                logger.info(
-                    "_detect_total_lancamentos: %d páginas × %d rows ≈ %d total",
-                    pages, rows_now, total,
-                )
-                return total
-        except ValueError:
-            pass
-
-    # "X resultados" ou similar
-    m = _re.search(r"(\d+)\s+(?:resultados|lan[çc]amentos)", body_text, _re.IGNORECASE)
-    if m:
-        try:
-            total = int(m.group(1))
-            logger.info("_detect_total_lancamentos: %d (via texto literal)", total)
-            return total
-        except ValueError:
-            pass
-
-    return None
-
-
 async def _maximize_rows_per_page(page) -> None:
-    """Ajusta o select 'Mostrar lançamentos por página' pro tamanho do batch.
+    """Seleciona a maior option no select 'Mostrar lançamentos por página'.
 
-    Sem isso, _find_next_uncategorized_row só lê a 1ª página da tabela e o
-    loop sai antes de cobrir todas as linhas pendentes (smoke 2026-05-14
-    confirmou tabela com 6 páginas × 25 linhas).
+    Recon DOM (2026-05-14, user confirmou): o paginador real do Planner é
+    um container desktop-only com classes `items-center justify-end hidden
+    gap-6 mt-3 mb-3 xl:flex`. Dentro dele há um `<select class="select
+    select-bordered ...">` SEM `name`, `id` ou `aria-label`. Options
+    disponíveis: 30, 50, 100, 150.
 
-    Estratégia adaptativa: detecta total de lançamentos (via "Página 1/N" ou
-    "X resultados") e escolhe a menor option do select que cobre esse total.
-    Se não conseguir detectar, fallback ao MAIOR option do select.
+    Tentativa anterior do detect_total foi removida: o paginador exibe
+    "Página 1/112" baseado em TODO o histórico do user no Planner, não só
+    no batch do OFX atual. Multiplicar por rows_visiveis sempre infla o
+    target.
+
+    Estratégia atual: pega o MAIOR option do select (150 hoje). Cobre OFX
+    semanal e mensal sem extrapolar. Se o select tiver options maiores no
+    futuro, automaticamente acompanha.
     """
-    target_total = await _detect_total_lancamentos(page)
-    candidates = [
-        "select[name='per_page']",
-        "select[name='perPage']",
-        "select[id*='per-page' i]",
-        "select[id*='perPage' i]",
-        "select[aria-label*='página' i]",
-        "select[aria-label*='page' i]",
-    ]
-    for sel in candidates:
-        loc = page.locator(sel).first
-        try:
-            if await loc.count() == 0:
-                continue
-            options = await loc.locator("option").all_inner_texts()
-            numeric = []
-            for opt in options:
-                try:
-                    numeric.append((int("".join(c for c in opt if c.isdigit())), opt))
-                except ValueError:
-                    continue
-            if not numeric:
-                continue
-            numeric.sort()  # asc
-
-            if target_total is not None:
-                # menor option >= target_total
-                fit = next((o for o in numeric if o[0] >= target_total), None)
-                target_label = (fit or numeric[-1])[1]
-                reason = f"fits>={target_total}" if fit else "fallback=max"
-            else:
-                target_label = numeric[-1][1]
-                reason = "fallback=max (sem total detectado)"
-
-            await loc.select_option(label=target_label)
-            logger.info(
-                "_maximize_rows_per_page: selector=%s set='%s' (%s)",
-                sel, target_label, reason,
-            )
-            await asyncio.sleep(0.8)  # aguarda tabela re-renderizar
-            return
-        except Exception as exc:
-            logger.debug("_maximize_rows_per_page tentativa falhou (%s): %s", sel, exc)
-            continue
-    logger.warning(
-        "_maximize_rows_per_page: nenhum select casou — categorize roda só 1ª página"
+    # Container do paginador desktop. CSS escape `\:` necessário pra Tailwind
+    # `xl:flex` em Playwright locator.
+    paginator = page.locator("div.xl\\:flex").filter(
+        has_text="lançamentos por página"
     )
+    try:
+        count_pag = await paginator.count()
+    except Exception as exc:
+        logger.warning("_maximize_rows_per_page: locator falhou — %s", exc)
+        return
+    if count_pag == 0:
+        logger.warning(
+            "_maximize_rows_per_page: container paginador (xl:flex) não encontrado"
+        )
+        return
+
+    select_loc = paginator.locator("select.select-bordered").first
+    try:
+        if await select_loc.count() == 0:
+            logger.warning(
+                "_maximize_rows_per_page: select.select-bordered ausente no paginador"
+            )
+            return
+
+        options = await select_loc.locator("option").all_inner_texts()
+        numeric: list[tuple[int, str]] = []
+        for opt in options:
+            digits = "".join(c for c in opt if c.isdigit())
+            if not digits:
+                continue
+            try:
+                numeric.append((int(digits), opt))
+            except ValueError:
+                continue
+        if not numeric:
+            logger.warning(
+                "_maximize_rows_per_page: select sem options numéricas (%s)", options
+            )
+            return
+
+        numeric.sort()
+        target_label = numeric[-1][1]  # MAIOR option
+        await select_loc.select_option(label=target_label)
+        logger.info(
+            "_maximize_rows_per_page: set='%s' (options=%s)",
+            target_label, [o[0] for o in numeric],
+        )
+        await asyncio.sleep(0.8)  # aguarda tabela re-renderizar
+    except Exception as exc:
+        logger.warning("_maximize_rows_per_page: select_option falhou — %s", exc)
 
 
 async def _categorize_pending_lines(
