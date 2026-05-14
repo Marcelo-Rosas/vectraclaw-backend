@@ -341,6 +341,7 @@ async def _run_categorize_only_async(
             # Filtra por período do OFX (categorize-only): resolve via cursor
             # last_processed_ofx. Sem cursor não há como saber o batch — segue
             # sem filtro (cai no maximize_rows_per_page como fallback).
+            routine_id = (task.get("input_json") or {}).get("routine_id")
             ofx_path_str = inputs.get("OFX_PATH", "")
             if ofx_path_str:
                 ofx_root = Path(ofx_path_str)
