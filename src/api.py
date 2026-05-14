@@ -3587,14 +3587,28 @@ async def list_workflow_steps(request: Request, company_id: str):
         return []
     try:
         client = get_authenticated_client(request.state.token)
-        defs = (
+        # postgrest-py 0.13.2 não expõe .or_(); union manual de 2 queries.
+        defs_co = (
             client.table("workflow_definitions")
             .select("id, company_id, slug, name")
-            .or_(f"company_id.eq.{company_id},company_id.is.null")
+            .eq("company_id", company_id)
             .eq("is_active", True)
             .execute()
         )
-        wf_defs = defs.data or []
+        defs_global = (
+            client.table("workflow_definitions")
+            .select("id, company_id, slug, name")
+            .is_("company_id", "null")
+            .eq("is_active", True)
+            .execute()
+        )
+        seen_ids: set[str] = set()
+        wf_defs: list[dict[str, Any]] = []
+        for d in list(defs_co.data or []) + list(defs_global.data or []):
+            did = str(d.get("id") or "")
+            if did and did not in seen_ids:
+                seen_ids.add(did)
+                wf_defs.append(d)
         if not wf_defs:
             return []
 
