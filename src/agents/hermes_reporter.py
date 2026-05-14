@@ -219,6 +219,19 @@ def entrypoint(task: dict) -> dict:
     recipients, subject_hint, markdown = _parse_task_description(desc)
     input_json = task.get("input_json") or {}
 
+    # VEC-413 alignment: fallback ao _resolved_config (agent_specialty_configs)
+    # quando task.description não traz RECIPIENT explícito. Mantém retrocompat
+    # com tasks legadas que ainda passam KEY=VALUE pela description.
+    if not recipients:
+        resolved_cfg = task.get("_resolved_config") or {}
+        cfg_recipient = str(resolved_cfg.get("recipient") or "").strip()
+        if cfg_recipient:
+            recipients = [r.strip() for r in cfg_recipient.split(",") if r.strip()]
+            logger.info(
+                "HermesReporter: recipients resolvidos via _resolved_config: %s",
+                recipients,
+            )
+
     if not recipients:
         logger.error("HermesReporter: nenhum destinatário encontrado na task %s", task.get("id"))
         return {"status": "errored", "error": "no recipients"}

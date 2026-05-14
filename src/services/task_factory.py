@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from src.models import MaterializedWorkflow, Task, TaskBlueprint
 from src.services import workflow_graph
-from src.services.morpheus_dispatcher import MorpheusDispatcher
+from src.services.morpheus_dispatcher import MORPHEUS_AGENT_ID, MorpheusDispatcher
 
 logger = logging.getLogger("TaskFactory")
 
@@ -149,6 +149,11 @@ class TaskFactory:
                 "spent": 0,
                 "cost_usd": 0,
                 "input_json": workflow_meta,
+                # Parent orchestration tem como responsável o Morpheus —
+                # convenção do team (ver agents/CLAUDE.md). Sem isso, o
+                # backfill setava com agent_id do primeiro step (ex: Kronos),
+                # quebrando a kanban.
+                "assigned_to_agent_id": MORPHEUS_AGENT_ID,
                 "created_at": now,
                 "updated_at": now,
             }
