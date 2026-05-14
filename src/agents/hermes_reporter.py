@@ -213,6 +213,98 @@ def _render_prospect_outreach_plain(subject: str, body_plain: str) -> str:
 </body></html>"""
 
 
+def _build_workflow_report_markdown(parent_task_id: str) -> str:
+    """Gera markdown do relatório a partir das outputs dos siblings de um workflow.
+
+    Cumpre a promessa documentada em ``kronos_planner.py:270-282``: quando o
+    Step 3 (oracle-report) é materializado num workflow tipo kronos_pipeline,
+    o handler aqui passa a montar o relatório automaticamente lendo
+    ``parent_task.output_json`` + siblings.
+
+    Retorna ``""`` se não conseguir resolver (sem supabase, parent não acha,
+    sem siblings). Nesse caso o entrypoint cai no flow legado que exigia
+    markdown em ``task.description``.
+    """
+    from src.api import supabase  # lazy: evita circular import
+    from datetime import datetime
+
+    if not supabase or not parent_task_id:
+        return ""
+
+    try:
+        pres = (
+            supabase.table("tasks").select("*").eq("id", parent_task_id).limit(1).execute()
+        )
+        if not pres.data:
+            return ""
+        parent = pres.data[0]
+        sres = (
+            supabase.table("tasks")
+            .select("*")
+            .eq("parent_task_id", parent_task_id)
+            .order("created_at")
+            .execute()
+        )
+        siblings = [s for s in (sres.data or []) if s.get("id") != parent_task_id]
+    except Exception as exc:
+        logger.warning("HermesReporter: build_workflow_report falhou: %s", exc)
+        return ""
+
+    wf_slug = (parent.get("input_json") or {}).get("workflowSlug", "workflow")
+    when = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    total_cat = total_unc = total_fail = 0
+    for s in siblings:
+        cat = (s.get("output_json") or {}).get("categorization") or {}
+        total_cat += int(cat.get("lines_categorized") or 0)
+        total_unc += int(cat.get("lines_unclassified") or 0)
+        total_fail += int(cat.get("lines_failed") or 0)
+    total = total_cat + total_unc + total_fail
+    pct = (total_cat / total * 100) if total else 0.0
+
+    lines = [f"## Pipeline `{wf_slug}` — {when}", ""]
+
+    if total > 0:
+        lines += [
+            "## Totais consolidados",
+            "",
+            "| Métrica | Valor |",
+            "|---|---|",
+            f"| Linhas processadas | {total} |",
+            f"| Categorizadas | **{total_cat}** ({pct:.1f}%) |",
+            f"| Sem regra (Verificar) | {total_unc} |",
+            f"| Falhas técnicas | {total_fail} |",
+            "",
+        ]
+
+    lines += ["## Detalhamento por etapa", ""]
+    for s in siblings:
+        title = s.get("title") or "?"
+        status = s.get("status") or "?"
+        badge = "✅" if status == "done" else ("❌" if status in ("errored", "blocked") else "⏳")
+        lines.append(f"### {badge} {title}")
+        lines.append(f"_Status: `{status}`_")
+        lines.append("")
+        out = s.get("output_json") or {}
+        if out.get("file_processed"):
+            lines.append(f"- **Arquivo processado:** `{out['file_processed']}`")
+        cat = out.get("categorization") or {}
+        if cat:
+            lines.append(
+                f"- **Categorização:** {cat.get('lines_categorized', 0)} ok / "
+                f"{cat.get('lines_unclassified', 0)} sem regra / "
+                f"{cat.get('lines_failed', 0)} falhas"
+            )
+        if out.get("screenshot_path"):
+            lines.append(f"- Screenshot: `{out['screenshot_path']}`")
+        err = (out.get("error_detail") or {}).get("message")
+        if err:
+            lines.append(f"- **Erro:** {err}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def entrypoint(task: dict) -> dict:
     """Ponto de entrada chamado pelo agent_daemon para operation_type='oracle-report'."""
     desc = task.get("description", "")
@@ -270,6 +362,19 @@ def entrypoint(task: dict) -> dict:
             "tokens": {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "source": "prospect_outreach"},
             "cost_usd": 0.0,
         }
+
+    # VEC-413 align: se markdown vazio mas task pertence a um workflow,
+    # buscar parent + siblings e gerar relatório automaticamente. Cumpre o
+    # acordo documentado em kronos_planner.py:270-282.
+    if not markdown.strip():
+        parent_id = task.get("parent_task_id")
+        if parent_id:
+            markdown = _build_workflow_report_markdown(parent_id)
+            if markdown:
+                logger.info(
+                    "HermesReporter: markdown sintetizado do workflow parent_task=%s",
+                    parent_id,
+                )
 
     if not markdown.strip():
         logger.error("HermesReporter: relatório vazio na task %s", task.get("id"))
