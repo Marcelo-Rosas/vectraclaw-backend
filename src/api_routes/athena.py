@@ -445,9 +445,20 @@ async def delete_athena_document(request: Request, document_id: str):
 
 # Status válidos no DB (CHECK constraint criado no sub-PR 1)
 _REC_DB_STATUSES = {"pending", "approved", "applied", "rejected", "superseded"}
+
+# Catalog canônico de kind alinhado com:
+#   - DB CHECK: migration 20260516150000_athena_kind_catalog_canonical.sql
+#   - Frontend Zod: src/types/api.ts (VectraClip)
+#   - Documentação: docs/ATHENA-RECOMMENDATIONS.md
+# 8 valores divididos em 2 categorias:
+#   - 5 EXECUTÁVEIS: Athena auto-aplica via mutação após aprovação humana
+#   - 3 INFORMATIVOS: apenas relatório/insight (humano lê + decide)
 _REC_VALID_KINDS = {
+    # Executáveis (Athena auto-aplica)
     "hire_new_agent", "add_specialty", "rewrite_system_prompt",
     "create_specialty", "consolidate_agents",
+    # Informativos (Athena só reporta)
+    "diagnose_gap", "suggest_automation", "suggest_hire_agent",
 }
 
 
@@ -512,7 +523,7 @@ async def list_athena_recommendations(
     Filtros opcionais via query string:
     - status: pending|approved|applied|rejected|superseded
     - target_agent_id: UUID
-    - kind: hire_new_agent|add_specialty|rewrite_system_prompt|create_specialty|consolidate_agents
+    - kind: ver docs/ATHENA-RECOMMENDATIONS.md (8 valores: 5 executáveis + 3 informativos)
 
     Ordenação: created_at DESC (mais recentes primeiro).
     """
