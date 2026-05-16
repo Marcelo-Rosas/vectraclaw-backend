@@ -1074,6 +1074,116 @@ async def sipoc_research(request: Request, payload: Dict[str, Any]):
         logger.error(f"sipoc_research failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DELETE hierárquico SIPOC (sector / process / component)
+#
+# FKs já definem cascade no DB:
+#   sipoc_processes.sector_id      → CASCADE
+#   sipoc_components.process_id    → CASCADE
+#   sipoc_edges.process_id         → CASCADE
+#   sipoc_edges.source_id/target_id → CASCADE
+#   sipoc_raci.process_id          → CASCADE
+#   sipoc_raci.component_id        → CASCADE
+#   sipoc_positions.sector_id      → SET NULL (positions ficam cross-cutting)
+#
+# RBAC: bloqueia sector_responsible/viewer (ação destrutiva).
+# Retorna contagens do que será deletado pra frontend mostrar feedback.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SIPOC_DELETE_BLOCKED_ROLES = ["sector_responsible", "viewer"]
+
+
+@app.delete("/api/sipoc/sectors/{sector_id}")
+async def delete_sipoc_sector(request: Request, sector_id: UUID):
+    """Remove um setor (cascateia processes + components + edges + raci).
+
+    Positions vinculadas ao setor ficam cross-cutting (sector_id=NULL via
+    FK SET NULL) — não são deletadas. RBAC bloqueia roles operacionais.
+    """
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _SIPOC_DELETE_BLOCKED_ROLES, "remover setores SIPOC")
+    try:
+        client = get_authenticated_client(request.state.token)
+        proc_ids = [r["id"] for r in (
+            client.table("sipoc_processes").select("id").eq("sector_id", str(sector_id)).execute().data or []
+        )]
+        comp_count = 0
+        if proc_ids:
+            comp_count = (client.table("sipoc_components").select("id", count="exact")
+                          .in_("process_id", proc_ids).execute().count or 0)
+        res = supabase.table("sipoc_sectors").delete().eq("id", str(sector_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "sector_not_found_or_not_accessible")
+        logger.info("delete_sipoc_sector sector=%s cascade processes=%d components=%d by=%s",
+                    sector_id, len(proc_ids), comp_count, scope.get("user_id"))
+        return {"deleted": True, "sectorId": str(sector_id),
+                "cascade": {"processes": len(proc_ids), "components": comp_count,
+                            "edgesAndRaci": "auto via FK CASCADE"}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_sipoc_sector failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/sipoc/processes/{process_id}")
+async def delete_sipoc_process(request: Request, process_id: UUID):
+    """Remove um processo (cascateia components + edges + raci). Sector permanece."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _SIPOC_DELETE_BLOCKED_ROLES, "remover processos SIPOC")
+    try:
+        client = get_authenticated_client(request.state.token)
+        comp_count = (client.table("sipoc_components").select("id", count="exact")
+                      .eq("process_id", str(process_id)).execute().count or 0)
+        raci_count = (client.table("sipoc_raci").select("id", count="exact")
+                      .eq("process_id", str(process_id)).execute().count or 0)
+        res = supabase.table("sipoc_processes").delete().eq("id", str(process_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "process_not_found_or_not_accessible")
+        logger.info("delete_sipoc_process process=%s cascade components=%d raci=%d by=%s",
+                    process_id, comp_count, raci_count, scope.get("user_id"))
+        return {"deleted": True, "processId": str(process_id),
+                "cascade": {"components": comp_count, "raci": raci_count,
+                            "edges": "auto via FK CASCADE"}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_sipoc_process failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/api/sipoc/components/{component_id}")
+async def delete_sipoc_component(request: Request, component_id: UUID):
+    """Remove um component (supplier/input/activity/output/customer).
+
+    Cascateia edges (sipoc_edges.source_id/target_id) + raci (component_id).
+    """
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _SIPOC_DELETE_BLOCKED_ROLES, "remover atividades/componentes SIPOC")
+    try:
+        client = get_authenticated_client(request.state.token)
+        raci_count = (client.table("sipoc_raci").select("id", count="exact")
+                      .eq("component_id", str(component_id)).execute().count or 0)
+        res = supabase.table("sipoc_components").delete().eq("id", str(component_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "component_not_found_or_not_accessible")
+        logger.info("delete_sipoc_component component=%s cascade raci=%d by=%s",
+                    component_id, raci_count, scope.get("user_id"))
+        return {"deleted": True, "componentId": str(component_id),
+                "cascade": {"raci": raci_count, "edges": "auto via FK CASCADE"}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_sipoc_component failed: {e}")
+        raise HTTPException(500, str(e))
+
+
 @app.post("/api/sipoc/components/{component_id}/promote")
 async def promote_sipoc_activity(request: Request, component_id: UUID):
     if not supabase:
