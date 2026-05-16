@@ -94,6 +94,53 @@ async def qualify_company(request: Request, company_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# =====================================================================
+# CNPJ lookup — 2 endpoints compartilham mesmo service:
+#
+#   POST /api/cnpj/lookup                          (público, sem auth)
+#     → usado em signup self-service (user ainda sem JWT) e em chamadas
+#       futuras que não dependem de company_id (ex: marketplace prospect)
+#
+#   POST /api/companies/{company_id}/lookup-cnpj   (legado, com auth+tenant)
+#     → usado em /prospects (FE valida JWT contra company_id atual)
+#     → mantido pra retrocompat; antes era o único endpoint
+#
+# Service: src/services/cnpj_lookup.py (restaurado 2026-05-17 após
+# ModuleNotFoundError em prod).
+# =====================================================================
+
+
+def _cnpj_error_to_http(exc) -> HTTPException:
+    """Mapeia CnpjLookupError → HTTPException usando o status_hint do service."""
+    return HTTPException(getattr(exc, "status_hint", 502), exc.message if hasattr(exc, "message") else str(exc))
+
+
+@router.post("/api/cnpj/lookup")
+@router.post("/cnpj/lookup")
+async def lookup_cnpj_public_endpoint(body: Dict[str, Any] = Body(default_factory=dict)):
+    """Lookup CNPJ público — sem auth, sem company_id na URL.
+
+    Usado em fluxos onde user ainda não tem sessão (signup) ou em chamadas
+    cross-tenant (marketplace). Rate limit aplicado pelo proxy reverso
+    (Cloudflare) — BrasilAPI tem ~3 req/s nativos.
+
+    Body: `{"cnpj": "00000000000100"}` — dígitos puros ou com formatação.
+    """
+    from src.services.cnpj_lookup import lookup_cnpj, CnpjLookupError
+
+    raw_cnpj = (body.get("cnpj") or "").strip() if isinstance(body, dict) else ""
+    if not raw_cnpj:
+        raise HTTPException(400, "cnpj_required")
+
+    try:
+        return await lookup_cnpj(raw_cnpj)
+    except CnpjLookupError as e:
+        raise _cnpj_error_to_http(e)
+    except Exception as e:
+        logger.error(f"lookup_cnpj_public_endpoint failed: {e}")
+        raise HTTPException(500, str(e))
+
+
 @router.post("/api/companies/{company_id}/lookup-cnpj")
 @router.post("/companies/{company_id}/lookup-cnpj")
 async def lookup_cnpj_endpoint(
@@ -101,7 +148,7 @@ async def lookup_cnpj_endpoint(
     company_id: str,
     body: Dict[str, Any] = Body(default_factory=dict),
 ):
-    """Consulta cartão CNPJ na BrasilAPI e devolve shape normalizado.
+    """Lookup CNPJ com auth + tenant scope (legado — usado em /prospects).
 
     Body: `{"cnpj": "00000000000100"}` — dígitos puros ou com formatação.
     Retorna razão social, fantasia, endereço, CNAE, situação cadastral, QSA, capital.
@@ -116,17 +163,9 @@ async def lookup_cnpj_endpoint(
         raise HTTPException(400, "cnpj_required")
 
     try:
-        result = await lookup_cnpj(raw_cnpj)
+        return await lookup_cnpj(raw_cnpj)
     except CnpjLookupError as e:
-        if e.code == CnpjLookupError.CODE_INVALID:
-            raise HTTPException(400, str(e))
-        if e.code == CnpjLookupError.CODE_NOT_FOUND:
-            raise HTTPException(404, str(e))
-        if e.code == CnpjLookupError.CODE_NETWORK:
-            raise HTTPException(504, str(e))
-        raise HTTPException(502, str(e))
+        raise _cnpj_error_to_http(e)
     except Exception as e:
         logger.error(f"lookup_cnpj_endpoint failed: {e}")
         raise HTTPException(500, str(e))
-
-    return result.model_dump()
