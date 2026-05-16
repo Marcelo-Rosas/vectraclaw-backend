@@ -1120,16 +1120,136 @@ async def get_process_raci(request: Request, process_id: UUID):
         logger.error(f"get_process_raci failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+_RACI_VALID_ROLES = {"R", "A", "C", "I"}
+_RACI_ADMIN_BLOCKED_ROLES = ["sector_responsible", "viewer"]
+
+
 @app.post("/api/sipoc/raci")
 async def update_raci_cell(request: Request, payload: Dict[str, Any]):
+    """Upsert de uma cell RACI (process+component+position → R/A/C/I).
+
+    Schmidt §"Engage stakeholders": cada activity (component) DEVE ter ao
+    menos 1 'A' (Accountable) e 1 'R' (Responsible) para ser considerada
+    bem-mapeada. Side-effect: quando role='R' é setado, atualiza também
+    o atalho `sipoc_components.responsible_position_id` (usado pelo
+    sector_responsible scope no Oracle chat, PR6).
+
+    RBAC: bloqueia sector_responsible/viewer (ação consultiva/admin).
+    Validação de role contra _RACI_VALID_ROLES (CHECK constraint do DB
+    rejeita inválidos com 23514, mas validamos antes pra mensagem em PT).
+    """
     if not supabase:
         return {"success": False}
+
+    # Validação de input
+    required = ("process_id", "component_id", "position_id", "role")
+    missing = [k for k in required if not payload.get(k)]
+    if missing:
+        raise HTTPException(400, f"RACI: campos obrigatórios faltando: {', '.join(missing)}")
+
+    role = payload.get("role")
+    if role not in _RACI_VALID_ROLES:
+        raise HTTPException(
+            400,
+            f"RACI: role '{role}' inválido. Esperado: R (Responsible), A (Accountable), C (Consulted), I (Informed).",
+        )
+
+    # RBAC
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _RACI_ADMIN_BLOCKED_ROLES, "editar matriz RACI do organograma")
+
     try:
         client = get_authenticated_client(request.state.token)
-        res = client.table("sipoc_raci").upsert(payload, on_conflict="component_id,position_id").execute()
-        return {"success": True, "data": res.data[0]}
+        clean_payload = {k: payload[k] for k in required if k in payload}
+        res = client.table("sipoc_raci").upsert(
+            clean_payload, on_conflict="component_id,position_id"
+        ).execute()
+
+        # Side-effect: se role='R', sincronizar atalho em sipoc_components.
+        # Schmidt: o "Responsible" é o executor único da activity — match natural
+        # com responsible_position_id (criado no PR2).
+        if role == "R":
+            try:
+                supabase.table("sipoc_components").update(
+                    {"responsible_position_id": payload["position_id"]}
+                ).eq("id", payload["component_id"]).execute()
+            except Exception as sync_err:
+                logger.warning(
+                    "RACI: sync responsible_position_id falhou (não-fatal) component=%s: %s",
+                    payload["component_id"], sync_err,
+                )
+
+        logger.info(
+            "RACI upsert process=%s component=%s position=%s role=%s by=%s",
+            payload.get("process_id"), payload.get("component_id"),
+            payload.get("position_id"), role, scope.get("user_id"),
+        )
+        return {"success": True, "data": res.data[0] if res.data else None}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"update_raci_cell failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/sipoc/raci/{component_id}/{position_id}")
+async def delete_raci_cell(request: Request, component_id: UUID, position_id: UUID):
+    """Remove uma cell RACI (component, position).
+
+    Se a cell era role='R', limpa também o atalho responsible_position_id
+    em sipoc_components (não deixar dado "fantasma").
+    """
+    if not supabase:
+        return {"success": False}
+
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _RACI_ADMIN_BLOCKED_ROLES, "remover cells da matriz RACI")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+
+        # Lê role antes pra decidir se precisa limpar responsible_position_id
+        existing = (
+            client.table("sipoc_raci")
+            .select("role")
+            .eq("component_id", str(component_id))
+            .eq("position_id", str(position_id))
+            .limit(1)
+            .execute()
+        )
+        was_responsible = existing.data and existing.data[0].get("role") == "R"
+
+        res = (
+            client.table("sipoc_raci")
+            .delete()
+            .eq("component_id", str(component_id))
+            .eq("position_id", str(position_id))
+            .execute()
+        )
+
+        if was_responsible:
+            try:
+                # Só limpa se o responsible ainda for esse position
+                supabase.table("sipoc_components").update(
+                    {"responsible_position_id": None}
+                ).eq("id", str(component_id)).eq(
+                    "responsible_position_id", str(position_id)
+                ).execute()
+            except Exception as sync_err:
+                logger.warning(
+                    "RACI delete: clear responsible_position_id falhou (não-fatal): %s",
+                    sync_err,
+                )
+
+        logger.info(
+            "RACI delete component=%s position=%s was_R=%s by=%s",
+            component_id, position_id, was_responsible, scope.get("user_id"),
+        )
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_raci_cell failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sipoc/templates")
