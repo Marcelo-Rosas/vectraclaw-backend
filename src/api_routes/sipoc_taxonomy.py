@@ -131,12 +131,21 @@ async def clone_to_process(
     - 404 template_not_found
     - 404 process_not_found_or_not_accessible (RLS bloqueou se tenant errado)
     """
-    from src.api import supabase, get_authenticated_client
+    from src.api import supabase, get_authenticated_client, get_user_scope, require_role_not
 
     if not supabase:
         return {"id": "mock-id"}
     try:
         client = get_authenticated_client(request.state.token)
+
+        # PR6: sector_responsible e viewer não podem importar templates
+        # (ação de admin/consultant/company_admin). Bloqueia early.
+        scope = get_user_scope(request.state.token)
+        require_role_not(
+            scope,
+            blocked_roles=["sector_responsible", "viewer"],
+            action="importar templates do marketplace SIPOC (peça ao company_admin)",
+        )
 
         # 1) Carrega template (catálogo global; RLS permite read authenticated)
         tres = (

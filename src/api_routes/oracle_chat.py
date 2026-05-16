@@ -194,11 +194,31 @@ async def oracle_chat(body: OracleChatRequest, request: Request):
     session_id = body.session_id or str(_uuid.uuid4())
 
     # PR5: hidratação do contexto quando scoped por activity
+    # PR6: validação de scope sector_responsible (só vê suas activities)
     payload = body.dict()
     if body.activity_id:
         try:
-            from src.api import get_authenticated_client
+            from src.api import get_authenticated_client, get_user_scope, assert_activity_in_scope
             client = get_authenticated_client(request.state.token)
+            scope = get_user_scope(request.state.token)
+
+            # PR6: assert scope ANTES de hidratar — se sector_responsible
+            # não puder, falha rápido (não enrich nem chama Gemini)
+            if scope.get("role") == "sector_responsible":
+                # Carrega só o suficiente pra validar
+                pre = (
+                    client.table("sipoc_components")
+                    .select("id, responsible_position_id")
+                    .eq("id", body.activity_id)
+                    .limit(1)
+                    .execute()
+                )
+                if not pre.data:
+                    # Não revelar existência — RLS já filtrou ou activity não existe
+                    from fastapi import HTTPException
+                    raise HTTPException(404, "activity_not_found_or_not_accessible")
+                assert_activity_in_scope(scope, pre.data[0])
+
             scoped = _fetch_activity_context(body.activity_id, client)
             if scoped:
                 base_ctx = payload.get("context") or {}
@@ -210,12 +230,17 @@ async def oracle_chat(body: OracleChatRequest, request: Request):
                 base_ctx.setdefault("activity_scope", scoped)
                 payload["context"] = base_ctx
                 logger.info(
-                    "oracle_chat scoped session=%s activity=%s neighbors_count=%s",
+                    "oracle_chat scoped session=%s activity=%s role=%s neighbors_count=%s",
                     session_id,
                     body.activity_id,
+                    scope.get("role"),
                     sum(len(v) for v in (scoped.get("neighbors") or {}).values()),
                 )
         except Exception as e:
+            # Re-lança 403/404 (decisões de autorização explícitas)
+            from fastapi import HTTPException
+            if isinstance(e, HTTPException) and e.status_code in (403, 404):
+                raise
             logger.warning("oracle_chat scoped enrichment falhou (degrada gracioso): %s", e)
 
     async def event_gen():
