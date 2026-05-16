@@ -10,7 +10,9 @@
 
 ## Ativas
 
-_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
+| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
+|---|---|---|---|---|---|
+| Auditoria handlers bottom-up (4 camadas em paralelo) | esta sessão (Opus 4.7) | `docs/audit-handlers-bottom-up` | `docs/AUDIT-HANDLERS-2026-05-16.md` (novo) | 2026-05-16 23:00 | ~1h (4 agentes paralelos) |
 
 ---
 
