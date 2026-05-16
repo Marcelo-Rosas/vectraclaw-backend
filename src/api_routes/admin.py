@@ -238,11 +238,20 @@ async def patch_app_user(request: Request, user_id: str, payload: PatchAppUserIn
         raise HTTPException(400, "no_valid_fields")
 
     try:
-        client = get_authenticated_client(request.state.token)
-
-        # Confirma user existe e é do mesmo tenant (RLS filtra; double check)
+        # PR7 hotfix: vectraclip.app_users só tem GRANT SELECT pra authenticated
+        # (não INSERT/UPDATE/DELETE). RLS policies admin existem, mas GRANT base
+        # faltando bloqueia o UPDATE antes do RLS rodar — "permission denied for
+        # table app_users". Solução cirúrgica: usar service_role aqui (já que
+        # require_role_not acima garante RBAC em app-layer).
+        # Tenant safety: query com filtro explícito de company_id derivado do scope.
+        # Alternativa estrutural (futuro PR): GRANT INSERT/UPDATE/DELETE pra
+        # authenticated; aí podemos voltar pra get_authenticated_client.
+        if not supabase:
+            raise HTTPException(503, "supabase_unavailable")
+        # Read pelo client authenticated (GRANT SELECT existe, RLS filtra)
+        read_client = get_authenticated_client(request.state.token)
         cur = (
-            client.table("app_users")
+            read_client.table("app_users")
             .select("id, company_id, role")
             .eq("id", user_id)
             .limit(1)
@@ -250,8 +259,12 @@ async def patch_app_user(request: Request, user_id: str, payload: PatchAppUserIn
         )
         if not cur.data:
             raise HTTPException(404, "user_not_found_or_not_accessible")
+        # Tenant safety: confirma que user pertence ao company_id do scope
+        if scope.get("company_id") and cur.data[0].get("company_id") != scope.get("company_id"):
+            raise HTTPException(403, "cross_tenant_update_blocked")
 
-        res = client.table("app_users").update(update_data).eq("id", user_id).execute()
+        # Update via service_role (bypassa GRANT faltante)
+        res = supabase.table("app_users").update(update_data).eq("id", user_id).execute()
         if not res.data:
             raise HTTPException(500, "update_returned_empty")
 
