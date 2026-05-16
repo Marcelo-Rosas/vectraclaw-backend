@@ -227,6 +227,70 @@ Body do PR cita:
 
 ---
 
+## P8 — Broken windows intencionais (UI quebrada como sinal honesto)
+
+**Regra:** se uma feature tem dependência crítica **não-implementada** (ex.: executor real,
+integração externa, fluxo de aprovação incompleto), **deixar a UI quebrar pode ser melhor
+que UX bonita que mascara o gap.** Documentar SEMPRE em `AUDIT-CONSOLIDADO.md` com
+tag `⏸️ INTENTIONAL` + critério de saída.
+
+### Por que isso é regra, não improviso
+
+UI bonita cria **dívida invisível**: humano (e cliente) usa a feature achando que está
+fazendo X, quando na real o sistema só registra status. Erro vermelho na tela é uma
+**flag estrutural** — todo mundo que abre vê o gap. Conserto cosmético = sumir o sinal.
+
+### Quando aplicar
+
+- Feature display-only que parece interativa (botões "Aprovar" sem executor real)
+- Integração externa mockada que vai ser substituída
+- Workflow incompleto onde N de M passos existem (UI mostraria o N como se fosse M)
+- Endpoint backend mais novo que frontend (sem retrocompat planejada)
+
+### Quando NÃO aplicar
+
+- Bug genuíno em feature completa → conserte normal
+- Erro de validação esperado (form de input) → mostre msg amigável
+- Loading state → use skeleton, não erro
+
+### Caso real (2026-05-16) — B7-bis
+
+`/agents/recommendations` retorna `Falha ao carregar` porque `recommendationKindSchema` é
+`z.enum([5 valores])` mas backend agora envia 8 (PR #141 canonicalizou + adicionou
+`diagnose_gap`). **Fix de 1 linha** (`z.string().min(1)`) está mapeado mas **não foi
+aplicado de propósito** — porque mesmo com o Zod consertado, aprovar uma recommendation
+não dispara executor. O sistema só muda `status='applied'`; o trabalho real (editar
+prompt, hire agent) fica todo manual. UI bonita induziria humano a aprovar achando que
+"vai aplicar". Erro vermelho = honestidade.
+
+**Condição de reverter:** quando existir `POST /api/athena/recommendations/{id}/execute`
+fazendo o trabalho real — ver `AUDIT-CONSOLIDADO.md` §"Decisão registrada: B7-bis".
+
+### Anti-pattern
+
+```ts
+// ❌ — UI bonita esconde gap
+export const recommendationKindSchema = z.string().min(1)  // ok zod
+// + botão "Aprovar" ativo
+// + toast "Recommendation aprovada com sucesso!"
+// + nada acontece de verdade no backend
+```
+
+```ts
+// ✅ — broken window intencional + documentação
+export const recommendationKindSchema = z.enum([...])  // proposital — não consertar
+// (ver docs/AUDIT-CONSOLIDADO.md §"Decisão registrada: B7-bis")
+```
+
+### Comentário obrigatório no código quando aplicar
+
+```ts
+// ⏸️ INTENTIONAL BROKEN — ver docs/AUDIT-CONSOLIDADO.md §"<seção>"
+// Não consertar sem ler primeiro. Condição de reverter: <X>.
+```
+
+---
+
 ## P6 — Onde NÃO há catálogo, declare como decisão (não como omissão)
 
 Alguns enums são realmente locais (máquina de estados interna), não merecem catálogo:

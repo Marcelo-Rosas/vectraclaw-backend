@@ -50,7 +50,7 @@ PRs duplicados.
 | B5 | `src/pages/Council.tsx:54-78` | `REQUEST_TYPE_CONFIG` hardcoded | idem B4 | ALTA | open |
 | B6 | `src/pages/Council.tsx:80-96` | `STATUS_CONFIG` hardcoded approvals | _(council_approval_statuses — VERIFICAR)_ | ALTA | open |
 | B7 | `src/lib/api/schemas.ts:94-178` | Múltiplos `z.enum()` (agentStatus, taskStatus, councilRequestType, userRole, councilApprovalStatus, **recommendationKind**) | vários | **🔴 CRÍTICA** (era MÉDIA) | **OPEN — VISÍVEL EM PROD** |
-| B7-bis | `src/lib/api/schemas.ts` `recommendationKindSchema` | `z.enum([hire_new_agent, add_specialty, rewrite_system_prompt, create_specialty, consolidate_agents])` | `athena_kind_catalog` (PR #141 canonicalizou 8 valores incluindo `diagnose_gap`) | **🔴 CRÍTICA** | **OPEN — quebra `/agents/recommendations`** ("Resposta inválida: Expected enum, received 'diagnose_gap'") |
+| B7-bis | `src/lib/api/schemas.ts` `recommendationKindSchema` | `z.enum([hire_new_agent, add_specialty, rewrite_system_prompt, create_specialty, consolidate_agents])` | `athena_kind_catalog` (PR #141 canonicalizou 8 valores incluindo `diagnose_gap`) | **⏸️ INTENTIONAL** (era 🔴 CRÍTICA) | **NÃO CONSERTAR até executor existir** — ver decisão abaixo |
 | B8 | `src/lib/display.ts:28-356` | `AGENT_STATUSES`, `ADAPTER_TYPES`, `TASK_STATUSES`, `TASK_OPERATION_TYPES`, etc. | múltiplos | MÉDIA | open — refactor maior |
 | B9 | `src/pages/Council.tsx:235-244` | `PayloadRenderer` switch hardcoded | idem B4 | MÉDIA | open |
 | B10 | `src/lib/display.ts:439-495` | `RAG_CATEGORIAS`, `RAG_DEPARTAMENTOS`, `RAG_CONFIDENCIALIDADES` | _(catalog não existe — criar?)_ | MÉDIA | decisão Product |
@@ -126,9 +126,29 @@ B7/B8.
 
 ---
 
+## ⏸️ Decisão registrada: B7-bis fica quebrada propositalmente
+
+**Data:** 2026-05-16 · **Owner:** Marcelo (chat session) · **Tipo:** Broken Window Intencional (P8 do CODE-PATTERNS).
+
+**Decisão:** **NÃO consertar** `recommendationKindSchema` (o `z.enum` que rejeita `diagnose_gap`) até existir um **executor real** que aplique recommendation aprovada sem humano editar à mão em `/agents/{id}/edit`.
+
+**Razão:** a página `/agents/recommendations` é display-only após `mark-applied` — o sistema NÃO executa nada, apenas muda `status='applied'`. UI funcionando bonita criaria **dívida invisível**: humano aprova achando que "Athena vai aplicar", quando na real precisa copiar `proposed_changes_json` à mão, ir em outra tela, editar prompt, voltar e marcar. Erro vermelho = sinal honesto.
+
+**Quando reverter (condição de saída):** quando existir endpoint tipo `POST /api/athena/recommendations/{id}/execute` que de fato:
+- `rewrite_system_prompt`: faz `PUT /agents/{id}` com `proposed_changes_json.prompt` e grava em `agent_prompt_history`
+- `hire_new_agent`: dispara wizard de provisioning OU executa o atomic create
+- `add_specialty` / `create_specialty`: insere em `agent_specialty_configs` / `agent_specialties` automaticamente
+- `consolidate_agents`: merge real com cuidado pra FKs
+
+Sem isso, o ciclo PMBOK fica em "Execução = manual" (gap mapeado na seção "Mapa PMBOK do fluxo atual" do diagnóstico Athena hoje).
+
+**Sinal de violação:** se você está prestes a abrir PR `fix(frontend): recommendationKindSchema z.string()`, **pare e volte aqui**. Não é bug — é débito de produto sinalizando.
+
+---
+
 ## Backlog priorizado (ordem sugerida)
 
-0. **🔴 CRÍTICA: B7-bis** — `recommendationKindSchema` quebrando `/agents/recommendations` em prod (backend mandou `diagnose_gap`, Zod do frontend rejeita). Fix de 1 linha: `recommendationKindSchema: z.ZodType<RecommendationKind> = z.string().min(1)` (mesmo pattern de `adapter_type` / `execution_mode`). **Owner sugerido:** sessão frontend que pegar o Lote 2 — encaixar como primeiro fix antes das batidas.
+0. ~~B7-bis~~ → **movida pra ⏸️ INTENTIONAL acima** (ver decisão)
 1. **CRIAR catalog GET endpoints faltantes** (`adapter_catalog`, `task_tree_status`) — destrava B7/B8 inteiros
 2. **A4** — Consolidar adapter mapping (`_to_db` duplicado)
 3. **A5+A6+A9** — `operation_type` catalog-driven (Pydantic + Kronos tuple)
