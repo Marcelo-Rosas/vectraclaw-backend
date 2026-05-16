@@ -766,9 +766,11 @@ async def auth_middleware(request: Request, call_next):
         "/api/",
         "/api/auth/login",
         "/api/auth/refresh",
+        "/api/auth/signup",
         "/api/health",
         "/auth/login",
         "/auth/refresh",
+        "/auth/signup",
         "/health",
         "/docs",
         "/redoc",
@@ -3235,6 +3237,218 @@ async def auth_logout():
         except Exception as e:
             logger.debug(f"logout error (ignorando): {e}")
     return {"success": True}
+
+
+# =====================================================================
+# Signup self-service (atomic: Auth user + company + app_user + JWT meta)
+# Controlado por flags de ambiente:
+#   SIGNUP_ENABLED            - "true" pra habilitar (default false)
+#   SIGNUP_ALLOWED_DOMAINS    - csv de domínios permitidos (vazio = todos)
+# Trigger: dogfood Vectra Cargo via UI (2026-05-17).
+# =====================================================================
+
+class SignupPayload(BaseModel):
+    email: str
+    password: str
+    user_name: str
+    company_name: str
+    mission: Optional[str] = None
+
+    class Config:
+        populate_by_name = True
+        extra = "ignore"
+
+
+@app.post("/auth/signup")
+@app.post("/api/auth/signup")
+async def auth_signup(payload: SignupPayload):
+    """Cria usuário + empresa + app_user num fluxo atomic.
+
+    Pipeline:
+      1. Valida flag SIGNUP_ENABLED + domínio permitido
+      2. supabase_auth.sign_up → cria user no Supabase Auth
+      3. INSERT vectraclip.companies (name, tier=trial, owner_user_id, mission)
+      4. INSERT vectraclip.app_users (id=auth user_id, email, name, role=admin, company_id)
+      5. supabase.auth.admin.update_user_by_id → app_metadata.vectraclip.{company_id, role}
+      6. Re-sign_in pra retornar JWT com app_metadata populado
+      7. audit_log action='auth.signup', target='company:<id>'
+
+    Rollback parcial em qualquer falha pós-step-2.
+    """
+    if os.getenv("SIGNUP_ENABLED", "false").lower() != "true":
+        raise HTTPException(403, "signup_disabled — defina SIGNUP_ENABLED=true no .env do backend")
+
+    if not supabase_auth or not supabase:
+        raise HTTPException(503, "auth_service_unavailable")
+
+    # Validação básica
+    email = (payload.email or "").strip().lower()
+    if "@" not in email or len(email) < 5:
+        raise HTTPException(400, "invalid_email")
+    if not payload.password or len(payload.password) < 8:
+        raise HTTPException(400, "password_min_8_chars")
+    user_name = (payload.user_name or "").strip()
+    company_name = (payload.company_name or "").strip()
+    if len(user_name) < 2 or len(company_name) < 2:
+        raise HTTPException(400, "user_name_and_company_name_min_2_chars")
+
+    # Domínio permitido (opcional — vazio = aceita todos)
+    allowed_csv = os.getenv("SIGNUP_ALLOWED_DOMAINS", "").strip()
+    if allowed_csv:
+        allowed = {d.strip().lower() for d in allowed_csv.split(",") if d.strip()}
+        domain = email.split("@", 1)[-1]
+        if domain not in allowed:
+            raise HTTPException(403, f"domain_not_allowed: {domain} (permitidos: {sorted(allowed)})")
+
+    # Step 1: criar user no Supabase Auth com email_confirm=True (auto-confirmado)
+    # Razão: usar sign_up dispara fluxo de email confirmation, mas:
+    #   - SMTP está bloqueado por Cloudflare WARP (gap R3 do PMO)
+    #   - Email confirmação não chega → user não consegue logar
+    # admin.create_user com email_confirm=True cria user JÁ confirmado, permitindo
+    # login imediato. Trade-off: signup não é mais 100% "self" — backend usa
+    # service_role pra confirmar. OK pra dogfood; pra modelo público de signup
+    # com confirmation, refatorar quando R3 SMTP for resolvido.
+    logger.info(f"signup: admin.create_user email={email} (email_confirm=True)")
+    try:
+        auth_res = supabase.auth.admin.create_user({
+            "email": email,
+            "password": payload.password,
+            "email_confirm": True,
+        })
+    except Exception as e:
+        logger.error(f"signup admin.create_user failed: {e}")
+        raise HTTPException(400, f"signup_failed: {e}")
+    if not auth_res.user:
+        raise HTTPException(500, "signup_no_user_returned")
+    user_id = str(auth_res.user.id)
+    logger.info(f"signup: user_id={user_id} created in Auth (auto-confirmed)")
+
+    # Step 2-4: company + app_user + metadata (com rollback se falhar)
+    company_id: Optional[str] = None
+    try:
+        # Step 2: create company (service_role — ainda OK pra signup, owner é user recém-criado)
+        company_payload: Dict[str, Any] = {
+            "name": company_name,
+            "tier": "trial",
+            "owner_user_id": user_id,
+        }
+        if payload.mission:
+            company_payload["mission"] = payload.mission
+        cmp_res = supabase.table("companies").insert(company_payload).execute()
+        if not cmp_res.data:
+            raise HTTPException(500, "company_insert_returned_empty")
+        company_id = cmp_res.data[0]["company_id"]
+        logger.info(f"signup: company_id={company_id} created")
+
+        # Step 3: create app_user vinculado (id = Auth user_id)
+        supabase.table("app_users").insert({
+            "id": user_id,
+            "email": email,
+            "name": user_name,
+            "role": "admin",
+            "company_id": company_id,
+        }).execute()
+        logger.info(f"signup: app_user inserted role=admin company={company_id}")
+
+        # Step 4: atualiza app_metadata.vectraclip do user no Auth
+        try:
+            supabase.auth.admin.update_user_by_id(user_id, {
+                "app_metadata": {
+                    "vectraclip": {"company_id": company_id, "role": "admin"},
+                },
+            })
+            logger.info(f"signup: app_metadata.vectraclip updated user={user_id}")
+        except Exception as upd_err:
+            # Não rollback — user existe, company existe, app_user existe.
+            # Falhar update_user_by_id deixa user logando com fallback (login.py busca em app_users).
+            logger.warning(f"signup: update_user_by_id falhou (non-fatal): {upd_err}")
+
+        # Step 5: audit log (best-effort)
+        try:
+            from src.services.audit import audit_log
+            audit_log(
+                supabase,
+                company_id=company_id,
+                actor_type="human",
+                actor_id=user_id,
+                action="auth.signup",
+                target=f"company:{company_id}",
+                payload={
+                    "company_name": company_name,
+                    "email": email,
+                    "user_name": user_name,
+                    "tier": "trial",
+                },
+            )
+        except Exception as audit_err:
+            logger.warning(f"signup audit_log non-fatal: {audit_err}")
+
+        # Step 6: Re-sign_in pra obter JWT com app_metadata.vectraclip populado
+        try:
+            session_res = supabase_auth.auth.sign_in_with_password({
+                "email": email,
+                "password": payload.password,
+            })
+            session = session_res.session
+            if not session:
+                raise Exception("re-login returned empty session")
+        except Exception as login_err:
+            # Signup OK mas re-login falhou. User pode logar manualmente.
+            logger.warning(f"signup re-login failed (non-fatal): {login_err}")
+            session = None
+
+        user_data = User(
+            id=user_id,
+            name=user_name,
+            email=email,
+            role="admin",
+            company_id=company_id,
+            avatar_url=None,
+            created_at=_user_created_at_to_utc(auth_res.user.created_at),
+        )
+
+        if session:
+            auth_session = AuthSession(
+                access_token=session.access_token,
+                refresh_token=session.refresh_token,
+                expires_at=_session_expires_to_utc(session.expires_at),
+                user=user_data,
+            )
+            return auth_session.to_zod_dict()
+        else:
+            # Sem session — frontend deve redirecionar pra /login e mostrar mensagem
+            return {
+                "user": user_data.to_zod_dict(),
+                "session": None,
+                "needs_manual_login": True,
+            }
+
+    except HTTPException:
+        # Cleanup: deletar user do Auth (e company se foi criada)
+        _signup_rollback(user_id, company_id)
+        raise
+    except Exception as e:
+        _signup_rollback(user_id, company_id)
+        logger.error(f"signup atomic step failed: {e}")
+        raise HTTPException(500, f"signup_atomic_failed: {e}")
+
+
+def _signup_rollback(user_id: Optional[str], company_id: Optional[str]) -> None:
+    """Best-effort cleanup quando atomic signup quebra após sign_up."""
+    if not user_id or not supabase:
+        return
+    if company_id:
+        try:
+            supabase.table("companies").delete().eq("company_id", company_id).execute()
+            logger.info(f"signup rollback: company {company_id} deletada")
+        except Exception as e:
+            logger.warning(f"signup rollback company falhou: {e}")
+    try:
+        supabase.auth.admin.delete_user(user_id)
+        logger.info(f"signup rollback: user {user_id} deletado do Auth")
+    except Exception as e:
+        logger.warning(f"signup rollback Auth user falhou: {e}")
+
 
 # =====================================================================
 # REST Resources (VectraClip Zod Schemas)
