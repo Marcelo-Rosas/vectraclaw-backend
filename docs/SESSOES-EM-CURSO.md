@@ -13,6 +13,7 @@
 | Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
 |---|---|---|---|---|---|
 | Dogfood cotação Vectra (ADR PMBOK) — UI manual + standby pra investigar quebras | esta sessão + Marcelo | `docs/adr-cotacao-dogfood-freight` (PR aberto) | `docs/ADR-VEC-COTACAO-DOGFOOD-FREIGHT.md` (novo), `docs/AUDIT-HANDLERS-2026-05-16.md` | 2026-05-17 00:30 | indefinido (dogfood manual) |
+| **Self-service signup multi-tenant** (criar empresa Vectra Cargo via UI) | esta sessão (Opus 4.7) | `feat/signup-self-service-vectra-cargo` | backend: migration `companies.mission` + `POST /api/auth/signup` atomic + audit; **frontend VectraClip:** `Login.tsx` (form signup real) + integração `useCompanies` refresh | 2026-05-17 01:00 | ~5h até segunda |
 
 ---
 
