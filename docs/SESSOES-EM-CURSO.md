@@ -10,7 +10,9 @@
 
 ## Ativas
 
-_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
+| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
+|---|---|---|---|---|---|
+| Daedalus PR D — migration bpmn_diagrams | esta sessão (Opus 4.7) | `feat/daedalus-bpmn-diagrams-table` | `supabase/migrations/20260516210000_daedalus_bpmn_diagrams.sql` | 2026-05-16 21:00 | ~30min |
 
 ---
 
