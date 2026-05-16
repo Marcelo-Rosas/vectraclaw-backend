@@ -171,13 +171,13 @@ Company (tenant isolation)
 
 ### Gaps consolidados Camada 2
 
-| Sev | Onde | Issue |
-|---|---|---|
-| 🔴 P0 | app_users PATCH | service_role bypass; RLS GRANT incompleto |
-| 🟡 P1 | execution-config validator | fallback silencioso sem warning se cache 60s stale |
-| 🟡 P1 | adapter_field_definitions field_type | Literal hardcoded (deveria FK catalog) |
-| 🟠 P2 | agent_domains | sem CRUD visível |
-| 🟠 P2 | secrets vault backend | rotation/encryption não auditados |
+| Sev | Onde | Issue | Status |
+|---|---|---|---|
+| 🔴 P0 | app_users PATCH | service_role bypass; RLS GRANT incompleto | ✅ **RESOLVED** PR #168 (G2.1) — escopo expandido pra companies + llm_models |
+| 🟡 P1 | execution-config validator | fallback silencioso sem warning se cache 60s stale | ✅ **RESOLVED** PR #168 (G2.2) — log INFO/WARNING explícito |
+| 🟡 P1 | adapter_field_definitions field_type | Literal hardcoded (deveria FK catalog) | ✅ **DECIDED — não é gap (P6)**. Cada tipo vira componente React diferente; adicionar tipo = code change inevitável. CODE-PATTERNS P6 atualizado |
+| 🟠 P2 | agent_domains | sem CRUD visível | ✅ **ACCEPTED — workaround SQL é o pattern correto**. Domains são vocabulário curado (Logistics/Finance/etc.) — criar via UI sem alinhar com produto = risco de explosão de domains paralelos |
+| 🟠 P2 | secrets vault backend | rotation/encryption não auditados | 📋 **ADR criado** — `docs/ADR-VEC-VAULT-AUDIT.md` com checklist compliance; auditoria efetiva agendada |
 
 ---
 
