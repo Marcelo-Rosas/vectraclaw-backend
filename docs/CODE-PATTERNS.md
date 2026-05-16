@@ -8,6 +8,49 @@
 
 ---
 
+## P0 — Espelhar antes de criar (regra dura)
+
+**Antes de adicionar entry em qualquer catálogo (`agent_specialties`, `adapter_catalog`,
+`llm_models`, `operation_types_catalog`, `agent_execution_modes`, etc.), você DEVE:**
+
+1. Rodar `SELECT <coluna_relevante> FROM <tabela> LIMIT 1` (ou ler o frontend Zod schema)
+2. **Copiar o shape literal** — nomes de campos, tipos, formato de arrays
+3. Só então preencher com o seu conteúdo
+
+**Por quê esta regra é dura:** múltiplas violações no mesmo dia (2026-05-16):
+- `bpmn-modeling.config_schema[0].options` virou `[{value, label}]` em vez de `["str", "str"]`
+  → quebrou Zod do frontend → hotfix #161
+- `bpmn-modeling.config_schema[0].default` em vez de `defaultValue` → mesmo hotfix
+- Padrão genérico: agentes Claude tendem a "enriquecer" schemas porque o shape "mais rico"
+  parece melhor abstratamente. Mas o frontend tem Zod schema rígido que segue o vizinho.
+  Schema rico ≠ schema certo.
+
+**Anti-pattern (✋):**
+
+```python
+# ❌ ERRADO — assumi shape sem checar
+config_schema = [{
+    "key": "model",
+    "options": [{"value": "x", "label": "X"}],  # parece mais rico…
+    "default": "x",                              # parece mais natural…
+}]
+```
+
+```python
+# ✅ CORRETO — espelhei Hodos antes
+# (SELECT config_schema FROM agent_specialties WHERE slug='route-cost-calculation')
+config_schema = [{
+    "key": "model",
+    "options": ["x", "y", "z"],     # convenção da casa
+    "defaultValue": "x",            # convenção da casa
+}]
+```
+
+**Aplica a:** specialty config_schema, adapter field definitions, llm_models tier
+descriptors, qualquer payload JSONB consumido pelo frontend com Zod schema rígido.
+
+---
+
 ## P1 — Catalog-driven enums (no Literal hardcoded)
 
 **Regra:** se existe tabela `vectraclip.X_catalog` (ou `X_types`, `X_modes`, `X_status`),
