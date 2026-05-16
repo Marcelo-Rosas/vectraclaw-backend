@@ -274,7 +274,7 @@ def get_authenticated_client(token: str) -> Client:
     if token == "dev-token" and supabase:
         return supabase
 
-    from supabase.lib.client_options import ClientOptions
+    from supabase import ClientOptions
     client = create_client(
         SUPABASE_URL,
         SUPABASE_ANON_KEY,
@@ -345,8 +345,7 @@ supabase = None
 supabase_auth = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
-        from supabase import create_client
-        from supabase.lib.client_options import ClientOptions
+        from supabase import create_client, ClientOptions
 
         # `ClientOptions.schema` pina o schema para todas as reconstruções futuras
         # de `_postgrest` — sobrevive inclusive se algum fluxo dispara SIGNED_IN

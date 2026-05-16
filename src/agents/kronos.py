@@ -1011,8 +1011,7 @@ def load_rules_from_db(client) -> dict:
         except Exception as first_err:
             if "PGRST205" in str(first_err) or "schema cache" in str(first_err).lower():
                 import os
-                from supabase import create_client
-                from supabase.lib.client_options import ClientOptions
+                from supabase import create_client, ClientOptions
                 schema = os.getenv("SUPABASE_SCHEMA", "vectraclip")
                 _c = create_client(
                     os.environ["SUPABASE_URL"],
