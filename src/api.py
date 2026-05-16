@@ -1659,6 +1659,321 @@ async def delete_raci_cell(request: Request, component_id: UUID, position_id: UU
         logger.error(f"delete_raci_cell failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# =============================================================================
+# Risk Register PMBOK — G1 (vectraclip.risks)
+# Doc: docs/EXECUCAO-G1-RISK-REGISTER-E-DAEDALUS.md §3
+# Tabela criada pelo PR #149.
+# =============================================================================
+
+# Constants — não viraram catalog porque são enums PMBOK fechados (P6 do
+# CODE-PATTERNS: máquina de estados local, não expansível por config de tenant).
+# CHECK do DB rejeita inválidos com 23514; validamos antes pra mensagem em PT.
+_RISK_VALID_CATEGORIES = {"technical", "external", "organizational", "project_mgmt"}
+_RISK_VALID_STATUSES = {"identified", "analyzing", "planned", "monitoring", "occurred", "closed"}
+_RISK_VALID_RESPONSE_STRATEGIES = {"avoid", "transfer", "mitigate", "accept", "escalate"}
+_RISK_WRITE_BLOCKED_ROLES = _SIPOC_EDIT_BLOCKED_ROLES  # mesma política do RACI
+
+
+class NewRiskInput(BaseModel):
+    """Input para POST /api/risks. Pelo menos 1 vínculo (goal/workflow/process/component) é
+    recomendado mas não obrigatório (risco pode ser company-wide)."""
+    name: str
+    category: str
+    probability: float
+    impact: float
+    description: Optional[str] = None
+    response_strategy: Optional[str] = None
+    mitigation_actions: Optional[str] = None
+    contingency_plan: Optional[str] = None
+    owner_position_id: Optional[str] = None
+    status: Optional[str] = "identified"
+    linked_goal_id: Optional[str] = None
+    linked_workflow_id: Optional[str] = None
+    linked_sipoc_process_id: Optional[str] = None
+    linked_sipoc_component_id: Optional[str] = None
+    detected_by_athena: Optional[bool] = False
+    athena_recommendation_id: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
+
+
+class UpdateRiskInput(BaseModel):
+    """Input para PATCH /api/risks/{id}. Tudo opcional — partial update."""
+    name: Optional[str] = None
+    category: Optional[str] = None
+    probability: Optional[float] = None
+    impact: Optional[float] = None
+    description: Optional[str] = None
+    response_strategy: Optional[str] = None
+    mitigation_actions: Optional[str] = None
+    contingency_plan: Optional[str] = None
+    owner_position_id: Optional[str] = None
+    status: Optional[str] = None
+    linked_goal_id: Optional[str] = None
+    linked_workflow_id: Optional[str] = None
+    linked_sipoc_process_id: Optional[str] = None
+    linked_sipoc_component_id: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
+
+
+def _validate_risk_payload(payload: Dict[str, Any], *, partial: bool = False) -> None:
+    """Validação pré-DB (mensagens em PT). CHECK do DB é o último guardião."""
+    if "category" in payload and payload["category"] is not None:
+        if payload["category"] not in _RISK_VALID_CATEGORIES:
+            raise HTTPException(
+                400,
+                f"Risk: category '{payload['category']}' inválida. "
+                f"Esperado: {sorted(_RISK_VALID_CATEGORIES)}.",
+            )
+    elif not partial:
+        raise HTTPException(400, "Risk: campo 'category' é obrigatório.")
+
+    if "probability" in payload and payload["probability"] is not None:
+        try:
+            p = float(payload["probability"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Risk: 'probability' deve ser número entre 0 e 1.")
+        if p < 0 or p > 1:
+            raise HTTPException(
+                400,
+                f"Risk: 'probability' deve estar entre 0 e 1 (recebido {p}).",
+            )
+    elif not partial:
+        raise HTTPException(400, "Risk: campo 'probability' é obrigatório.")
+
+    if "impact" in payload and payload["impact"] is not None:
+        try:
+            i = float(payload["impact"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Risk: 'impact' deve ser número entre 1 e 10.")
+        if i < 1 or i > 10:
+            raise HTTPException(
+                400,
+                f"Risk: 'impact' deve estar entre 1 e 10 (recebido {i}).",
+            )
+    elif not partial:
+        raise HTTPException(400, "Risk: campo 'impact' é obrigatório.")
+
+    if "status" in payload and payload["status"] is not None:
+        if payload["status"] not in _RISK_VALID_STATUSES:
+            raise HTTPException(
+                400,
+                f"Risk: status '{payload['status']}' inválido. "
+                f"Esperado: {sorted(_RISK_VALID_STATUSES)}.",
+            )
+
+    if "response_strategy" in payload and payload["response_strategy"]:
+        if payload["response_strategy"] not in _RISK_VALID_RESPONSE_STRATEGIES:
+            raise HTTPException(
+                400,
+                f"Risk: response_strategy '{payload['response_strategy']}' inválido. "
+                f"Esperado: {sorted(_RISK_VALID_RESPONSE_STRATEGIES)}.",
+            )
+
+    if "name" in payload and payload["name"] is not None:
+        name = str(payload["name"]).strip()
+        if len(name) < 3:
+            raise HTTPException(400, "Risk: 'name' deve ter ao menos 3 caracteres.")
+        if len(name) > 200:
+            raise HTTPException(400, "Risk: 'name' não pode passar de 200 caracteres.")
+
+
+@app.post("/api/risks")
+async def create_risk(request: Request, payload: NewRiskInput):
+    """Cria risco novo. company_id vem do JWT (tenant scope)."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _RISK_WRITE_BLOCKED_ROLES, "criar riscos")
+
+    company_id = _resolve_company_id(request)
+    if not company_id:
+        raise HTTPException(400, "company_id_required (JWT sem tenant scope)")
+
+    data = payload.model_dump(exclude_none=True)
+    _validate_risk_payload(data)
+    data["company_id"] = company_id
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("risks").insert(data).execute()
+        if not res.data:
+            raise HTTPException(500, "Risk: insert returned empty")
+        logger.info(
+            "Risk created id=%s name=%r category=%s prob=%s impact=%s by=%s",
+            res.data[0].get("id"), data.get("name"), data.get("category"),
+            data.get("probability"), data.get("impact"), scope.get("user_id"),
+        )
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"create_risk failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/companies/{company_id}/risks")
+async def list_company_risks(
+    request: Request,
+    company_id: UUID,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    min_score: Optional[float] = None,
+):
+    """Lista riscos de uma company. Filtros opcionais: status, category, min_score.
+    Ordena por risk_score DESC (mais críticos primeiro)."""
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        q = client.table("risks").select("*").eq("company_id", str(company_id))
+        if status:
+            if status not in _RISK_VALID_STATUSES:
+                raise HTTPException(400, f"status inválido: {status}")
+            q = q.eq("status", status)
+        if category:
+            if category not in _RISK_VALID_CATEGORIES:
+                raise HTTPException(400, f"category inválida: {category}")
+            q = q.eq("category", category)
+        if min_score is not None:
+            q = q.gte("risk_score", min_score)
+        res = q.order("risk_score", desc=True).execute()
+        return res.data or []
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"list_company_risks failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/risks/{risk_id}")
+async def get_risk(request: Request, risk_id: UUID):
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("risks").select("*").eq("id", str(risk_id)).limit(1).execute()
+        if not res.data:
+            raise HTTPException(404, "risk_not_found")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_risk failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/risks/{risk_id}")
+async def patch_risk(request: Request, risk_id: UUID, payload: UpdateRiskInput):
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _RISK_WRITE_BLOCKED_ROLES, "editar riscos")
+
+    data = payload.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(400, "no_valid_fields")
+    _validate_risk_payload(data, partial=True)
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("risks").update(data).eq("id", str(risk_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "risk_not_found")
+        logger.info(
+            "Risk patched id=%s fields=%s by=%s",
+            risk_id, list(data.keys()), scope.get("user_id"),
+        )
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_risk failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/risks/{risk_id}")
+async def delete_risk(request: Request, risk_id: UUID):
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _RISK_WRITE_BLOCKED_ROLES, "remover riscos")
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("risks").delete().eq("id", str(risk_id)).execute()
+        # supabase delete não retorna data se RLS falhar — verificar GET antes? Mantém simples.
+        logger.info("Risk deleted id=%s by=%s", risk_id, scope.get("user_id"))
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_risk failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/goals/{goal_id}/risks")
+async def list_goal_risks(request: Request, goal_id: UUID):
+    """Riscos vinculados a um goal específico."""
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("risks").select("*")
+            .eq("linked_goal_id", str(goal_id))
+            .order("risk_score", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"list_goal_risks failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sipoc/processes/{process_id}/risks")
+async def list_sipoc_process_risks(request: Request, process_id: UUID):
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("risks").select("*")
+            .eq("linked_sipoc_process_id", str(process_id))
+            .order("risk_score", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"list_sipoc_process_risks failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/sipoc/components/{component_id}/risks")
+async def list_sipoc_component_risks(request: Request, component_id: UUID):
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("risks").select("*")
+            .eq("linked_sipoc_component_id", str(component_id))
+            .order("risk_score", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"list_sipoc_component_risks failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# (fim Risk Register)
+# =============================================================================
+
+
 @app.get("/api/sipoc/templates")
 async def list_templates():
     return get_templates_list()
