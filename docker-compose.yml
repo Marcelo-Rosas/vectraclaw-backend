@@ -4,9 +4,11 @@ services:
     container_name: vectraclaw-backend
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "3100:3000"
     env_file:
       - .env
+    environment:
+      PORT: "3000"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
       interval: 30s
