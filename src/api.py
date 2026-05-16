@@ -941,8 +941,13 @@ def _slugify_sipoc(name: str) -> str:
 
 def _normalize_sipoc_payload_to_snake(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Aceita payload em camelCase OU snake_case (frontend velho mistura).
-    DB exige snake_case. Defensive transform — não quebra clients corretos."""
+    DB exige snake_case. Defensive transform — não quebra clients corretos.
+
+    Inclui campos de TODAS as tabelas SIPOC pra reuso entre handlers
+    (sectors, processes, components, positions, raci).
+    """
     camel_to_snake = {
+        # IDs e refs
         "companyId": "company_id",
         "sectorId": "sector_id",
         "reportsToId": "reports_to_id",
@@ -950,6 +955,18 @@ def _normalize_sipoc_payload_to_snake(payload: Dict[str, Any]) -> Dict[str, Any]
         "componentId": "component_id",
         "positionId": "position_id",
         "parentSectorId": "parent_sector_id",
+        "responsibleId": "responsible_id",
+        "responsiblePositionId": "responsible_position_id",
+        "suggestedOperationType": "suggested_operation_type",
+        # Status/flags
+        "automationStatus": "automation_status",
+        "validationStatus": "validation_status",
+        "validationNotes": "validation_notes",
+        "clonedFromTemplateId": "cloned_from_template_id",
+        # Metadados
+        "diagnosticMetadata": "diagnostic_metadata",
+        "createdAt": "created_at",
+        "updatedAt": "updated_at",
     }
     out = {}
     for k, v in payload.items():
@@ -1209,6 +1226,258 @@ async def delete_sipoc_component(request: Request, component_id: UUID):
         raise
     except Exception as e:
         logger.error(f"delete_sipoc_component failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATCH hierárquico SIPOC (sector / process / component) — UI-first MVP
+#
+# Backend dos 3 endpoints PATCH que UI precisa pra editar nome/descrição
+# sem CLI. Padrão idêntico aos DELETEs acima:
+# - require_role_not bloqueia sector_responsible/viewer
+# - service_role no UPDATE (consistente com hotfix #137)
+# - validate_sipoc_name reaproveitado pros campos name/title
+# - normalize_payload aceita camelCase do frontend
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SIPOC_EDIT_BLOCKED_ROLES = _SIPOC_DELETE_BLOCKED_ROLES  # mesma matriz
+
+
+@app.patch("/api/sipoc/sectors/{sector_id}")
+async def patch_sipoc_sector(request: Request, sector_id: UUID, payload: Dict[str, Any]):
+    """Edita um setor SIPOC (name, icon, metadata, parent_sector_id).
+
+    Schema real: id, company_id, name, slug, icon, metadata, parent_sector_id.
+    NÃO tem `description` (esse campo é só de processes/components).
+    """
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _SIPOC_EDIT_BLOCKED_ROLES, "editar setores SIPOC")
+
+    payload = _normalize_sipoc_payload_to_snake(payload)
+    update_data: Dict[str, Any] = {}
+    if "name" in payload and payload["name"] is not None:
+        update_data["name"] = _validate_sipoc_name(payload["name"], kind="Setor")
+        # Se nome mudou, slug pode estar stale; re-gerar (idempotente)
+        update_data["slug"] = _slugify_sipoc(update_data["name"])
+    if "icon" in payload:
+        update_data["icon"] = payload["icon"]
+    if "metadata" in payload and isinstance(payload["metadata"], dict):
+        update_data["metadata"] = payload["metadata"]
+    if "parent_sector_id" in payload:
+        update_data["parent_sector_id"] = payload["parent_sector_id"] or None
+
+    if not update_data:
+        raise HTTPException(400, "no_valid_fields")
+
+    try:
+        res = supabase.table("sipoc_sectors").update(update_data).eq("id", str(sector_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "sector_not_found_or_not_accessible")
+        logger.info("patch_sipoc_sector sector=%s fields=%s by=%s",
+                    sector_id, list(update_data.keys()), scope.get("user_id"))
+        return SipocSector(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_sipoc_sector failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/sipoc/processes/{process_id}")
+async def patch_sipoc_process(request: Request, process_id: UUID, payload: Dict[str, Any]):
+    """Edita um processo SIPOC (name, description, status, position_id, etc.)."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _SIPOC_EDIT_BLOCKED_ROLES, "editar processos SIPOC")
+
+    payload = _normalize_sipoc_payload_to_snake(payload)
+    update_data: Dict[str, Any] = {}
+    if "name" in payload and payload["name"] is not None:
+        update_data["name"] = _validate_sipoc_name(payload["name"], kind="Processo", max_len=80)
+    if "description" in payload:
+        update_data["description"] = payload["description"]
+    if "status" in payload:
+        update_data["status"] = payload["status"]
+    if "sector_id" in payload:
+        update_data["sector_id"] = payload["sector_id"]
+    if "position_id" in payload:
+        update_data["position_id"] = payload["position_id"] or None
+    if "responsible_id" in payload:
+        update_data["responsible_id"] = payload["responsible_id"] or None
+    if "metadata" in payload and isinstance(payload["metadata"], dict):
+        update_data["metadata"] = payload["metadata"]
+
+    if not update_data:
+        raise HTTPException(400, "no_valid_fields")
+
+    try:
+        res = supabase.table("sipoc_processes").update(update_data).eq("id", str(process_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "process_not_found_or_not_accessible")
+        logger.info("patch_sipoc_process process=%s fields=%s by=%s",
+                    process_id, list(update_data.keys()), scope.get("user_id"))
+        return SipocProcess(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_sipoc_process failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/sipoc/processes/{process_id}/components")
+async def create_sipoc_component_standalone(
+    request: Request, process_id: UUID, payload: Dict[str, Any]
+):
+    """Cria um component SIPOC (activity, supplier, input, output, customer)
+    standalone, sem precisar de template do marketplace.
+
+    Resolve Gap 3 do dogfood — antes só dava pra criar via SipocWizard ou SQL.
+
+    Body esperado:
+      {
+        "type": "activity" | "supplier" | "input" | "output" | "customer",
+        "content": {"name": "...", "description": "...", "what": "...", ...},
+        "order": <int opcional, default=99>,
+        "automation_status": <opcional para activity>,
+        "suggested_operation_type": <opcional>,
+        "responsible_position_id": <opcional UUID>
+      }
+    """
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _SIPOC_EDIT_BLOCKED_ROLES, "criar componentes SIPOC")
+
+    payload = _normalize_sipoc_payload_to_snake(payload)
+
+    # Valida type contra os 5 valores aceitos no SIPOC
+    valid_types = {"supplier", "input", "output", "customer", "activity"}
+    comp_type = payload.get("type")
+    if comp_type not in valid_types:
+        raise HTTPException(
+            400,
+            f"type inválido: '{comp_type}'. Aceito: {sorted(valid_types)}",
+        )
+
+    # Valida content
+    content = payload.get("content") or {}
+    if not isinstance(content, dict):
+        raise HTTPException(400, "content deve ser objeto JSON")
+    content_name = content.get("name") or content.get("title")
+    if content_name:
+        # Usa mesma validação dos sectors (3-80 chars, sem 'Quero...', etc.)
+        kind = "Atividade" if comp_type == "activity" else f"Componente {comp_type}"
+        content["name"] = _validate_sipoc_name(content_name, kind=kind, max_len=80)
+        # Remove título se existir pra evitar duplicação
+        content.pop("title", None)
+
+    insert_row = {
+        "process_id": str(process_id),
+        "type": comp_type,
+        "content": content,
+        "order": payload.get("order", 99),
+    }
+    # Campos opcionais do PR2 (PR #131) — só se vier no payload
+    if comp_type == "activity":
+        if "automation_status" in payload:
+            insert_row["automation_status"] = payload["automation_status"]
+        if "suggested_operation_type" in payload:
+            insert_row["suggested_operation_type"] = payload["suggested_operation_type"]
+        if "responsible_position_id" in payload:
+            insert_row["responsible_position_id"] = payload["responsible_position_id"] or None
+    if "metadata" in payload and isinstance(payload["metadata"], dict):
+        insert_row["metadata"] = payload["metadata"]
+
+    try:
+        res = supabase.table("sipoc_components").insert(insert_row).execute()
+        if not res.data:
+            raise HTTPException(500, "insert_returned_empty")
+        component = res.data[0]
+        logger.info("create_sipoc_component_standalone process=%s type=%s component=%s by=%s",
+                    process_id, comp_type, component["id"], scope.get("user_id"))
+        return {
+            "id": component["id"],
+            "processId": str(process_id),
+            "type": component["type"],
+            "content": component["content"],
+            "order": component.get("order"),
+            "automationStatus": component.get("automation_status"),
+            "suggestedOperationType": component.get("suggested_operation_type"),
+            "responsiblePositionId": component.get("responsible_position_id"),
+            "createdAt": component.get("created_at"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"create_sipoc_component_standalone failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/api/sipoc/components/{component_id}")
+async def patch_sipoc_component(request: Request, component_id: UUID, payload: Dict[str, Any]):
+    """Edita um component (content, order, automation_status, etc.)."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _SIPOC_EDIT_BLOCKED_ROLES, "editar componentes SIPOC")
+
+    payload = _normalize_sipoc_payload_to_snake(payload)
+    update_data: Dict[str, Any] = {}
+
+    if "content" in payload:
+        content = payload["content"]
+        if not isinstance(content, dict):
+            raise HTTPException(400, "content deve ser objeto JSON")
+        # Valida nome se enviado no content (mesmo padrão dos POSTs)
+        if content.get("name"):
+            content["name"] = _validate_sipoc_name(content["name"], kind="Componente", max_len=80)
+        update_data["content"] = content
+
+    if "order" in payload:
+        update_data["order"] = payload["order"]
+    if "automation_status" in payload:
+        update_data["automation_status"] = payload["automation_status"]
+    if "suggested_operation_type" in payload:
+        update_data["suggested_operation_type"] = payload["suggested_operation_type"]
+    if "responsible_position_id" in payload:
+        update_data["responsible_position_id"] = payload["responsible_position_id"] or None
+    if "diagnostic_metadata" in payload and isinstance(payload["diagnostic_metadata"], dict):
+        update_data["diagnostic_metadata"] = payload["diagnostic_metadata"]
+    if "validation_status" in payload:
+        update_data["validation_status"] = payload["validation_status"]
+    if "validation_notes" in payload:
+        update_data["validation_notes"] = payload["validation_notes"]
+    if "metadata" in payload and isinstance(payload["metadata"], dict):
+        update_data["metadata"] = payload["metadata"]
+
+    if not update_data:
+        raise HTTPException(400, "no_valid_fields")
+
+    try:
+        res = supabase.table("sipoc_components").update(update_data).eq("id", str(component_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "component_not_found_or_not_accessible")
+        logger.info("patch_sipoc_component component=%s fields=%s by=%s",
+                    component_id, list(update_data.keys()), scope.get("user_id"))
+        component = res.data[0]
+        return {
+            "id": component["id"],
+            "processId": component.get("process_id"),
+            "type": component["type"],
+            "content": component["content"],
+            "order": component.get("order"),
+            "automationStatus": component.get("automation_status"),
+            "suggestedOperationType": component.get("suggested_operation_type"),
+            "responsiblePositionId": component.get("responsible_position_id"),
+            "updatedAt": component.get("updated_at"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_sipoc_component failed: {e}")
         raise HTTPException(500, str(e))
 
 
