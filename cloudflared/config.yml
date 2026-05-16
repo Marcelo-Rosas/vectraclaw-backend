@@ -1,8 +1,8 @@
-tunnel: <SEU_TUNNEL_ID>
-credentials-file: /etc/cloudflared/<SEU_TUNNEL_ID>.json
+tunnel: 7488faec-a04f-463c-a3fa-cb6cd0b0a205
+credentials-file: /etc/cloudflared/7488faec-a04f-463c-a3fa-cb6cd0b0a205.json
 
 ingress:
-  - hostname: api.vectraclip.vectracargo.com.br
+  - hostname: api-vectraclip.vectracargo.com.br
     service: http://backend:3000
     originRequest:
       noTLSVerify: false
