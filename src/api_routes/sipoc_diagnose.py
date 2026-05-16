@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 
 logger = logging.getLogger("api.sipoc_diagnose")
 router = APIRouter(tags=["sipoc-diagnose"])
@@ -274,4 +275,100 @@ async def diagnose_sector(request: Request, sector_id: str):
         raise
     except Exception as e:
         logger.error(f"diagnose_sector failed: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
+
+
+def _compute_diagnose_for_pdf(sector_id: str, client) -> Dict[str, Any]:
+    """Mesma agregação do endpoint POST, mas SEM persistir em
+    athena_recommendations (chamado pelo endpoint de PDF — leitura pura).
+    """
+    sres = (
+        client.table("sipoc_sectors")
+        .select("id, name, company_id")
+        .eq("id", sector_id)
+        .limit(1)
+        .execute()
+    )
+    if not sres.data:
+        raise HTTPException(404, "sector_not_found_or_not_accessible")
+    sector = sres.data[0]
+
+    pres = (
+        client.table("sipoc_processes")
+        .select("id, name")
+        .eq("sector_id", sector_id)
+        .execute()
+    )
+    processes = pres.data or []
+    process_ids = [p["id"] for p in processes]
+
+    activities: List[Dict[str, Any]] = []
+    if process_ids:
+        ares = (
+            client.table("sipoc_components")
+            .select("id, process_id, type, content, automation_status, suggested_operation_type, responsible_position_id")
+            .in_("process_id", process_ids)
+            .eq("type", "activity")
+            .execute()
+        )
+        activities = ares.data or []
+
+    diagnose = _compute_diagnose(sector, processes, activities)
+    diagnose["recommendation"] = {
+        "id": None,
+        "status": "pdf_export",
+        "rationale": _build_rationale_text(diagnose),
+    }
+    return diagnose
+
+
+@router.get("/api/sipoc/diagnose/{sector_id}/pdf")
+@router.get("/sipoc/diagnose/{sector_id}/pdf")
+async def diagnose_sector_pdf(request: Request, sector_id: str):
+    """Gera PDF executivo do diagnóstico de um setor (sem persistir).
+
+    Usa o mesmo cálculo do POST mas:
+    - NÃO insere row em athena_recommendations (read-only)
+    - Retorna binário application/pdf com filename sugestivo
+
+    Útil pra "Exportar diagnóstico" no SipocReport sem poluir o painel
+    Athena com uma row a cada export.
+    """
+    from src.api import supabase, get_authenticated_client, get_user_scope, require_role_not
+    from src.services.sipoc_diagnose_pdf import render_diagnose_pdf
+    from datetime import datetime as _dt
+
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _DIAGNOSE_BLOCKED_ROLES, "exportar PDF do diagnóstico")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        diagnose = _compute_diagnose_for_pdf(sector_id, client)
+        pdf_bytes = render_diagnose_pdf(diagnose)
+
+        # Slug do nome pro filename
+        sector_name = diagnose["sector"].get("name") or "setor"
+        safe_name = "".join(c if c.isalnum() else "_" for c in sector_name).strip("_") or "setor"
+        date_str = _dt.now().strftime("%Y%m%d")
+        filename = f"diagnostico_sipoc_{safe_name}_{date_str}.pdf"
+
+        logger.info(
+            "diagnose_sector_pdf sector=%s bytes=%d filename=%s",
+            sector_id, len(pdf_bytes), filename,
+        )
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Content-Length": str(len(pdf_bytes)),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"diagnose_sector_pdf failed: {e}", exc_info=True)
         raise HTTPException(500, str(e))
