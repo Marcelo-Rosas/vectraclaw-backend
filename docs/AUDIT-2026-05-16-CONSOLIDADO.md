@@ -49,7 +49,8 @@ PRs duplicados.
 | B4 | `src/components/shared/NotificationsBell.tsx:48-53` | `typeLabels` hardcoded | _(council_request_types — VERIFICAR se existe)_ | ALTA | open — investigar catalog |
 | B5 | `src/pages/Council.tsx:54-78` | `REQUEST_TYPE_CONFIG` hardcoded | idem B4 | ALTA | open |
 | B6 | `src/pages/Council.tsx:80-96` | `STATUS_CONFIG` hardcoded approvals | _(council_approval_statuses — VERIFICAR)_ | ALTA | open |
-| B7 | `src/lib/api/schemas.ts:94-178` | Múltiplos `z.enum()` (agentStatus, taskStatus, councilRequestType, userRole, councilApprovalStatus) | vários | MÉDIA | open — depende de A7/A8 e catalogs novos |
+| B7 | `src/lib/api/schemas.ts:94-178` | Múltiplos `z.enum()` (agentStatus, taskStatus, councilRequestType, userRole, councilApprovalStatus, **recommendationKind**) | vários | **🔴 CRÍTICA** (era MÉDIA) | **OPEN — VISÍVEL EM PROD** |
+| B7-bis | `src/lib/api/schemas.ts` `recommendationKindSchema` | `z.enum([hire_new_agent, add_specialty, rewrite_system_prompt, create_specialty, consolidate_agents])` | `athena_kind_catalog` (PR #141 canonicalizou 8 valores incluindo `diagnose_gap`) | **🔴 CRÍTICA** | **OPEN — quebra `/agents/recommendations`** ("Resposta inválida: Expected enum, received 'diagnose_gap'") |
 | B8 | `src/lib/display.ts:28-356` | `AGENT_STATUSES`, `ADAPTER_TYPES`, `TASK_STATUSES`, `TASK_OPERATION_TYPES`, etc. | múltiplos | MÉDIA | open — refactor maior |
 | B9 | `src/pages/Council.tsx:235-244` | `PayloadRenderer` switch hardcoded | idem B4 | MÉDIA | open |
 | B10 | `src/lib/display.ts:439-495` | `RAG_CATEGORIAS`, `RAG_DEPARTAMENTOS`, `RAG_CONFIDENCIALIDADES` | _(catalog não existe — criar?)_ | MÉDIA | decisão Product |
@@ -127,6 +128,7 @@ B7/B8.
 
 ## Backlog priorizado (ordem sugerida)
 
+0. **🔴 CRÍTICA: B7-bis** — `recommendationKindSchema` quebrando `/agents/recommendations` em prod (backend mandou `diagnose_gap`, Zod do frontend rejeita). Fix de 1 linha: `recommendationKindSchema: z.ZodType<RecommendationKind> = z.string().min(1)` (mesmo pattern de `adapter_type` / `execution_mode`). **Owner sugerido:** sessão frontend que pegar o Lote 2 — encaixar como primeiro fix antes das batidas.
 1. **CRIAR catalog GET endpoints faltantes** (`adapter_catalog`, `task_tree_status`) — destrava B7/B8 inteiros
 2. **A4** — Consolidar adapter mapping (`_to_db` duplicado)
 3. **A5+A6+A9** — `operation_type` catalog-driven (Pydantic + Kronos tuple)
