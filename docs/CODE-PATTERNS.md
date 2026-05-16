@@ -302,6 +302,7 @@ Alguns enums são realmente locais (máquina de estados interna), não merecem c
 | `User.role` | `models.py:591` `admin/member` | Auth/security — mudar tem implicação maior que catálogo |
 | `SipocComponent.type` | `models.py:1025` `supplier/input/activity/output/customer` | Framework SIPOC tem 5 canônicos por definição |
 | `Incident.severity` | `models.py:623` `low/medium/high` | Escala universal |
+| `AdapterFieldDefinition.field_type` | `models.py:422` `text/textarea/number/boolean/select/multiselect/file_upload/secret/url` | Cada tipo vira componente React diferente (switch UI). Adicionar tipo = adicionar componente = code change inevitável |
 
 Se você AINDA acha que merece catálogo, abra issue antes de mexer — não é mero
 hardcode, é decisão arquitetural com trade-off.
