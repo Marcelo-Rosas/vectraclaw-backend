@@ -13,6 +13,10 @@ basedpyright/
 # --- Secrets / env ---
 .env
 .env.*
+!/.env.example
+
+# --- Cloudflare Tunnel (credenciais locais) ---
+cloudflared/*.json
 
 # --- Claude / IDE ---
 .claude/

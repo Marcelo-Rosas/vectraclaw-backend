@@ -91,8 +91,7 @@ class ResilientHarnessDaemon:
         if not url or not key:
             return None
         try:
-            from supabase import create_client
-            from supabase.lib.client_options import ClientOptions
+            from supabase import create_client, ClientOptions
             schema = os.getenv("SUPABASE_SCHEMA", "vectraclip")
             self._supabase = create_client(url, key, options=ClientOptions(schema=schema, persist_session=False))
         except Exception as e:
