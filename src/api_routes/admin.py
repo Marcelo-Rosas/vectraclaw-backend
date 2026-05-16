@@ -272,6 +272,26 @@ async def patch_app_user(request: Request, user_id: str, payload: PatchAppUserIn
             "patch_app_user user=%s fields=%s by=%s",
             user_id, list(update_data.keys()), scope.get("user_id"),
         )
+
+        # G1.1 audit log (best-effort) — compliance trail de mudança de role/position
+        from src.services.audit import audit_log
+        prev_role = cur.data[0].get("role")
+        new_role = update_data.get("role")
+        action_name = "user.role_change" if (new_role and new_role != prev_role) else "user.update"
+        audit_log(
+            supabase,
+            company_id=str(scope.get("company_id") or cur.data[0].get("company_id") or ""),
+            actor_type="human",
+            actor_id=str(scope.get("user_id") or "unknown"),
+            action=action_name,
+            target=f"user:{user_id}",
+            payload={
+                "fields_changed": list(update_data.keys()),
+                "previous_role": prev_role,
+                "new_role": new_role,
+                "assigned_position_id": update_data.get("assigned_position_id"),
+            },
+        )
         return _user_to_dict(res.data[0])
     except HTTPException:
         raise
