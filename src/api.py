@@ -3255,6 +3255,13 @@ class SignupPayload(BaseModel):
     user_name: str
     company_name: str
     mission: Optional[str] = None
+    # PR 3 dogfood: front pode enviar CNPJ (digitado no signup form) e/ou
+    # cnpj_data (preview já resolvido pelo /api/cnpj/lookup). Backend usa
+    # qualquer um dos dois pra disparar athena-onboarding com perfil já
+    # enriquecido. Ambos são opcionais — sem CNPJ, perfil sai esparso e o
+    # handler athena-onboarding flag um warning sugerindo Oracle research.
+    cnpj: Optional[str] = None
+    cnpj_data: Optional[Dict[str, Any]] = None
 
     class Config:
         populate_by_name = True
@@ -3384,6 +3391,52 @@ async def auth_signup(payload: SignupPayload):
             )
         except Exception as audit_err:
             logger.warning(f"signup audit_log non-fatal: {audit_err}")
+
+        # Step 5.5: dispatch athena-onboarding (best-effort) — PR 3 dogfood Vectra Cargo.
+        # Sintetiza markdown do perfil empresarial via CNPJ data + bio e ingere
+        # no RAG corpus do tenant via Mnemos. Quando o user chegar no primeiro
+        # Goal, Athena classify/charter já tem contexto do negócio dele.
+        # Não bloqueia signup: se cair, user faz onboarding manualmente depois.
+        try:
+            _ATHENA_AGENT_ID = "ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d"
+            onboarding_input: Dict[str, Any] = {
+                "company_name": company_name,
+                "user_name": user_name,
+                "user_email": email,
+            }
+            # cnpj_data: opcional. Front pode mandar via payload.cnpj_data (preview do CNPJ
+            # lookup que ele já fez no form). Se ausente, handler degrada graciosamente
+            # com perfil esparso + warning.
+            if getattr(payload, "cnpj_data", None):
+                onboarding_input["cnpj_data"] = payload.cnpj_data
+            elif getattr(payload, "cnpj", None):
+                # Front mandou só o CNPJ (sem data); resolve no backend via service.
+                # Best-effort: se falhar, segue sem.
+                try:
+                    from src.services.cnpj_lookup import lookup_cnpj as _lookup
+                    onboarding_input["cnpj_data"] = await _lookup(payload.cnpj)
+                except Exception as cnpj_err:
+                    logger.info(f"signup onboarding: cnpj resolution skipped: {cnpj_err}")
+            if payload.mission:
+                onboarding_input["notes"] = payload.mission
+
+            supabase.table("tasks").insert({
+                "company_id": company_id,
+                "title": f"Onboarding Athena — {company_name}",
+                "description": (
+                    f"Sintetiza perfil empresarial e ingere no RAG corpus inicial. "
+                    f"Disparado automaticamente no signup self-service."
+                ),
+                "operation_type": "athena-onboarding",
+                "status": "queued",
+                "budget_limit": 50_000,
+                "executor_type": "harness",
+                "assigned_to_agent_id": _ATHENA_AGENT_ID,
+                "input_json": onboarding_input,
+            }).execute()
+            logger.info(f"signup: athena-onboarding dispatched company={company_id}")
+        except Exception as onb_err:
+            logger.warning(f"signup athena-onboarding dispatch non-fatal: {onb_err}")
 
         # Step 6: Re-sign_in pra obter JWT com app_metadata.vectraclip populado
         try:

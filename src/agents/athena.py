@@ -3423,6 +3423,393 @@ Retorne APENAS o JSON conforme schema do system prompt. Sem markdown wrapper."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# athena-onboarding — síntese de perfil empresarial → RAG corpus inicial
+#
+# Disparado UMA VEZ pelo signup self-service (src/api.py auth_signup step 5.5).
+# Compõe um documento markdown estruturado a partir do CNPJ data + bio +
+# atividade do novo tenant, faz upload no bucket rag-documents e cria task
+# rag-ingest pro Mnemos chunkar + embedar. Quando o user chegar no primeiro
+# Goal, Athena classify/charter já tem contexto do negócio dele.
+#
+# Por que markdown e não JSON? RAG corpus indexa texto. Markdown é a melhor
+# representação humana+máquina pra perfil empresarial — preserva hierarquia
+# (seções), legibilidade pra debug, e o chunker do Mnemos lida bem.
+#
+# Idempotência: este handler é despachado UMA VEZ no signup. Se o user
+# disparar novamente (ex: reonboarding), criaremos um novo rag_documents row
+# (não dedupe). Decisão consciente: perfil pode mudar, RAG aceita versões.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _render_onboarding_markdown(
+    company_name: str,
+    cnpj_data: Optional[Dict[str, Any]],
+    user_name: Optional[str],
+    user_email: Optional[str],
+    extra_notes: Optional[str],
+) -> str:
+    """Compõe markdown estruturado em PT-BR a partir dos dados disponíveis.
+
+    Função PURA — testável sem Gemini. O Gemini é usado depois para
+    enriquecer com insights iniciais (síntese), mas a base factual sai daqui.
+    """
+    cnpj_data = cnpj_data or {}
+    lines: list[str] = []
+    lines.append(f"# Perfil empresarial — {company_name}")
+    lines.append("")
+    lines.append(f"_Documento gerado automaticamente no onboarding da empresa no VectraClip._")
+    lines.append("")
+
+    lines.append("## Identificação")
+    if cnpj_data.get("name"):
+        lines.append(f"- **Razão social:** {cnpj_data['name']}")
+    if cnpj_data.get("trade_name"):
+        lines.append(f"- **Nome fantasia:** {cnpj_data['trade_name']}")
+    if cnpj_data.get("cnpj"):
+        lines.append(f"- **CNPJ:** {cnpj_data['cnpj']}")
+    if cnpj_data.get("legal_nature"):
+        lines.append(f"- **Natureza jurídica:** {cnpj_data['legal_nature']}")
+    if cnpj_data.get("company_size"):
+        lines.append(f"- **Porte:** {cnpj_data['company_size']}")
+    if cnpj_data.get("opening_date"):
+        lines.append(f"- **Data de abertura:** {cnpj_data['opening_date']}")
+    if cnpj_data.get("registration_status"):
+        lines.append(f"- **Situação cadastral:** {cnpj_data['registration_status']}")
+    if not any(cnpj_data.get(k) for k in ("name", "trade_name", "cnpj")):
+        lines.append("- _CNPJ não informado no signup. Perfil será enriquecido pelo Oracle research mais tarde._")
+    lines.append("")
+
+    if cnpj_data.get("cnae_main_description") or cnpj_data.get("cnaes_secondary"):
+        lines.append("## Atividades econômicas (CNAE)")
+        if cnpj_data.get("cnae_main_code") and cnpj_data.get("cnae_main_description"):
+            lines.append(f"- **Principal ({cnpj_data['cnae_main_code']}):** {cnpj_data['cnae_main_description']}")
+        elif cnpj_data.get("cnae_main_description"):
+            lines.append(f"- **Principal:** {cnpj_data['cnae_main_description']}")
+        secondaries = cnpj_data.get("cnaes_secondary") or []
+        if secondaries:
+            lines.append("- **Secundárias:**")
+            for c in secondaries[:10]:  # cap visual; lista completa pode ter dezenas
+                cod = c.get("codigo") or "?"
+                desc = c.get("descricao") or "?"
+                lines.append(f"  - {cod}: {desc}")
+            if len(secondaries) > 10:
+                lines.append(f"  - _(+{len(secondaries) - 10} CNAEs secundárias adicionais)_")
+        lines.append("")
+
+    if cnpj_data.get("city") or cnpj_data.get("address"):
+        lines.append("## Localização")
+        if cnpj_data.get("address"):
+            addr_parts = [cnpj_data.get("address")]
+            if cnpj_data.get("address_number"):
+                addr_parts.append(cnpj_data["address_number"])
+            lines.append(f"- **Endereço:** {' '.join(p for p in addr_parts if p)}")
+        if cnpj_data.get("address_neighborhood"):
+            lines.append(f"- **Bairro:** {cnpj_data['address_neighborhood']}")
+        if cnpj_data.get("city") and cnpj_data.get("state"):
+            lines.append(f"- **Cidade/UF:** {cnpj_data['city']}/{cnpj_data['state']}")
+        if cnpj_data.get("zip_code"):
+            lines.append(f"- **CEP:** {cnpj_data['zip_code']}")
+        lines.append("")
+
+    partners = cnpj_data.get("partners") or []
+    if partners:
+        lines.append("## Quadro societário (QSA)")
+        for p in partners[:20]:
+            name = p.get("name") or "?"
+            role = p.get("role") or "?"
+            entry = p.get("entry_date") or "?"
+            lines.append(f"- **{name}** — {role} (entrada: {entry})")
+        if len(partners) > 20:
+            lines.append(f"- _(+{len(partners) - 20} sócios adicionais)_")
+        lines.append("")
+
+    if cnpj_data.get("share_capital") is not None:
+        lines.append("## Capital")
+        try:
+            cap = float(cnpj_data["share_capital"])
+            lines.append(f"- **Capital social:** R$ {cap:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        except Exception:
+            lines.append(f"- **Capital social:** {cnpj_data['share_capital']}")
+        lines.append("")
+
+    lines.append("## Contato administrativo")
+    if user_name:
+        lines.append(f"- **Responsável no VectraClip:** {user_name}")
+    if user_email:
+        lines.append(f"- **Email:** {user_email}")
+    if cnpj_data.get("email"):
+        lines.append(f"- **Email Receita:** {cnpj_data['email']}")
+    if cnpj_data.get("phone"):
+        lines.append(f"- **Telefone Receita:** {cnpj_data['phone']}")
+    lines.append("")
+
+    if extra_notes:
+        lines.append("## Notas adicionais")
+        lines.append(extra_notes.strip())
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _build_onboarding_insight_prompt(markdown_base: str, company_name: str) -> str:
+    """Prompt para o Gemini gerar bloco de insights iniciais (apêndice do markdown).
+
+    Estritamente sintético — sem fabricar dados que não estão no markdown base.
+    """
+    return f"""Você é a Athena, coach de Project Management do VectraClip (PMBOK / Heldman).
+Está recebendo o perfil factual de uma nova empresa que acaba de fazer onboarding na plataforma.
+Sua tarefa: gerar um bloco de insights iniciais que ajude a si mesma (em futuras consultas RAG) a entender o negócio rapidamente.
+
+REGRAS DURAS
+- Use APENAS fatos presentes no markdown base abaixo. NÃO invente clientes, fornecedores, faturamento ou tamanho de operação.
+- Se o markdown base for esparso (ex: CNPJ não informado), diga isso explicitamente em vez de chutar.
+- Saída em PT-BR, markdown, NO MÁXIMO 12 bullets distribuídos em 3 seções fixas:
+  ## Insights iniciais
+  ### Modelo de negócio (inferido do CNAE)
+  ### Hipóteses iniciais de processos críticos
+  ### Pontos de atenção para o coach Athena
+
+MARKDOWN BASE
+=============
+{markdown_base}
+
+Devolva APENAS o bloco "## Insights iniciais" e o que vier depois. Sem preâmbulo, sem encerramento, sem citar estas instruções."""
+
+
+import hashlib as _hashlib  # noqa: E402 (local import — usado só em _handle_onboarding)
+
+
+async def _handle_onboarding(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Handler do athena-onboarding — gera perfil markdown + ingere no RAG.
+
+    Pipeline:
+      1. Compõe markdown base (PURO, sem LLM) a partir de cnpj_data + company info
+      2. Chama Gemini Flash para gerar bloco "Insights iniciais" (apêndice)
+      3. Concatena markdown final
+      4. Hash sha256 + upload Storage bucket `rag-documents`
+      5. INSERT rag_documents status='uploaded'
+      6. INSERT task rag-ingest pro Mnemos (chunk + embed)
+      7. Retorna envelope I/T/O com document_id + ingest_task_id
+
+    Tolerância a falhas:
+      - Gemini falha → segue sem o bloco de insights (degrade gracioso)
+      - Storage falha → erro (não tem como ingerir sem o arquivo)
+      - INSERT rag_documents falha → erro
+      - INSERT task rag-ingest falha → warn (rag_documents fica como uploaded;
+        Mnemos polling não pega automaticamente, requer retry manual)
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from src.services.gemini_client import generate as gemini_generate
+
+    started_at = _dt.now(_tz.utc).isoformat()
+    supabase = input_data.get("_supabase")
+    task_id = input_data.get("_task_id", "")
+    company_id = input_data.get("_company_id")
+
+    company_name = (input_data.get("company_name") or "").strip()
+    cnpj_data = input_data.get("cnpj_data") or {}
+    user_name = (input_data.get("user_name") or "").strip() or None
+    user_email = (input_data.get("user_email") or "").strip() or None
+    extra_notes = input_data.get("notes")
+
+    def _err(code: str, message: str, status_override: str = "blocked") -> Dict[str, Any]:
+        return {
+            "output_json": {
+                "handler_name": "athena-onboarding",
+                "execution_id": task_id,
+                "execution_started_at": started_at,
+                "execution_completed_at": _dt.now(_tz.utc).isoformat(),
+                "inputs_used": {"company_id": company_id, "company_name": company_name},
+                "tools_techniques_applied": ["expert_judgment"],
+                "outputs": {"status": "error", "code": code, "message": message},
+                "validation": {
+                    "schema_version": ATHENA_SCHEMA_VERSION,
+                    "all_required_inputs_present": bool(company_name and company_id),
+                    "confidence": 0.0,
+                    "warnings": [],
+                    "needs_human_review": True,
+                },
+                "citations": [],
+                "metadata": {"tokens": {"input": 0, "output": 0, "total": 0}},
+            },
+            "cost_usd": 0.0,
+            "status_override": status_override,
+        }
+
+    if supabase is None:
+        return _err("missing_supabase", "Cliente Supabase não disponível")
+    if not company_id:
+        return _err("missing_company_id", "task.company_id é obrigatório")
+    if not company_name:
+        return _err("missing_company_name", "input.company_name é obrigatório")
+
+    # 1) Markdown base
+    md_base = _render_onboarding_markdown(
+        company_name=company_name,
+        cnpj_data=cnpj_data,
+        user_name=user_name,
+        user_email=user_email,
+        extra_notes=extra_notes,
+    )
+
+    # 2) Insights via Gemini (best-effort)
+    insights_block = ""
+    tokens: Dict[str, int] = {"input": 0, "output": 0, "total": 0}
+    cost = 0.0
+    try:
+        insight_prompt = _build_onboarding_insight_prompt(md_base, company_name)
+        gen_result = await asyncio.to_thread(
+            gemini_generate,
+            insight_prompt,
+            model=ATHENA_DEFAULT_MODEL,
+        )
+        insights_block = (gen_result.get("text") or "").strip()
+        tk = gen_result.get("tokens") or {}
+        tokens = {
+            "input": int(tk.get("input", 0) or 0),
+            "output": int(tk.get("output", 0) or 0),
+            "total": int(tk.get("total", 0) or 0),
+        }
+        cost = _calc_cost(tokens)
+    except Exception as exc:
+        logger.warning("athena-onboarding gemini insights failed (degradando): %s", exc)
+        insights_block = "## Insights iniciais\n\n_Não gerado nesta execução. Bloco será preenchido em consulta futura quando a Athena interpretar este perfil em contexto de Goal/Project._\n"
+
+    md_final = md_base + "\n" + insights_block.rstrip() + "\n"
+    md_bytes = md_final.encode("utf-8")
+    sha = _hashlib.sha256(md_bytes).hexdigest()
+    filename = f"onboarding-{company_id}.md"
+    storage_path = f"companies/{company_id}/onboarding/{filename}"
+
+    # 4) Upload Storage
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.storage.from_("rag-documents").upload(
+                path=storage_path,
+                file=md_bytes,
+                file_options={"content-type": "text/markdown", "upsert": "true"},
+            )
+        )
+    except Exception as exc:
+        # upsert=true minimiza colisão; se ainda falhar, é erro real
+        logger.error("athena-onboarding storage upload failed: %s", exc, exc_info=True)
+        return _err("storage_upload_failed", f"Falha no upload Storage: {exc}")
+
+    # 5) INSERT rag_documents
+    document_id: Optional[str] = None
+    try:
+        ins = (
+            supabase.table("rag_documents")
+            .insert({
+                "company_id": company_id,
+                "filename": filename,
+                "storage_path": storage_path,
+                "sha256": sha,
+                "mime_type": "text/markdown",
+                "size_bytes": len(md_bytes),
+                "status": "uploaded",
+                "metadata": {
+                    "source": "athena-onboarding",
+                    "company_name": company_name,
+                    "cnpj": (cnpj_data or {}).get("cnpj"),
+                    "produced_by_task_id": task_id,
+                    "schema_version": ATHENA_SCHEMA_VERSION,
+                },
+            })
+            .execute()
+        )
+        if not ins.data:
+            return _err("rag_document_insert_empty", "INSERT rag_documents retornou vazio")
+        document_id = ins.data[0]["id"]
+    except Exception as exc:
+        logger.error("athena-onboarding rag_documents insert failed: %s", exc, exc_info=True)
+        return _err("rag_document_insert_failed", str(exc))
+
+    # 6) Dispatch task rag-ingest pro Mnemos
+    ingest_task_id: Optional[str] = None
+    _MNEMOS_AGENT_ID = "00000000-0000-0000-0000-000000000003"
+    try:
+        t_ins = (
+            supabase.table("tasks")
+            .insert({
+                "company_id": company_id,
+                "title": f"RAG ingest — perfil onboarding {company_name}",
+                "description": (
+                    f"Ingest do perfil empresarial gerado no onboarding. "
+                    f"document_id={document_id}, sha256={sha[:12]}..."
+                ),
+                "operation_type": "rag-ingest",
+                "status": "queued",
+                "budget_limit": 50_000,
+                "executor_type": "harness",
+                "assigned_to_agent_id": _MNEMOS_AGENT_ID,
+                "input_json": {
+                    "document_id": document_id,
+                    "filename": filename,
+                    "sha256": sha,
+                },
+            })
+            .execute()
+        )
+        if t_ins.data:
+            ingest_task_id = t_ins.data[0].get("id")
+            # Link rag_documents.ingest_task_id (best-effort)
+            try:
+                supabase.table("rag_documents").update(
+                    {"ingest_task_id": ingest_task_id}
+                ).eq("id", document_id).execute()
+            except Exception as link_exc:
+                logger.warning("athena-onboarding link ingest_task_id failed: %s", link_exc)
+    except Exception as exc:
+        # rag_documents row existe; user vê o doc como uploaded mas não indexado.
+        # Não é fatal pra fechar a task de onboarding.
+        logger.warning("athena-onboarding rag-ingest dispatch failed (non-fatal): %s", exc)
+
+    completed_at = _dt.now(_tz.utc).isoformat()
+    return {
+        "output_json": {
+            "handler_name": "athena-onboarding",
+            "execution_id": task_id,
+            "execution_started_at": started_at,
+            "execution_completed_at": completed_at,
+            "inputs_used": {
+                "company_id": company_id,
+                "company_name": company_name,
+                "cnpj_provided": bool((cnpj_data or {}).get("cnpj")),
+                "has_extra_notes": bool(extra_notes),
+            },
+            "tools_techniques_applied": [
+                "expert_judgment",
+                "document_synthesis",
+                "rag_curation",
+            ],
+            "outputs": {
+                "status": "onboarded",
+                "document_id": document_id,
+                "ingest_task_id": ingest_task_id,
+                "storage_path": storage_path,
+                "sha256": sha,
+                "size_bytes": len(md_bytes),
+                "insights_generated": bool(insights_block and "_Não gerado" not in insights_block),
+            },
+            "validation": {
+                "schema_version": ATHENA_SCHEMA_VERSION,
+                "all_required_inputs_present": True,
+                "confidence": 0.9 if (cnpj_data or {}).get("cnpj") else 0.4,
+                "warnings": [] if (cnpj_data or {}).get("cnpj") else [
+                    "CNPJ não informado — perfil base esparso; Oracle research recomendado pra enriquecer"
+                ],
+                "needs_human_review": False,
+            },
+            "citations": [],
+            "metadata": {"tokens": tokens},
+        },
+        "cost_usd": cost,
+        "status_override": "done",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dispatch table — mapeia operation_type → handler
 # Todos stubs no PR1; substituídos por handlers reais nos PRs futuros.
 # Roteamento real do daemon (src/agent_daemon.py) usa apenas o prefixo
@@ -3442,6 +3829,8 @@ _SPECIALTY_DISPATCH = {
     "athena-recommend":        _handle_recommend,
     # VEC-390 (Prioritizer — mandato 3)
     "athena-prioritize":       _handle_prioritize,
+    # PR 3 dogfood Vectra Cargo: onboarding markdown → RAG corpus inicial
+    "athena-onboarding":       _handle_onboarding,
 }
 
 

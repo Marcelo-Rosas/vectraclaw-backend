@@ -134,6 +134,8 @@ class Task(CamelModel):
         "athena-audit",
         "athena-recommend",
         "athena-prioritize",
+        # PR 3 dogfood Vectra Cargo: onboarding markdown → RAG corpus inicial
+        "athena-onboarding",
         # VEC-416: Kronos pivot — Meu Planner Financeiro via Playwright
         "planner-import-ofx",
         "planner-categorize-pendings",
