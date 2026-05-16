@@ -939,10 +939,32 @@ def _slugify_sipoc(name: str) -> str:
     return slug or "sem-nome"
 
 
+def _normalize_sipoc_payload_to_snake(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Aceita payload em camelCase OU snake_case (frontend velho mistura).
+    DB exige snake_case. Defensive transform — não quebra clients corretos."""
+    camel_to_snake = {
+        "companyId": "company_id",
+        "sectorId": "sector_id",
+        "reportsToId": "reports_to_id",
+        "processId": "process_id",
+        "componentId": "component_id",
+        "positionId": "position_id",
+        "parentSectorId": "parent_sector_id",
+    }
+    out = {}
+    for k, v in payload.items():
+        snake = camel_to_snake.get(k, k)
+        # snake_case version wins se ambos presentes
+        if snake not in out:
+            out[snake] = v
+    return out
+
+
 @app.post("/api/sipoc/sectors")
 async def create_sipoc_sector(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "name": payload.get("name")}
+    payload = _normalize_sipoc_payload_to_snake(payload)
     payload["name"] = _validate_sipoc_name(payload.get("name"), kind="Setor")
     # Auto-gera slug se não fornecido (coluna NOT NULL no DB)
     if not payload.get("slug"):
@@ -973,11 +995,14 @@ async def list_sipoc_positions(request: Request, company_id: UUID = Query(...)):
 async def create_sipoc_position(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "title": payload.get("title")}
+    payload = _normalize_sipoc_payload_to_snake(payload)
     payload["title"] = _validate_sipoc_name(payload.get("title"), kind="Cargo")
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_positions").insert(payload).execute()
         return SipocPosition(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"create_sipoc_position failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -998,6 +1023,9 @@ async def list_sipoc_processes(request: Request, sector_id: UUID = Query(...)):
 async def create_sipoc_process(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "name": payload.get("name")}
+    payload = _normalize_sipoc_payload_to_snake(payload)
+    # sipoc_processes não tem coluna company_id — silenciosamente ignora se vier
+    payload.pop("company_id", None)
     # Processes podem ter nome um pouco maior (até 80) — descrição operacional.
     payload["name"] = _validate_sipoc_name(payload.get("name"), kind="Processo", max_len=80)
     try:
