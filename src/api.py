@@ -1093,6 +1093,10 @@ async def list_sipoc_components(request: Request, process_id: UUID = Query(...))
 async def upsert_sipoc_component(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "type": payload.get("type")}
+    # Normaliza camelCase → snake_case (frontend manda processId/automationStatus/etc.).
+    # Os irmãos POST sectors/processes/positions já chamam isso; este endpoint estava
+    # esquecido — bug reportado por user em 2026-05-16 (auditoria de handlers).
+    payload = _normalize_sipoc_payload_to_snake(payload)
     try:
         client = get_authenticated_client(request.state.token)
         # Se tiver ID, atualiza; senão, insere.
@@ -1101,7 +1105,7 @@ async def upsert_sipoc_component(request: Request, payload: Dict[str, Any]):
             res = client.table("sipoc_components").update(payload).eq("id", comp_id).execute()
         else:
             res = client.table("sipoc_components").insert(payload).execute()
-        
+
         return SipocComponent(**res.data[0]).to_zod_dict()
     except Exception as e:
         logger.error(f"upsert_sipoc_component failed: {e}")
