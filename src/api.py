@@ -924,7 +924,18 @@ async def list_sipoc_sectors(request: Request, company_id: UUID = Query(...)):
         return []
     try:
         client = get_authenticated_client(request.state.token)
-        res = client.table("sipoc_sectors").select("*").eq("company_id", company_id).order("name").execute()
+        # PostgREST embed — bug #3 do E2E Lote 2: frontend precisa de processes[]
+        # aninhado pra renderizar tree do SipocManagement. Subset enxuto
+        # (id/name/description/status) é o que SipocProcessSummary aceita.
+        # Outros endpoints (GET /sectors/{id}, POST etc.) seguem sem embed:
+        # processes default = [].
+        res = (
+            client.table("sipoc_sectors")
+            .select("*, processes:sipoc_processes(id,name,description,status)")
+            .eq("company_id", company_id)
+            .order("name")
+            .execute()
+        )
         return [SipocSector(**row).to_zod_dict() for row in (res.data or [])]
     except Exception as e:
         logger.error(f"list_sipoc_sectors failed: {e}")

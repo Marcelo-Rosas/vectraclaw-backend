@@ -977,6 +977,22 @@ class SipocCompany(CamelModel):
     def to_zod_dict(self):
         return self.dict(by_alias=True)
 
+class SipocProcessSummary(CamelModel):
+    """Resumo enxuto de SipocProcess usado em embed (GET /sectors).
+
+    Subset propositalmente curto — apenas o suficiente pro tree do
+    SipocManagement renderizar (id pra clique, name pra label, description
+    pro tooltip, status pro badge). Detalhes completos via GET /sipoc/processes/{id}.
+    """
+    id: str
+    name: str
+    description: Optional[str] = None
+    status: Literal["rascunho", "em_revisao", "aprovado", "arquivado"] = "rascunho"
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+
 class SipocSector(CamelModel):
     id: str
     company_id: str
@@ -985,6 +1001,10 @@ class SipocSector(CamelModel):
     icon: Optional[str] = None
     parent_sector_id: Optional[str] = None
     metadata: Dict[str, Any] = {}
+    # processes embed via PostgREST (fix bug #3 do E2E Lote 2 — sessão frontend
+    # precisa pra renderizar tree em /sipoc/management). Vazio por default pra
+    # endpoints que NÃO fazem embed (GET /sectors/{id}, POSTs etc.).
+    processes: List["SipocProcessSummary"] = []
     created_at: datetime
     updated_at: datetime
 
