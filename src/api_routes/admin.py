@@ -238,20 +238,14 @@ async def patch_app_user(request: Request, user_id: str, payload: PatchAppUserIn
         raise HTTPException(400, "no_valid_fields")
 
     try:
-        # PR7 hotfix: vectraclip.app_users só tem GRANT SELECT pra authenticated
-        # (não INSERT/UPDATE/DELETE). RLS policies admin existem, mas GRANT base
-        # faltando bloqueia o UPDATE antes do RLS rodar — "permission denied for
-        # table app_users". Solução cirúrgica: usar service_role aqui (já que
-        # require_role_not acima garante RBAC em app-layer).
-        # Tenant safety: query com filtro explícito de company_id derivado do scope.
-        # Alternativa estrutural (futuro PR): GRANT INSERT/UPDATE/DELETE pra
-        # authenticated; aí podemos voltar pra get_authenticated_client.
+        # G2.1 (PR #168): GRANT INSERT/UPDATE/DELETE pra authenticated + policies
+        # ampliadas (admin, platform_admin, consultant, company_admin). PR #137
+        # hotfix usava service_role como workaround — agora RLS protege no DB.
         if not supabase:
             raise HTTPException(503, "supabase_unavailable")
-        # Read pelo client authenticated (GRANT SELECT existe, RLS filtra)
-        read_client = get_authenticated_client(request.state.token)
+        client = get_authenticated_client(request.state.token)
         cur = (
-            read_client.table("app_users")
+            client.table("app_users")
             .select("id, company_id, role")
             .eq("id", user_id)
             .limit(1)
@@ -260,11 +254,12 @@ async def patch_app_user(request: Request, user_id: str, payload: PatchAppUserIn
         if not cur.data:
             raise HTTPException(404, "user_not_found_or_not_accessible")
         # Tenant safety: confirma que user pertence ao company_id do scope
+        # (RLS no DB também garante, mas chequemos antes pra mensagem útil em PT)
         if scope.get("company_id") and cur.data[0].get("company_id") != scope.get("company_id"):
             raise HTTPException(403, "cross_tenant_update_blocked")
 
-        # Update via service_role (bypassa GRANT faltante)
-        res = supabase.table("app_users").update(update_data).eq("id", user_id).execute()
+        # Update via authenticated client — RLS WRITE policy admin_tenant valida
+        res = client.table("app_users").update(update_data).eq("id", user_id).execute()
         if not res.data:
             raise HTTPException(500, "update_returned_empty")
 
