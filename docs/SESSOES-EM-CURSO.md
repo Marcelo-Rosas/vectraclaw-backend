@@ -10,9 +10,7 @@
 
 ## Ativas
 
-| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
-|---|---|---|---|---|---|
-| G1 Risk Register (PMBOK) — PR A migration | esta sessão (Opus 4.7) | `feat/risk-register-table` | `supabase/migrations/20260516200000_risk_register.sql` | 2026-05-16 20:30 | ~30min (smoke + PR) |
+_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
 
 ---
 
@@ -20,6 +18,7 @@
 
 | O que | PR | Closed |
 |---|---|---|
+| **G1 Risk Register PMBOK completo (A+B+C)**: tabela `vectraclip.risks` + CRUD + persistência Athena | #149 + #150 + #151 | hoje |
 | execution_mode catalog-driven (backend) + CODE-PATTERNS / AUDIT / SESSOES docs | backend #146 | hoje |
 | AgentExecutionCard catalog-driven + DynamicSchemaForm reutilizável (frontend) | frontend #22 | merged |
 | Auditoria de botões fantasmas + semáforo de sessões em curso (frontend) | _(commit `8cb2d8f` na branch `docs/sessoes-em-curso-e-auditoria-botoes`)_ | hoje (sessão paralela) |
