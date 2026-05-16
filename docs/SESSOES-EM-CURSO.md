@@ -10,7 +10,9 @@
 
 ## Ativas
 
-_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
+| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
+|---|---|---|---|---|---|
+| Dogfood cotação Vectra (ADR PMBOK) — UI manual + standby pra investigar quebras | esta sessão + Marcelo | `docs/adr-cotacao-dogfood-freight` (PR aberto) | `docs/ADR-VEC-COTACAO-DOGFOOD-FREIGHT.md` (novo), `docs/AUDIT-HANDLERS-2026-05-16.md` | 2026-05-17 00:30 | indefinido (dogfood manual) |
 
 ---
 

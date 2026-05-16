@@ -260,7 +260,7 @@ Oracle research → oracle-report → HermesReporter → Email
 
 | Item | Sev | Onde |
 |---|---|---|
-| `route-cost-calculation` EXCLUDED | 🔴 ALTA | morpheus_dispatcher.py:18-22 |
+| ~~`route-cost-calculation` EXCLUDED~~ | 🟢 **REDEFINIDO** — gap inicial era erro de diagnóstico (auditor: handler missing; verdade: Goal não modelado). EXCLUDED é semântica correta. Ver `ADR-VEC-COTACAO-DOGFOOD-FREIGHT.md`. Dogfood agendado com Marcelo. |
 | Mercator/Plutus/Hodos handlers missing | 🟡 MÉDIA | src/agents/ (TODO P2) |
 | `email_lead` handler não localizado | 🟡 MÉDIA | Hermes downstream |
 | Cloudflare WARP bloqueia SMTP | 🔴 ALTA | HermesReporter |
