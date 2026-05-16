@@ -65,10 +65,10 @@
 ### 1.3 RACI matrix
 - **Handler:** `src/api.py:1513–1630`
 - **Executa:** UPSERT (process_id, component_id, position_id, role) com CHECK `role IN ('R','A','C','I')`
-- **Entrega:** lista RACI; ❌ **sem WS broadcast**
-- **Conversa com:** UI SIPOC builder (não persiste hoje → 0 rows); `calculate_raci_stats()` existe mas nunca chamada
+- **Entrega:** GET retorna `{matrix, stats}` — `stats` vem de `calculate_raci_stats()` (`src/services/sipoc_raci.py`) com 3 indicadores: `overloaded_positions`, `missing_accountable`, `multiple_accountable`. ❌ **sem WS broadcast**
+- **Conversa com:** UI SIPOC builder (não persiste hoje → 0 rows). Service `calculate_raci_stats` é chamado dentro do GET `/raci` (correção 2026-05-16 G1.3)
 - **Tabelas:** WRITE `sipoc_raci`; READ `sipoc_processes`, `sipoc_components`, `sipoc_positions`
-- **Estado:** 🟡 backend pronto, **UI não persiste**
+- **Estado:** 🟡 backend pronto + stats já expostos, **UI não persiste matriz nem consome stats**
 
 ### 1.4 Risks PMBOK (G1)
 - **Handler:** `src/api.py:1663–1968` (REST CRUD) + `src/agents/athena.py:1090` (`athena-risk-register`)
