@@ -330,6 +330,112 @@ def validate_jwt_company_id(token: str, url_company_id: str) -> None:
             detail="company_id do payload difere do company_id do JWT",
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR6 Fase A — RBAC sector_responsible: helpers de scope do user
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_jwt_sub(token: str) -> Optional[str]:
+    """Lê o claim `sub` (auth.uid) do JWT. None se inválido."""
+    if not token or token == "dev-token":
+        return None
+    import base64, json as _json
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = _json.loads(base64.b64decode(payload_b64))
+        return claims.get("sub")
+    except Exception:
+        return None
+
+
+def get_user_scope(token: str) -> dict:
+    """Resolve o scope do user a partir do JWT + (se preciso) lookup em app_users.
+
+    Retorna dict:
+      - company_id: str | None     (do JWT.app_metadata.vectraclip.company_id)
+      - role: str                  ('admin'|'platform_admin'|'consultant'|'company_admin'|'sector_responsible'|'viewer')
+      - user_id: str | None        (JWT.sub == app_users.id == auth.users.id)
+      - position_id: str | None    (app_users.assigned_position_id; populado SÓ se role=sector_responsible)
+
+    Bypass dev-token: retorna scope global ('platform_admin', None pra ids).
+
+    O lookup em app_users só roda pra sector_responsible (otimização — outros
+    roles não precisam de position_id). Falha silenciosa → position_id=None,
+    o que faz assert_activity_in_scope lançar 403 informativo.
+    """
+    if token == "dev-token":
+        return {"company_id": None, "role": "platform_admin", "user_id": None, "position_id": None}
+
+    vc = _extract_vectraclip_claims(token)
+    company_id = vc.get("company_id")
+    role = vc.get("role") or "company_admin"
+    user_id = _extract_jwt_sub(token)
+
+    position_id = None
+    if role == "sector_responsible" and user_id and supabase:
+        try:
+            res = (
+                supabase.table("app_users")
+                .select("assigned_position_id")
+                .eq("id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                position_id = res.data[0].get("assigned_position_id")
+        except Exception as e:
+            logger.warning("get_user_scope app_users lookup failed user=%s: %s", user_id, e)
+
+    return {
+        "company_id": company_id,
+        "role": role,
+        "user_id": user_id,
+        "position_id": position_id,
+    }
+
+
+def assert_activity_in_scope(scope: dict, activity_row: dict) -> None:
+    """Lança HTTPException 403 se sector_responsible não puder acessar a activity.
+
+    - Roles amplas (admin, platform_admin, consultant, company_admin, viewer):
+      pass-through. RLS já filtra por company_id.
+    - sector_responsible: activity.responsible_position_id DEVE bater com
+      scope.position_id. Caso contrário, 403.
+    - sector_responsible sem position_id atribuído: 403 informativo
+      ("pedir admin pra atribuir cargo").
+    """
+    if scope.get("role") != "sector_responsible":
+        return
+
+    user_position = scope.get("position_id")
+    if not user_position:
+        raise HTTPException(
+            status_code=403,
+            detail="sector_responsible sem assigned_position_id — peça ao admin pra atribuir seu cargo no organograma",
+        )
+
+    activity_responsible = activity_row.get("responsible_position_id")
+    if activity_responsible != user_position:
+        raise HTTPException(
+            status_code=403,
+            detail="Atividade fora do seu escopo (responsible_position_id não corresponde ao seu cargo)",
+        )
+
+
+def require_role_not(scope: dict, blocked_roles: list, action: str) -> None:
+    """Lança HTTPException 403 se scope.role estiver em blocked_roles.
+
+    Útil pra impedir sector_responsible/viewer de fazer ações de admin
+    (ex: criar/editar templates, importar atividades em processes alheios).
+    """
+    if scope.get("role") in blocked_roles:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Seu role ({scope.get('role')}) não pode {action}",
+        )
+
+
 # VEC-199b — DOIS clients Supabase distintos:
 #   * `supabase`       → service_role (ignora RLS) usado pelo Doctor + endpoints server-side.
 #   * `supabase_auth`  → anon key, dedicado a sign_in/refresh/logout do usuário.
