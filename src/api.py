@@ -1806,10 +1806,29 @@ async def create_risk(request: Request, payload: NewRiskInput):
         res = client.table("risks").insert(data).execute()
         if not res.data:
             raise HTTPException(500, "Risk: insert returned empty")
+        risk_id = res.data[0].get("id")
         logger.info(
             "Risk created id=%s name=%r category=%s prob=%s impact=%s by=%s",
-            res.data[0].get("id"), data.get("name"), data.get("category"),
+            risk_id, data.get("name"), data.get("category"),
             data.get("probability"), data.get("impact"), scope.get("user_id"),
+        )
+        # G1.1 audit log (best-effort, service_role)
+        from src.services.audit import audit_log
+        audit_log(
+            supabase,
+            company_id=str(company_id),
+            actor_type="human",
+            actor_id=str(scope.get("user_id") or "unknown"),
+            action="risk.create",
+            target=f"risk:{risk_id}",
+            payload={
+                "name": data.get("name"),
+                "category": data.get("category"),
+                "probability": data.get("probability"),
+                "impact": data.get("impact"),
+                "linked_goal_id": data.get("linked_goal_id"),
+                "linked_sipoc_process_id": data.get("linked_sipoc_process_id"),
+            },
         )
         return res.data[0]
     except HTTPException:
@@ -7317,6 +7336,28 @@ async def _set_approval_status(request: Request, approval_id: str, status: str) 
         # Auto-create agent when a hire_agent approval is approved
         if status == "approved" and approval_row.get("request_type") == "hire_agent":
             _auto_create_agent_from_approval(approval_row)
+
+        # G1.1 audit log (best-effort) — compliance trail de quem aprovou/rejeitou o quê
+        try:
+            scope = get_user_scope(request.state.token)
+            actor_id = str(scope.get("user_id") or "unknown")
+        except Exception:
+            actor_id = "unknown"
+        from src.services.audit import audit_log
+        audit_log(
+            supabase,
+            company_id=str(approval_row.get("company_id") or ""),
+            actor_type="human",
+            actor_id=actor_id,
+            action=f"approval.{status}",  # approval.approved | approval.rejected
+            target=f"approval:{approval_id}",
+            payload={
+                "request_type": approval_row.get("request_type"),
+                "previous_status": approval_row.get("status"),
+                "new_status": status,
+                "auto_created_agent": (status == "approved" and approval_row.get("request_type") == "hire_agent"),
+            },
+        )
 
         return CouncilApproval(**res.data[0]).to_zod_dict()
     except HTTPException:
