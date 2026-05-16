@@ -13,7 +13,6 @@
 | Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
 |---|---|---|---|---|---|
 | Dogfood cotação Vectra (ADR PMBOK) — UI manual + standby pra investigar quebras | esta sessão + Marcelo | `docs/adr-cotacao-dogfood-freight` (PR aberto) | `docs/ADR-VEC-COTACAO-DOGFOOD-FREIGHT.md` (novo), `docs/AUDIT-HANDLERS-2026-05-16.md` | 2026-05-17 00:30 | indefinido (dogfood manual) |
-| **Self-service signup multi-tenant** (criar empresa Vectra Cargo via UI) | esta sessão (Opus 4.7) | `feat/signup-self-service-vectra-cargo` | backend: migration `companies.mission` + `POST /api/auth/signup` atomic + audit; **frontend VectraClip:** `Login.tsx` (form signup real) + integração `useCompanies` refresh | 2026-05-17 01:00 | ~5h até segunda |
 
 ---
 
@@ -22,6 +21,8 @@
 | O que | PR | Closed |
 |---|---|---|
 | **fix bug #3 E2E Lote 2** — GET /sipoc/sectors embed processes[] (SipocProcessSummary novo + PostgREST embed); validado em prod end-to-end; bug #1 também confirmado RESOLVED em prod | #174 | hoje |
+| **Signup self-service Vectra Cargo** (backend POST /api/auth/signup atomic + frontend Login.tsx form real + migration companies.mission + smoke prod E2E) | backend #177 + frontend #33 | hoje |
+| **PMO STATUS DOC** (consolidado real — Marcelo cobrou na madrugada após eu falhar em entregar durante o dia) | (este PR) | hoje |
 | **Daedalus PR G+H** (FINAL): handler estatístico + dispatch + launcher (11º daemon online) | #159 | hoje |
 | **Daedalus PR F**: specialty bpmn-modeling + agent Daedalus + config (13/13 smoke) | #158 | hoje |
 | **Daedalus PR E**: CRUD bpmn_diagrams + duplicate + versions + hotfix SECURITY DEFINER | #156 | hoje |
