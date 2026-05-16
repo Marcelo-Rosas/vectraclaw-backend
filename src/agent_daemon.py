@@ -504,6 +504,12 @@ class ResilientHarnessDaemon:
             result = asyncio.run(athena_execute(task, self._get_supabase()))
             return _json.dumps(result)
 
+        # Daedalus (PR G+H — modelador BPMN, fallback estatístico sem LLM)
+        if op_type.startswith("bpmn-"):
+            from src.agents.daedalus import execute_specialty as daedalus_execute
+            result = asyncio.run(daedalus_execute(task, self._get_supabase()))
+            return _json.dumps(result)
+
         if op_type.startswith("oracle-"):
             from src.agents.oracle import execute_specialty
             result = asyncio.run(execute_specialty(task, self._get_supabase()))
