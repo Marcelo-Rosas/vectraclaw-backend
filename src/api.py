@@ -855,10 +855,62 @@ async def list_sipoc_companies(request: Request):
         logger.error(f"list_sipoc_companies failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SIPOC input validation — previne "dados lixo" (frases de chat virando nome
+# de setor/processo, etc.). Aplicado em POST sectors/processes/positions/companies.
+# Helper exportado pra outros submodules que precisem do mesmo padrão.
+# ─────────────────────────────────────────────────────────────────────────────
+import re as _re_sipoc
+
+# Prefixos típicos de frase de chat que NÃO devem virar nome de entidade.
+_SIPOC_BAD_PREFIXES = (
+    "quero ", "acho ", "vou ", "preciso ", "devo ",
+    "tenho que ", "mapear ", "gostaria ", "pretendo ",
+)
+
+
+def _validate_sipoc_name(raw: Any, *, kind: str, min_len: int = 3, max_len: int = 50) -> str:
+    """Valida e normaliza um nome de entidade SIPOC (sector/process/position/company).
+
+    Regras:
+      - Tipo string não-vazia (após trim)
+      - Length entre min_len e max_len
+      - Sem quebras de linha
+      - Não começa com prefixo de frase de chat ('Quero', 'Acho', 'Vou', etc.)
+      - Não é todo numérico ou só caracteres especiais
+
+    Lança HTTPException 400 com mensagem em PT explicando o problema.
+    Retorna o nome normalizado (trimmed).
+    """
+    if not isinstance(raw, str):
+        raise HTTPException(400, f"{kind}: nome deve ser texto")
+    name = raw.strip()
+    if not name:
+        raise HTTPException(400, f"{kind}: nome obrigatório")
+    if "\n" in name or "\r" in name:
+        raise HTTPException(400, f"{kind}: nome não pode ter quebras de linha")
+    if len(name) < min_len:
+        raise HTTPException(400, f"{kind}: nome muito curto (mínimo {min_len} caracteres)")
+    if len(name) > max_len:
+        raise HTTPException(400, f"{kind}: nome muito longo (máximo {max_len} caracteres). Não escreva frases — use um nome curto e descritivo.")
+    low = name.lower()
+    for bad in _SIPOC_BAD_PREFIXES:
+        if low.startswith(bad):
+            raise HTTPException(
+                400,
+                f"{kind}: nome não pode começar com '{bad.strip().capitalize()}'. Use um nome direto (ex: 'Contas a Pagar', 'Cotação de Frete'). Não escreva o que você quer fazer — escreva o nome da entidade.",
+            )
+    if _re_sipoc.fullmatch(r"[\d\s\-_.,;:!?]+", name):
+        raise HTTPException(400, f"{kind}: nome precisa ter pelo menos uma letra")
+    return name
+
+
 @app.post("/api/sipoc/companies")
 async def create_sipoc_company(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "name": payload.get("name")}
+    # Validação de nome (PR cleanup pós-AS-IS)
+    payload["name"] = _validate_sipoc_name(payload.get("name"), kind="Empresa SIPOC")
     try:
         res = supabase.table("sipoc_companies").insert(payload).execute()
         return SipocCompany(**res.data[0]).to_zod_dict()
@@ -878,14 +930,29 @@ async def list_sipoc_sectors(request: Request, company_id: UUID = Query(...)):
         logger.error(f"list_sipoc_sectors failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _slugify_sipoc(name: str) -> str:
+    """Slug simples a partir de um nome SIPOC: lowercase + hifens + sem acento."""
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", name)
+    ascii_only = "".join(c for c in nfkd if not unicodedata.combining(c))
+    slug = _re_sipoc.sub(r"[^a-zA-Z0-9]+", "-", ascii_only).strip("-").lower()
+    return slug or "sem-nome"
+
+
 @app.post("/api/sipoc/sectors")
 async def create_sipoc_sector(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "name": payload.get("name")}
+    payload["name"] = _validate_sipoc_name(payload.get("name"), kind="Setor")
+    # Auto-gera slug se não fornecido (coluna NOT NULL no DB)
+    if not payload.get("slug"):
+        payload["slug"] = _slugify_sipoc(payload["name"])
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_sectors").insert(payload).execute()
         return SipocSector(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"create_sipoc_sector failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -906,6 +973,7 @@ async def list_sipoc_positions(request: Request, company_id: UUID = Query(...)):
 async def create_sipoc_position(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "title": payload.get("title")}
+    payload["title"] = _validate_sipoc_name(payload.get("title"), kind="Cargo")
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_positions").insert(payload).execute()
@@ -930,10 +998,14 @@ async def list_sipoc_processes(request: Request, sector_id: UUID = Query(...)):
 async def create_sipoc_process(request: Request, payload: Dict[str, Any]):
     if not supabase:
         return {"id": "mock-id", "name": payload.get("name")}
+    # Processes podem ter nome um pouco maior (até 80) — descrição operacional.
+    payload["name"] = _validate_sipoc_name(payload.get("name"), kind="Processo", max_len=80)
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_processes").insert(payload).execute()
         return SipocProcess(**res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"create_sipoc_process failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
