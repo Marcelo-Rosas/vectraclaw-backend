@@ -12,7 +12,7 @@
 
 | Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
 |---|---|---|---|---|---|
-| fix bug #3 E2E Lote 2 — GET /sectors embed processes[] | esta sessão (Opus 4.7) | `fix/sipoc-sectors-embed-processes` | `src/api.py:921`, `src/models.py` (SipocSector + SipocProcessSummary novo) | 2026-05-16 23:30 | ~30min |
+_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
 
 ---
 
@@ -20,6 +20,7 @@
 
 | O que | PR | Closed |
 |---|---|---|
+| **fix bug #3 E2E Lote 2** — GET /sipoc/sectors embed processes[] (SipocProcessSummary novo + PostgREST embed); validado em prod end-to-end; bug #1 também confirmado RESOLVED em prod | #174 | hoje |
 | **Daedalus PR G+H** (FINAL): handler estatístico + dispatch + launcher (11º daemon online) | #159 | hoje |
 | **Daedalus PR F**: specialty bpmn-modeling + agent Daedalus + config (13/13 smoke) | #158 | hoje |
 | **Daedalus PR E**: CRUD bpmn_diagrams + duplicate + versions + hotfix SECURITY DEFINER | #156 | hoje |
