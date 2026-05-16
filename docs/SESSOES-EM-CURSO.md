@@ -12,7 +12,7 @@
 
 | Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
 |---|---|---|---|---|---|
-| Auditoria handlers bottom-up (4 camadas em paralelo) | esta sessão (Opus 4.7) | `docs/audit-handlers-bottom-up` | `docs/AUDIT-HANDLERS-2026-05-16.md` (novo) | 2026-05-16 23:00 | ~1h (4 agentes paralelos) |
+| fix bug #3 E2E Lote 2 — GET /sectors embed processes[] | esta sessão (Opus 4.7) | `fix/sipoc-sectors-embed-processes` | `src/api.py:921`, `src/models.py` (SipocSector + SipocProcessSummary novo) | 2026-05-16 23:30 | ~30min |
 
 ---
 
