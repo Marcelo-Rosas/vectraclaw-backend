@@ -10,10 +10,7 @@
 
 ## Ativas
 
-| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
-|---|---|---|---|---|---|
-| Auditoria Botões Fantasmas → Batidas 1-4 | sessão paralela do user | _(a definir)_ | `GoalTree`, `TaskCard`, `StepNode`, `SipocSettings`, `SipocManagement`, `UserMenu`, `SipocReport`, `CompanySettings`, `SipocDiagnosticCard`, `SipocWizard` | 2026-05-16 | aberto |
-| execution_mode catalog-driven + CODE-PATTERNS | esta sessão (Opus 4.7) | `feat/agent-execution-catalog-driven` | `models.py:463`, `api.py:5125,5938`, `AgentExecutionCard.tsx`, `types/api.ts`, `schemas.ts`, `agents.ts`, `keys.ts`, `queries/agents.ts`, novo `DynamicSchemaForm.tsx`, novos `docs/CODE-PATTERNS.md`, `docs/AUDIT-2026-05-16-CONSOLIDADO.md`, este | 2026-05-16 | fechando |
+_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
 
 ---
 
@@ -21,11 +18,27 @@
 
 | O que | PR | Closed |
 |---|---|---|
+| execution_mode catalog-driven (backend) + CODE-PATTERNS / AUDIT / SESSOES docs | backend #146 | hoje |
+| AgentExecutionCard catalog-driven + DynamicSchemaForm reutilizável (frontend) | frontend #22 | aberto, CI verde (Cloudflare Pages) — aguarda merge |
+| Auditoria de botões fantasmas + semáforo de sessões em curso (frontend) | _(commit `8cb2d8f` na branch `docs/sessoes-em-curso-e-auditoria-botoes`)_ | hoje (sessão paralela) |
 | Lote 1 SIPOC BE-A/B/C (PATCH sectors/processes, POST/PATCH components) | #145 | hoje |
 | DELETE hierárquico SIPOC | #144 | hoje |
 | Dogfood Vectra Cargo end-to-end | #143 | hoje |
 | Athena diagnose agregador por setor (PR9 Fase A) | #139 | hoje |
 | SIPOC input validation + auto-slug nos POSTs | #138 | hoje |
+
+### Decisões registradas (não executadas) — vindas da auditoria de botões fantasmas
+
+| Item | Decisão | Owner |
+|---|---|---|
+| `UserMenu.tsx:75,80` "Perfil" / "Configurações" toasts vazios | **Opção B sugerida pela sessão paralela:** apontar para `/settings/user` (já existe). Aguarda confirmação do user. | sessão paralela (frontend) |
+| `SipocReport.tsx:498` "Detalhes em breve" | **Manter** — placeholder consciente do PR #18 | — |
+| `SipocSettings.tsx:48` "Exportar RACI consolidada" | Decisão pendente: remover botão até backend existir OU manter como signal de roadmap | user |
+| `CompanySettings.tsx:150` "Convidar" disabled hard-coded | Investigar motivo antes de remover ou habilitar | user |
+
+### Incidente registrado — colisão de checkout (evidência viva do problema)
+
+Em 2026-05-16, duas sessões caíram acidentalmente na branch `feat/agent-execution-card-catalog-driven` uma da outra e cada uma pensou que estava em "branch alheia". Resolvido sem perda de trabalho (a sessão paralela recriou sua branch limpa em cima de main; os 2 docs untracked sobreviveram). É o caso de uso exato que motivou criar este `SESSOES-EM-CURSO.md`. Memory `multi-session-coordination` atualizada com o incidente como exemplo.
 
 ---
 
