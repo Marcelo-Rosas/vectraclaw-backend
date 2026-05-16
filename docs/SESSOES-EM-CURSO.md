@@ -10,9 +10,7 @@
 
 ## Ativas
 
-| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
-|---|---|---|---|---|---|
-| Daedalus PR D — migration bpmn_diagrams | esta sessão (Opus 4.7) | `feat/daedalus-bpmn-diagrams-table` | `supabase/migrations/20260516210000_daedalus_bpmn_diagrams.sql` | 2026-05-16 21:00 | ~30min |
+_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
 
 ---
 
@@ -20,6 +18,8 @@
 
 | O que | PR | Closed |
 |---|---|---|
+| **Daedalus PR D**: bpmn_diagrams + bpmn_diagram_versions + trigger snapshot inteligente | #154 | hoje |
+| **Lote 2 Frontend handoff** doc autossuficiente (5 sub-PRs FE-A..E ~10h) | #153 | hoje |
 | **G1 Risk Register PMBOK completo (A+B+C)**: tabela `vectraclip.risks` + CRUD + persistência Athena | #149 + #150 + #151 | hoje |
 | execution_mode catalog-driven (backend) + CODE-PATTERNS / AUDIT / SESSOES docs | backend #146 | hoje |
 | AgentExecutionCard catalog-driven + DynamicSchemaForm reutilizável (frontend) | frontend #22 | merged |
