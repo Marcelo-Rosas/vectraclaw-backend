@@ -89,13 +89,13 @@
 
 | Item | Sev |
 |---|---|
-| Zero dados operacionais (approvals/raci/risks/audit_log) | 🔴 ALTA |
-| Approvals sem audit trail | 🟡 MÉDIA |
-| Risks criam mas não fluem (status fixo `identified`) | 🟡 MÉDIA |
-| RBAC hardcoded (sem CRUD UI) | 🟠 BAIXA |
-| Audit log nunca alimentado | 🔴 ALTA |
+| Zero dados operacionais (approvals/raci/risks/audit_log) | 🔴 ALTA → 🟡 **PARCIAL** | audit_log + risks fluindo (G1.1/G1.2); raci/approvals dependem frontend |
+| Approvals sem audit trail | ✅ **RESOLVED** PR #167 (G1.1 — approve/reject têm audit) |
+| Risks criam mas não fluem (status fixo `identified`) | ✅ **RESOLVED** PR #170 (G1.2 — state machine 6 status + endpoint transition) |
+| RBAC hardcoded (sem CRUD UI) | 📋 **ADR parqueado** — `docs/ADR-VEC-RBAC-CATALOG.md` (G1.5) — atacar quando operação crescer |
+| Audit log nunca alimentado | ✅ **RESOLVED** PR #167+#170 (G1.1+G1.6 — 5 endpoints integrados) |
 | ~~RACI analysis service existe mas sem endpoint~~ | ✅ INVALIDADO PR #171 (endpoint já chama `calculate_raci_stats` em `api.py:1528`) |
-| WS broadcast ausente em todos endpoints da camada | 🟠 INFO |
+| WS broadcast ausente em todos endpoints da camada | 📋 **ADR parqueado** — `docs/ADR-VEC-WS-GOVERNANCE-BROADCAST.md` (G1.4) — espera demanda frontend |
 
 ---
 
