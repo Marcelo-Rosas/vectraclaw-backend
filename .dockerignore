@@ -1,0 +1,31 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Variaveis de ambiente reais
+.env
+
+# Credenciais do tunnel (nunca no container)
+cloudflared/*.json
+
+# Artefatos de Playwright local
+root/.cache/ms-playwright
+
+# Logs e dados locais
+*.log
+logs/
+archive/
+
+# Git
+.git/
+.gitignore
+
+# Docs e assets de dev
+docs/
+assets/omx/
+README.md
+CLAUDE.md
