@@ -96,6 +96,9 @@ CREATE INDEX IF NOT EXISTS bpmn_diagram_versions_diagram_idx
 -- =============================================================================
 
 -- 1) Snapshot da versão anterior em UPDATE de diagram_json
+--    (NOTA: SECURITY DEFINER aplicado em hotfix subsequente
+--     20260516210001_bpmn_trigger_security_definer.sql — necessário porque
+--     authenticated tem só SELECT em bpmn_diagram_versions)
 CREATE OR REPLACE FUNCTION vectraclip.bpmn_snapshot_version()
 RETURNS TRIGGER AS $$
 BEGIN

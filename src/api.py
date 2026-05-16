@@ -1974,6 +1974,289 @@ async def list_sipoc_component_risks(request: Request, component_id: UUID):
 # =============================================================================
 
 
+# =============================================================================
+# Daedalus BPMN Diagrams — bpmn_diagrams + bpmn_diagram_versions
+# Doc: docs/EXECUCAO-G1-RISK-REGISTER-E-DAEDALUS.md §2.5
+# Tabelas criadas pelo PR #154.
+# Engine própria (NÃO BPMN 2.0 XML — diagram_json é shape @xyflow/react).
+# =============================================================================
+
+_BPMN_VALID_GENERATED_BY = {"manual", "athena", "daedalus", "imported"}
+_BPMN_WRITE_BLOCKED_ROLES = _SIPOC_EDIT_BLOCKED_ROLES  # mesma política do RACI/risks
+
+
+class NewBpmnDiagramInput(BaseModel):
+    """Input para POST /api/bpmn/diagrams. company_id vem do JWT."""
+    name: str
+    diagram_json: Dict[str, Any]
+    description: Optional[str] = None
+    generated_by: Optional[str] = "manual"
+    generated_by_task_id: Optional[str] = None
+    linked_sipoc_process_id: Optional[str] = None
+    linked_workflow_id: Optional[str] = None
+    linked_goal_id: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
+
+
+class UpdateBpmnDiagramInput(BaseModel):
+    """Input para PATCH /api/bpmn/diagrams/{id}. Tudo opcional."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    diagram_json: Optional[Dict[str, Any]] = None
+    linked_sipoc_process_id: Optional[str] = None
+    linked_workflow_id: Optional[str] = None
+    linked_goal_id: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
+
+
+def _validate_bpmn_diagram_json(diagram_json: Any) -> None:
+    """Validação mínima do shape — handler Daedalus (PR G) fará validação BPMN
+    rules (nó start único, gateways com ≥2 saídas, etc.)."""
+    if not isinstance(diagram_json, dict):
+        raise HTTPException(400, "BPMN: diagram_json deve ser objeto JSON.")
+    nodes = diagram_json.get("nodes")
+    if nodes is None or not isinstance(nodes, list):
+        raise HTTPException(400, "BPMN: diagram_json.nodes deve ser lista (pode ser vazia).")
+    edges = diagram_json.get("edges")
+    if edges is None or not isinstance(edges, list):
+        raise HTTPException(400, "BPMN: diagram_json.edges deve ser lista (pode ser vazia).")
+
+
+def _validate_bpmn_name(name: Any) -> str:
+    if not isinstance(name, str):
+        raise HTTPException(400, "BPMN: 'name' obrigatório (string).")
+    n = name.strip()
+    if len(n) < 3:
+        raise HTTPException(400, "BPMN: 'name' deve ter ao menos 3 caracteres.")
+    if len(n) > 200:
+        raise HTTPException(400, "BPMN: 'name' não pode passar de 200 caracteres.")
+    return n
+
+
+@app.post("/api/bpmn/diagrams")
+async def create_bpmn_diagram(request: Request, payload: NewBpmnDiagramInput):
+    """Cria diagrama BPMN. company_id vem do JWT (tenant scope)."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _BPMN_WRITE_BLOCKED_ROLES, "criar diagramas BPMN")
+
+    company_id = _resolve_company_id(request)
+    if not company_id:
+        raise HTTPException(400, "company_id_required (JWT sem tenant scope)")
+
+    data = payload.model_dump(exclude_none=True)
+    data["name"] = _validate_bpmn_name(data.get("name"))
+    _validate_bpmn_diagram_json(data.get("diagram_json"))
+    gen_by = data.get("generated_by", "manual")
+    if gen_by not in _BPMN_VALID_GENERATED_BY:
+        raise HTTPException(
+            400,
+            f"BPMN: generated_by '{gen_by}' inválido. Esperado: {sorted(_BPMN_VALID_GENERATED_BY)}.",
+        )
+    data["generated_by"] = gen_by
+    data["company_id"] = company_id
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("bpmn_diagrams").insert(data).execute()
+        if not res.data:
+            raise HTTPException(500, "BPMN: insert returned empty")
+        logger.info(
+            "BPMN diagram created id=%s name=%r generated_by=%s by=%s",
+            res.data[0].get("id"), data.get("name"), gen_by, scope.get("user_id"),
+        )
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"create_bpmn_diagram failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/companies/{company_id}/bpmn/diagrams")
+async def list_company_bpmn_diagrams(
+    request: Request,
+    company_id: UUID,
+    linked_sipoc_process_id: Optional[UUID] = None,
+    linked_workflow_id: Optional[UUID] = None,
+    linked_goal_id: Optional[UUID] = None,
+    generated_by: Optional[str] = None,
+):
+    """Lista diagramas BPMN da company com filtros opcionais por vínculo/origem.
+    Ordena por updated_at DESC (mais recentes primeiro)."""
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        q = client.table("bpmn_diagrams").select("*").eq("company_id", str(company_id))
+        if linked_sipoc_process_id:
+            q = q.eq("linked_sipoc_process_id", str(linked_sipoc_process_id))
+        if linked_workflow_id:
+            q = q.eq("linked_workflow_id", str(linked_workflow_id))
+        if linked_goal_id:
+            q = q.eq("linked_goal_id", str(linked_goal_id))
+        if generated_by:
+            if generated_by not in _BPMN_VALID_GENERATED_BY:
+                raise HTTPException(400, f"generated_by inválido: {generated_by}")
+            q = q.eq("generated_by", generated_by)
+        res = q.order("updated_at", desc=True).execute()
+        return res.data or []
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"list_company_bpmn_diagrams failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/bpmn/diagrams/{diagram_id}")
+async def get_bpmn_diagram(request: Request, diagram_id: UUID):
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("bpmn_diagrams").select("*").eq("id", str(diagram_id)).limit(1).execute()
+        if not res.data:
+            raise HTTPException(404, "bpmn_diagram_not_found")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_bpmn_diagram failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/bpmn/diagrams/{diagram_id}")
+async def patch_bpmn_diagram(request: Request, diagram_id: UUID, payload: UpdateBpmnDiagramInput):
+    """Edita diagrama. Mudança em diagram_json dispara snapshot da versão
+    anterior em bpmn_diagram_versions (trigger DB). Mudança só de metadata
+    não snapshota."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _BPMN_WRITE_BLOCKED_ROLES, "editar diagramas BPMN")
+
+    data = payload.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(400, "no_valid_fields")
+    if "name" in data:
+        data["name"] = _validate_bpmn_name(data["name"])
+    if "diagram_json" in data:
+        _validate_bpmn_diagram_json(data["diagram_json"])
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = client.table("bpmn_diagrams").update(data).eq("id", str(diagram_id)).execute()
+        if not res.data:
+            raise HTTPException(404, "bpmn_diagram_not_found")
+        logger.info(
+            "BPMN diagram patched id=%s fields=%s new_version=%s by=%s",
+            diagram_id, list(data.keys()), res.data[0].get("version"), scope.get("user_id"),
+        )
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"patch_bpmn_diagram failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/bpmn/diagrams/{diagram_id}")
+async def delete_bpmn_diagram(request: Request, diagram_id: UUID):
+    """Remove diagrama. CASCADE deleta também todas as versões em bpmn_diagram_versions."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _BPMN_WRITE_BLOCKED_ROLES, "remover diagramas BPMN")
+    try:
+        client = get_authenticated_client(request.state.token)
+        client.table("bpmn_diagrams").delete().eq("id", str(diagram_id)).execute()
+        logger.info("BPMN diagram deleted id=%s by=%s", diagram_id, scope.get("user_id"))
+        return Response(status_code=204)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_bpmn_diagram failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/bpmn/diagrams/{diagram_id}/duplicate")
+async def duplicate_bpmn_diagram(request: Request, diagram_id: UUID, payload: Optional[Dict[str, Any]] = None):
+    """Clona um diagrama existente. Novo registro com version=1 e generated_by='manual'
+    (mesmo que o original tenha vindo de athena/daedalus — o clone é trabalho humano).
+    Opcional: payload {name: '...'} para sobrescrever o nome do clone (default: '<original> (cópia)')."""
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _BPMN_WRITE_BLOCKED_ROLES, "duplicar diagramas BPMN")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        orig_res = client.table("bpmn_diagrams").select("*").eq("id", str(diagram_id)).limit(1).execute()
+        if not orig_res.data:
+            raise HTTPException(404, "bpmn_diagram_not_found")
+        original = orig_res.data[0]
+
+        override_name = (payload or {}).get("name") if isinstance(payload, dict) else None
+        new_name = _validate_bpmn_name(override_name) if override_name else f"{original.get('name', 'Diagrama')} (cópia)"
+
+        clone = {
+            "company_id": original["company_id"],
+            "name": new_name,
+            "description": original.get("description"),
+            "diagram_json": original["diagram_json"],
+            "linked_sipoc_process_id": original.get("linked_sipoc_process_id"),
+            "linked_workflow_id": original.get("linked_workflow_id"),
+            "linked_goal_id": original.get("linked_goal_id"),
+            "generated_by": "manual",
+        }
+
+        res = client.table("bpmn_diagrams").insert(clone).execute()
+        if not res.data:
+            raise HTTPException(500, "BPMN duplicate: insert returned empty")
+        logger.info(
+            "BPMN diagram duplicated source=%s clone=%s by=%s",
+            diagram_id, res.data[0].get("id"), scope.get("user_id"),
+        )
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"duplicate_bpmn_diagram failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/bpmn/diagrams/{diagram_id}/versions")
+async def list_bpmn_diagram_versions(request: Request, diagram_id: UUID):
+    """Histórico append-only de versões do diagrama. Ordem: mais recente primeiro.
+    Não inclui a versão atual (que vive em bpmn_diagrams.diagram_json) —
+    versions tem apenas as anteriores que foram snapshotadas pelo trigger."""
+    if not supabase:
+        return []
+    try:
+        client = get_authenticated_client(request.state.token)
+        res = (
+            client.table("bpmn_diagram_versions")
+            .select("*")
+            .eq("diagram_id", str(diagram_id))
+            .order("version", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"list_bpmn_diagram_versions failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# (fim Daedalus BPMN)
+# =============================================================================
+
+
 @app.get("/api/sipoc/templates")
 async def list_templates():
     return get_templates_list()

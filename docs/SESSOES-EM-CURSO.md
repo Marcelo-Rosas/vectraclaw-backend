@@ -10,7 +10,9 @@
 
 ## Ativas
 
-_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
+| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
+|---|---|---|---|---|---|
+| Daedalus PR E — endpoints CRUD bpmn_diagrams | esta sessão (Opus 4.7) | `feat/daedalus-bpmn-endpoints` | `src/api.py` (bloco bpmn ~50 linhas após risks) | 2026-05-16 21:30 | ~1h |
 
 ---
 
