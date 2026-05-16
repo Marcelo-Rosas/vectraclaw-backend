@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("Athena")
 
@@ -1273,10 +1273,156 @@ async def _handle_risk_register(prompt: str, input_data: Dict[str, Any]) -> Dict
         task_id, goal_id, risks_count, tokens["total"], cost_usd,
     )
 
+    # G1 PR C — persistência best-effort em vectraclip.risks (PR #149 criou a tabela)
+    try:
+        persistence_stats = _persist_athena_risks(
+            supabase,
+            company_id=goal.get("company_id"),
+            goal_id=goal_id,
+            gemini_payload=gemini_payload,
+        )
+        envelope["metadata"]["persistence"] = persistence_stats
+    except Exception as exc:
+        logger.warning(
+            "athena-risk-register persistence wrapper failed (non-fatal) task=%s: %s",
+            task_id, exc,
+        )
+        envelope["metadata"]["persistence"] = {"error": str(exc), "persisted": 0}
+
     return {
         "output_json": envelope,
         "cost_usd": cost_usd,
         "status_override": "done",
+    }
+
+
+# G1 PR C — mapeamento de escala/taxonomia PMBOK 5ª (output Gemini) → schema
+# vectraclip.risks. As escalas são diferentes por design: o handler Athena segue
+# Heldman/PMBOK 5ª (impact ∈ {0.05, 0.10, 0.20, 0.40, 0.80}); a tabela usa escala
+# 1-10 mais intuitiva pra UI. O mapeamento abaixo é discreto e idempotente.
+_ATHENA_IMPACT_TO_DB = {
+    0.05: 1.0,   # Trivial
+    0.10: 2.5,   # Baixo
+    0.20: 5.0,   # Moderado
+    0.40: 7.5,   # Alto
+    0.80: 10.0,  # Crítico
+}
+
+_ATHENA_RBS_TO_DB_CATEGORY = {
+    "External": "external",
+    "Organizational": "organizational",
+    "Project Management": "project_mgmt",
+    "Technical": "technical",
+}
+
+# Strategy Athena (PMBOK 5ª threat + opportunity) → response_strategy do CHECK do DB.
+# Opportunities (exploit/enhance/share) são mapeadas pragmaticamente — a tabela
+# atual cobre threats; revisitar quando G1 PR D habilitar opportunities nativas.
+_ATHENA_STRATEGY_TO_DB = {
+    "eliminate": "avoid",
+    "mitigate": "mitigate",
+    "transfer": "transfer",
+    "accept_active": "accept",
+    "accept_passive": "accept",
+    "accept": "accept",
+    # opportunity strategies — mapping aproximado
+    "exploit": "accept",
+    "enhance": "mitigate",
+    "share": "transfer",
+}
+
+
+def _map_athena_risk_to_db_row(
+    risk: Dict[str, Any],
+    company_id: str,
+    goal_id: str,
+) -> Dict[str, Any]:
+    """Mapeia 1 risco Gemini → 1 row para vectraclip.risks."""
+    gemini_prob = float(risk.get("probability", 0.5) or 0.5)
+    gemini_impact = float(risk.get("impact", 0.20) or 0.20)
+    db_impact = _ATHENA_IMPACT_TO_DB.get(round(gemini_impact, 2))
+    if db_impact is None:
+        # Escala fora do canônico — interpola linear 0..1 → 1..10
+        db_impact = max(1.0, min(10.0, gemini_impact * 12.5))
+
+    desc = (risk.get("description") or "").strip()
+    if len(desc) > 200:
+        name = desc[:197].rstrip() + "..."
+    else:
+        name = desc or "(sem descrição)"
+
+    response_plan = (risk.get("response_plan") or "").strip() or None
+
+    secondary = risk.get("secondary_risks") or []
+    contingency = None
+    if secondary:
+        lines = [f"- {sr.get('description', '').strip()}" for sr in secondary[:5] if sr.get("description")]
+        if lines:
+            contingency = "Riscos secundários a monitorar:\n" + "\n".join(lines)
+
+    return {
+        "company_id": str(company_id),
+        "linked_goal_id": str(goal_id),
+        "name": name,
+        "description": desc or None,
+        "category": _ATHENA_RBS_TO_DB_CATEGORY.get(
+            risk.get("rbs_category", "Project Management"), "project_mgmt"
+        ),
+        "probability": gemini_prob,
+        "impact": db_impact,
+        "response_strategy": _ATHENA_STRATEGY_TO_DB.get(risk.get("strategy"), "accept"),
+        "mitigation_actions": response_plan,
+        "contingency_plan": contingency,
+        "status": "identified",
+        "detected_by_athena": True,
+    }
+
+
+def _persist_athena_risks(
+    supabase: Any,
+    *,
+    company_id: str,
+    goal_id: str,
+    gemini_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Best-effort: insere riscos identificados em vectraclip.risks.
+
+    Não bloqueia o handler em caso de falha (cada row em try/except isolado).
+    Retorna stats pra incluir no envelope.metadata.persistence.
+    """
+    risks = gemini_payload.get("risks") or []
+    if not risks:
+        return {"persisted": 0, "errors": 0, "skipped_empty": True, "risk_db_ids": []}
+    if supabase is None or not company_id:
+        return {"persisted": 0, "errors": 0, "skipped_no_supabase": True, "risk_db_ids": []}
+
+    persisted = 0
+    errors = 0
+    risk_db_ids: list = []
+
+    for r in risks:
+        try:
+            row = _map_athena_risk_to_db_row(r, company_id, goal_id)
+            res = supabase.table("risks").insert(row).execute()
+            if res.data:
+                persisted += 1
+                risk_db_ids.append(res.data[0].get("id"))
+        except Exception as exc:
+            errors += 1
+            logger.warning(
+                "athena-risk-register persist failed (non-fatal) gemini_risk_id=%s: %s",
+                r.get("id"), exc,
+            )
+
+    logger.info(
+        "athena-risk-register persisted %d/%d risks (errors=%d) goal=%s company=%s",
+        persisted, len(risks), errors, goal_id, company_id,
+    )
+    return {
+        "persisted": persisted,
+        "errors": errors,
+        "total_attempted": len(risks),
+        "risk_db_ids": risk_db_ids,
     }
 
 
