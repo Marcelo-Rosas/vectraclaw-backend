@@ -10,9 +10,7 @@
 
 ## Ativas
 
-| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
-|---|---|---|---|---|---|
-| Daedalus PR E — endpoints CRUD bpmn_diagrams | esta sessão (Opus 4.7) | `feat/daedalus-bpmn-endpoints` | `src/api.py` (bloco bpmn ~50 linhas após risks) | 2026-05-16 21:30 | ~1h |
+_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
 
 ---
 
@@ -20,6 +18,7 @@
 
 | O que | PR | Closed |
 |---|---|---|
+| **Daedalus PR E**: CRUD bpmn_diagrams + duplicate + versions + hotfix SECURITY DEFINER | #156 | hoje |
 | **Daedalus PR D**: bpmn_diagrams + bpmn_diagram_versions + trigger snapshot inteligente | #154 | hoje |
 | **Lote 2 Frontend handoff** doc autossuficiente (5 sub-PRs FE-A..E ~10h) | #153 | hoje |
 | **G1 Risk Register PMBOK completo (A+B+C)**: tabela `vectraclip.risks` + CRUD + persistência Athena | #149 + #150 + #151 | hoje |
