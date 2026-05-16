@@ -44,6 +44,7 @@ DAEMONS: list[tuple[str, str]] = [
     ("HermesReporter", "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"),
     ("Kronos",         "9c8d7e6f-5a4b-4321-9876-543210fedcba"),
     ("Athena",         "ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d"),
+    ("Daedalus",       "d4ed4145-0000-4000-8000-000000000005"),
 ]
 
 

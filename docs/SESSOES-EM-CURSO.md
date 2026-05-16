@@ -12,7 +12,7 @@
 
 | Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
 |---|---|---|---|---|---|
-| Daedalus PR F — specialty + agent seed | esta sessão (Opus 4.7) | `feat/daedalus-specialty-and-agent` | `supabase/migrations/20260516220000_daedalus_seed_specialty_agent.sql` | 2026-05-16 22:00 | ~45min |
+| Daedalus PR G+H — handler estatístico + launcher | esta sessão (Opus 4.7) | `feat/daedalus-handler-and-launcher` | `src/agents/daedalus.py` (novo), `src/agent_daemon.py` (rotear bpmn-generate), `start_all_daemons.py` (incluir Daedalus), migration nova com operation_type catalog | 2026-05-16 22:45 | ~1h30 |
 
 ---
 
@@ -20,6 +20,7 @@
 
 | O que | PR | Closed |
 |---|---|---|
+| **Daedalus PR F**: specialty bpmn-modeling + agent Daedalus + config (13/13 smoke) | #158 | hoje |
 | **Daedalus PR E**: CRUD bpmn_diagrams + duplicate + versions + hotfix SECURITY DEFINER | #156 | hoje |
 | **Daedalus PR D**: bpmn_diagrams + bpmn_diagram_versions + trigger snapshot inteligente | #154 | hoje |
 | **Lote 2 Frontend handoff** doc autossuficiente (5 sub-PRs FE-A..E ~10h) | #153 | hoje |
