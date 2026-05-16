@@ -68,21 +68,55 @@ def _sys_pid_alive(pid: int) -> bool:
         return False
 
 
+# Janela em que heartbeat conta como "running". Default 60s = 2× o idle heartbeat
+# interval (VEC-377, DAEMON_IDLE_HEARTBEAT_SECONDS default 30s) — evita flapping
+# false-negative quando heartbeat atrasa por jitter de rede ou contenção de lock.
+_HEARTBEAT_FRESH_SECONDS = int(os.getenv("DAEMON_FRESH_HEARTBEAT_SECONDS", "60"))
+
+
 def _sys_daemon_status(agent_id: str, name: str) -> dict:
-    lock = _SYS_LOCK_DIR / f"{agent_id}.lock"
-    if not lock.exists():
-        return {"agentId": agent_id, "name": name, "running": False, "pid": None}
+    """PR6.1 — Status do daemon via heartbeat no DB (não via PID local).
+
+    Pós-Docker, daemons rodam no host (Task Scheduler) enquanto a API roda
+    em container Linux. PID-based check via `tasklist` (Windows-only) +
+    `.daemon_locks` (não-mounted) sempre falha. Fonte de verdade canônica
+    pós-Docker é o heartbeat no DB: se existe heartbeat de < 30s, daemon
+    está vivo, independente de onde estiver rodando.
+
+    Fallback: se Supabase indisponível, retorna running=False.
+    """
     try:
-        pid = int(lock.read_text().strip())
-        alive = _sys_pid_alive(pid)
-        if not alive:
-            try:
-                lock.unlink()
-            except Exception:
-                pass
-        return {"agentId": agent_id, "name": name, "running": alive, "pid": pid if alive else None}
-    except Exception:
-        return {"agentId": agent_id, "name": name, "running": False, "pid": None}
+        # Lazy import: evita circular se api.py ainda não importou este módulo.
+        from src.api import supabase
+        if not supabase:
+            return {"agentId": agent_id, "name": name, "running": False, "pid": None, "lastHeartbeatAgeSeconds": None}
+
+        from datetime import datetime, timezone
+        res = (
+            supabase.table("heartbeats")
+            .select("created_at")
+            .eq("agent_id", agent_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return {"agentId": agent_id, "name": name, "running": False, "pid": None, "lastHeartbeatAgeSeconds": None}
+
+        ts = res.data[0]["created_at"]
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        running = age < _HEARTBEAT_FRESH_SECONDS
+        return {
+            "agentId": agent_id,
+            "name": name,
+            "running": running,
+            "pid": None,  # heartbeat-based: PID não disponível
+            "lastHeartbeatAgeSeconds": int(age),
+        }
+    except Exception as e:
+        logger.warning("_sys_daemon_status heartbeat lookup failed agent=%s: %s", name, e)
+        return {"agentId": agent_id, "name": name, "running": False, "pid": None, "lastHeartbeatAgeSeconds": None}
 
 
 def _sys_build_env(agent_id: str) -> dict:
