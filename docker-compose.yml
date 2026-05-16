@@ -1,0 +1,37 @@
+services:
+  backend:
+    build: .
+    container_name: vectraclaw-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  daemon:
+    build: .
+    container_name: vectraclaw-daemon
+    restart: unless-stopped
+    command: ["python", "-m", "src.agent_daemon"]
+    env_file:
+      - .env
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: vectraclaw-tunnel
+    restart: unless-stopped
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    depends_on:
+      backend:
+        condition: service_healthy

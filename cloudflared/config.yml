@@ -1,0 +1,9 @@
+tunnel: <SEU_TUNNEL_ID>
+credentials-file: /etc/cloudflared/<SEU_TUNNEL_ID>.json
+
+ingress:
+  - hostname: api.vectraclip.vectracargo.com.br
+    service: http://backend:3000
+    originRequest:
+      noTLSVerify: false
+  - service: http_status:404
