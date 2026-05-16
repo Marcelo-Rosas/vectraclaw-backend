@@ -10,9 +10,7 @@
 
 ## Ativas
 
-| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
-|---|---|---|---|---|---|
-| Daedalus PR G+H — handler estatístico + launcher | esta sessão (Opus 4.7) | `feat/daedalus-handler-and-launcher` | `src/agents/daedalus.py` (novo), `src/agent_daemon.py` (rotear bpmn-generate), `start_all_daemons.py` (incluir Daedalus), migration nova com operation_type catalog | 2026-05-16 22:45 | ~1h30 |
+_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
 
 ---
 
@@ -20,6 +18,7 @@
 
 | O que | PR | Closed |
 |---|---|---|
+| **Daedalus PR G+H** (FINAL): handler estatístico + dispatch + launcher (11º daemon online) | #159 | hoje |
 | **Daedalus PR F**: specialty bpmn-modeling + agent Daedalus + config (13/13 smoke) | #158 | hoje |
 | **Daedalus PR E**: CRUD bpmn_diagrams + duplicate + versions + hotfix SECURITY DEFINER | #156 | hoje |
 | **Daedalus PR D**: bpmn_diagrams + bpmn_diagram_versions + trigger snapshot inteligente | #154 | hoje |
