@@ -94,7 +94,7 @@
 | Risks criam mas não fluem (status fixo `identified`) | 🟡 MÉDIA |
 | RBAC hardcoded (sem CRUD UI) | 🟠 BAIXA |
 | Audit log nunca alimentado | 🔴 ALTA |
-| RACI analysis service existe mas sem endpoint | 🟠 INFO |
+| ~~RACI analysis service existe mas sem endpoint~~ | ✅ INVALIDADO PR #171 (endpoint já chama `calculate_raci_stats` em `api.py:1528`) |
 | WS broadcast ausente em todos endpoints da camada | 🟠 INFO |
 
 ---
