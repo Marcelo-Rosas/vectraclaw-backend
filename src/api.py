@@ -1889,8 +1889,34 @@ async def get_risk(request: Request, risk_id: UUID):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# G1.2 — State machine PMBOK Risk Management lifecycle
+# Cada transição precisa ser legal (não dá pra pular fases ou voltar arbitrariamente).
+# Schmidt §"Risks são iterativos": permite revert pra identified em qualquer momento
+# (descobriu erro de análise) e closed terminal (não revive).
+_RISK_VALID_TRANSITIONS: Dict[str, set] = {
+    "identified":  {"analyzing", "closed"},
+    "analyzing":   {"planned", "identified", "closed"},
+    "planned":     {"monitoring", "analyzing", "closed"},
+    "monitoring":  {"occurred", "closed", "planned"},
+    "occurred":    {"closed"},  # ocorreu → só fecha (não volta)
+    "closed":      set(),         # terminal — nenhuma transição
+}
+
+
+class RiskTransitionInput(BaseModel):
+    to_status: str
+    notes: Optional[str] = None
+
+    class Config:
+        extra = "ignore"
+
+
 @app.patch("/api/risks/{risk_id}")
 async def patch_risk(request: Request, risk_id: UUID, payload: UpdateRiskInput):
+    """Edita risco. NOTA: pra mudar `status` use POST /api/risks/{id}/transition
+    (state machine valida transições legais). PATCH com `status` ainda funciona
+    mas não checa transição — use só em correção manual.
+    """
     if not supabase:
         raise HTTPException(503, "supabase_unavailable")
     scope = get_user_scope(request.state.token)
@@ -1903,6 +1929,12 @@ async def patch_risk(request: Request, risk_id: UUID, payload: UpdateRiskInput):
 
     try:
         client = get_authenticated_client(request.state.token)
+        # Ler estado anterior pro audit log (campos mudados + status anterior)
+        prev_res = client.table("risks").select("status,company_id,name").eq("id", str(risk_id)).limit(1).execute()
+        if not prev_res.data:
+            raise HTTPException(404, "risk_not_found")
+        prev_row = prev_res.data[0]
+
         res = client.table("risks").update(data).eq("id", str(risk_id)).execute()
         if not res.data:
             raise HTTPException(404, "risk_not_found")
@@ -1910,11 +1942,102 @@ async def patch_risk(request: Request, risk_id: UUID, payload: UpdateRiskInput):
             "Risk patched id=%s fields=%s by=%s",
             risk_id, list(data.keys()), scope.get("user_id"),
         )
+        # G1.6 audit log — patch direto (transition tem seu próprio audit abaixo)
+        from src.services.audit import audit_log
+        audit_log(
+            supabase,
+            company_id=str(prev_row.get("company_id") or ""),
+            actor_type="human",
+            actor_id=str(scope.get("user_id") or "unknown"),
+            action="risk.patch",
+            target=f"risk:{risk_id}",
+            payload={
+                "fields_changed": list(data.keys()),
+                "previous_status": prev_row.get("status"),
+                "new_status": data.get("status"),
+                "name": prev_row.get("name"),
+            },
+        )
         return res.data[0]
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"patch_risk failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/risks/{risk_id}/transition")
+async def transition_risk(request: Request, risk_id: UUID, payload: RiskTransitionInput):
+    """G1.2 — Transiciona status do risco respeitando state machine PMBOK.
+
+    State machine:
+      identified  → analyzing | closed
+      analyzing   → planned | identified | closed
+      planned     → monitoring | analyzing | closed
+      monitoring  → occurred | closed | planned
+      occurred    → closed
+      closed      → (terminal)
+
+    Body: {to_status, notes?}
+    """
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _RISK_WRITE_BLOCKED_ROLES, "transicionar status de risco")
+
+    to_status = payload.to_status
+    if to_status not in _RISK_VALID_STATUSES:
+        raise HTTPException(400, f"to_status inválido: {to_status!r}. Esperado: {sorted(_RISK_VALID_STATUSES)}")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        # Ler estado atual + validar transição
+        cur = client.table("risks").select("status,company_id,name").eq("id", str(risk_id)).limit(1).execute()
+        if not cur.data:
+            raise HTTPException(404, "risk_not_found")
+        current = cur.data[0]
+        from_status = current.get("status") or "identified"
+
+        if to_status == from_status:
+            raise HTTPException(400, f"risco já está em status={from_status!r} (no-op)")
+
+        allowed = _RISK_VALID_TRANSITIONS.get(from_status, set())
+        if to_status not in allowed:
+            raise HTTPException(
+                409,
+                f"transição ilegal: {from_status!r} → {to_status!r}. "
+                f"De {from_status!r} é permitido apenas {sorted(allowed) or '(terminal — nenhuma)'}",
+            )
+
+        res = client.table("risks").update({"status": to_status}).eq("id", str(risk_id)).execute()
+        if not res.data:
+            raise HTTPException(500, "transition_returned_empty")
+
+        logger.info(
+            "Risk transition id=%s from=%s to=%s by=%s",
+            risk_id, from_status, to_status, scope.get("user_id"),
+        )
+        # G1.6 audit log — transição é evento PMBOK compliance-critical
+        from src.services.audit import audit_log
+        audit_log(
+            supabase,
+            company_id=str(current.get("company_id") or ""),
+            actor_type="human",
+            actor_id=str(scope.get("user_id") or "unknown"),
+            action="risk.transition",
+            target=f"risk:{risk_id}",
+            payload={
+                "from_status": from_status,
+                "to_status": to_status,
+                "notes": payload.notes,
+                "name": current.get("name"),
+            },
+        )
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"transition_risk failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1926,9 +2049,27 @@ async def delete_risk(request: Request, risk_id: UUID):
     require_role_not(scope, _RISK_WRITE_BLOCKED_ROLES, "remover riscos")
     try:
         client = get_authenticated_client(request.state.token)
-        res = client.table("risks").delete().eq("id", str(risk_id)).execute()
-        # supabase delete não retorna data se RLS falhar — verificar GET antes? Mantém simples.
+        # Ler antes pro audit (DELETE não tem RETURNING confiável via RLS)
+        prev_res = client.table("risks").select("company_id,name,status").eq("id", str(risk_id)).limit(1).execute()
+        prev_row = prev_res.data[0] if prev_res.data else None
+
+        client.table("risks").delete().eq("id", str(risk_id)).execute()
         logger.info("Risk deleted id=%s by=%s", risk_id, scope.get("user_id"))
+        # G1.6 audit log — DELETE é evento crítico (compliance: quem apagou risco)
+        if prev_row:
+            from src.services.audit import audit_log
+            audit_log(
+                supabase,
+                company_id=str(prev_row.get("company_id") or ""),
+                actor_type="human",
+                actor_id=str(scope.get("user_id") or "unknown"),
+                action="risk.delete",
+                target=f"risk:{risk_id}",
+                payload={
+                    "name": prev_row.get("name"),
+                    "status_at_delete": prev_row.get("status"),
+                },
+            )
         return Response(status_code=204)
     except HTTPException:
         raise
