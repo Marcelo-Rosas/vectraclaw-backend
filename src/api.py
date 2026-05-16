@@ -5121,8 +5121,56 @@ async def upsert_company_secret(request: Request, company_id: str, payload: Comp
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Cache TTL curto pra evitar round-trip por PUT mas refletir mudanças
+# no catalog em <60s sem restart. Idempotente — ignorado se supabase=None.
+_EXECUTION_MODE_CACHE: Dict[str, Any] = {"ids": None, "default": None, "fetched_at": 0.0}
+_EXECUTION_MODE_CACHE_TTL_S = 60.0
+
+
+def _load_execution_mode_ids() -> set:
+    """Lê IDs ativos de agent_execution_modes (cacheado 60s).
+    Retorna set vazio se supabase indisponível (skip validation — FK do DB
+    pega depois). Catalog-driven: nada hardcoded."""
+    import time
+    now = time.time()
+    cached = _EXECUTION_MODE_CACHE.get("ids")
+    if cached is not None and (now - _EXECUTION_MODE_CACHE.get("fetched_at", 0.0)) < _EXECUTION_MODE_CACHE_TTL_S:
+        return cached
+    if not supabase:
+        return set()
+    try:
+        res = (
+            supabase.table("agent_execution_modes")
+            .select("id,display_order,is_active")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        rows = res.data or []
+        ids = {str(r["id"]) for r in rows if r.get("id")}
+        default = str(rows[0]["id"]) if rows else None
+        _EXECUTION_MODE_CACHE["ids"] = ids
+        _EXECUTION_MODE_CACHE["default"] = default
+        _EXECUTION_MODE_CACHE["fetched_at"] = now
+        return ids
+    except Exception as e:
+        logger.warning(f"_load_execution_mode_ids fallback (empty set): {e}")
+        return set()
+
+
+def _default_execution_mode() -> str:
+    """Default = primeiro mode ativo do catalog por display_order.
+    Fallback duro 'REALTIME' só se catalog vazio E supabase indisponível
+    (boot offline). Documentado: NÃO é constante semântica, é degenerado."""
+    _load_execution_mode_ids()  # populates cache
+    return _EXECUTION_MODE_CACHE.get("default") or "REALTIME"
+
+
 class AgentExecutionSetupInput(BaseModel):
-    executionMode: Literal["REALTIME", "CRON", "TRIGGER"]
+    # str + validator que normaliza UPPER + valida contra catalog
+    # `vectraclip.agent_execution_modes`. Sem Literal — o catalog cresce
+    # sem deploy (ex.: futuro QUEUE_EVENT, WEBSUB) e a UI já leva via GET.
+    executionMode: str
     triggerConfig: Dict[str, Any] = Field(default_factory=dict)
     functionUrl: Optional[str] = None
     authSecretRef: Optional[str] = None
@@ -5137,6 +5185,18 @@ class AgentExecutionSetupInput(BaseModel):
     def empty_str_to_none(cls, v):
         if v == "":
             return None
+        return v
+
+    @validator("executionMode", pre=True)
+    def normalize_and_validate_mode(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            raise ValueError("executionMode_required")
+        v = str(v).strip().upper()
+        valid = _load_execution_mode_ids()
+        if valid and v not in valid:
+            raise ValueError(
+                f"unknown_execution_mode: '{v}' (válidos: {sorted(valid)})"
+            )
         return v
 
 
@@ -5160,7 +5220,7 @@ def _default_execution_config_payload(agent_id: str, company_id: Optional[str]) 
         "id": f"default-{agent_id}",
         "companyId": company_id or "",
         "agentId": agent_id,
-        "executionMode": "REALTIME",
+        "executionMode": _default_execution_mode(),
         "triggerConfig": {},
         "functionUrl": None,
         "authSecretRef": None,
@@ -5935,11 +5995,17 @@ async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
             .execute()
         )
         exec_row = exec_res.data[0] if exec_res.data else None
-        execution_mode = str((exec_row or {}).get("execution_mode") or "REALTIME").upper()
+        execution_mode = str(
+            (exec_row or {}).get("execution_mode") or _default_execution_mode()
+        ).upper()
         function_url = (exec_row or {}).get("function_url")
         if not function_url:
-            # REALTIME agents are consumed by the daemon poller and do not require
-            # an HTTP function_url. For CRON/TRIGGER, keep requiring function_url.
+            # Modes consumidos por poller local (REALTIME) não precisam de
+            # function_url. A semântica "precisa de URL?" deveria virar
+            # propriedade no catalog (config_schema marca function_url como
+            # required:true em CRON/TRIGGER, false/ausente em REALTIME).
+            # Por ora mantemos check pela ID conhecida — TODO migrar para
+            # consulta a `agent_execution_modes.config_schema`.
             if execution_mode == "REALTIME":
                 duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
                 _chronos_log_dispatch_event(

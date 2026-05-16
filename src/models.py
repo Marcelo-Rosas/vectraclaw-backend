@@ -460,7 +460,9 @@ class AgentExecutionConfig(CamelModel):
     id: str
     company_id: str
     agent_id: str
-    execution_mode: Literal["REALTIME", "CRON", "TRIGGER"]
+    # str + FK em vectraclip.agent_execution_configs.execution_mode garante
+    # validação contra `agent_execution_modes`. Catalog-driven, não hardcoded.
+    execution_mode: str
     trigger_config: Dict[str, Any] = {}
     function_url: Optional[str] = None
     auth_secret_ref: Optional[str] = None
