@@ -10,7 +10,9 @@
 
 ## Ativas
 
-_(nenhuma — adicione 1 linha aqui antes do primeiro tool use significativo da sua sessão)_
+| Sessão | Owner | Branch / PR | Arquivos | Iniciada | ETA |
+|---|---|---|---|---|---|
+| G1 Risk Register (PMBOK) — PR A migration | esta sessão (Opus 4.7) | `feat/risk-register-table` | `supabase/migrations/20260516200000_risk_register.sql` | 2026-05-16 20:30 | ~30min (smoke + PR) |
 
 ---
 
