@@ -7158,6 +7158,7 @@ from src.api_routes import oracle_chat as _oracle_chat_routes  # noqa: E402
 from src.api_routes import rag as _rag_routes  # noqa: E402
 from src.api_routes import athena as _athena_routes  # noqa: E402
 from src.api_routes import sipoc_taxonomy as _sipoc_taxonomy_routes  # noqa: E402
+from src.api_routes import admin as _admin_routes  # noqa: E402
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -7170,4 +7171,5 @@ app.include_router(_oracle_chat_routes.router)
 app.include_router(_rag_routes.router)
 app.include_router(_athena_routes.router)
 app.include_router(_sipoc_taxonomy_routes.router)
+app.include_router(_admin_routes.router)
 
