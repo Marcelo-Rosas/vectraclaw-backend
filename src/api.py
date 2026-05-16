@@ -3712,7 +3712,11 @@ async def patch_company(request: Request, company_id: str, patch: UpdateCompanyI
         return row
 
     try:
-        res = supabase.table("companies").update(payload).eq("company_id", company_id).execute()
+        # G2.1 (PR #168): GRANT UPDATE + policy companies_update_admin ampliada
+        # (admin, platform_admin, consultant, company_admin). RLS protege tenant
+        # no DB; antes este endpoint usava service_role (bypass).
+        client = get_authenticated_client(request.state.token)
+        res = client.table("companies").update(payload).eq("company_id", company_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="company_not_found")
         row = res.data[0]
@@ -3746,6 +3750,11 @@ async def delete_company(company_id: str):
         check = supabase.table("companies").select("company_id").eq("company_id", company_id).execute()
         if not check.data:
             raise HTTPException(status_code=404, detail="company_not_found")
+        # ACCEPTED bypass: DELETE company é operação plataforma (apagar tenant
+        # inteiro tem risco maior que UPDATE). Sem GRANT DELETE pra authenticated
+        # de propósito — só plataforma faz via service_role + RBAC platform_admin
+        # checado em camada superior (validate_jwt_company_id acima protege
+        # cross-tenant). G2.1 (PR #168) documentou esta decisão.
         supabase.table("companies").delete().eq("company_id", company_id).execute()
         return Response(status_code=204)
     except HTTPException:
@@ -5770,6 +5779,18 @@ def _load_execution_mode_ids() -> set:
         rows = res.data or []
         ids = {str(r["id"]) for r in rows if r.get("id")}
         default = str(rows[0]["id"]) if rows else None
+        # G2.2: log explícito quando cache é re-fetched (visibilidade pra
+        # debug de mode novo rejeitado em janela <60s do deploy do catalog)
+        previous = _EXECUTION_MODE_CACHE.get("ids")
+        if previous is None:
+            logger.info("execution_mode cache primed: ids=%s default=%s", sorted(ids), default)
+        elif previous != ids:
+            added = ids - previous
+            removed = previous - ids
+            logger.warning(
+                "execution_mode cache changed: added=%s removed=%s default_now=%s",
+                sorted(added), sorted(removed), default,
+            )
         _EXECUTION_MODE_CACHE["ids"] = ids
         _EXECUTION_MODE_CACHE["default"] = default
         _EXECUTION_MODE_CACHE["fetched_at"] = now
@@ -7945,6 +7966,11 @@ async def patch_llm_model(request: Request, model_id: str, payload: Dict[str, An
         update_data = {field_map[k]: v for k, v in payload.items() if k in field_map}
         if not update_data:
             raise HTTPException(status_code=400, detail="no_fields_to_update")
+        # ACCEPTED bypass: llm_models é catalog CROSS-TENANT (não tem company_id).
+        # G2.1 (PR #168) criou policy WRITE platform_admin no DB, mas Marcelo
+        # (tenant admin) NÃO é platform_admin — UI tenant não consegue gerenciar.
+        # Mantém service_role aqui; UI de gerência futura via admin console de
+        # plataforma quando RBAC platform_admin estiver implementado.
         res = supabase.table("llm_models").update(update_data).eq("id", model_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="llm_model_not_found")
