@@ -28,6 +28,7 @@ _OPERATION_TYPE_SCORES: Dict[str, int] = {
     "document_generation": 75,  # síntese estruturada → CMA
     "other": 60,              # padrão simples → lean CMA
     "research": 85,           # síntese de informação → CMA
+    "athena-onboarding": 85,  # síntese estruturada de perfil empresarial → CMA
 }
 
 CMA_THRESHOLD = 50
