@@ -1,4 +1,9 @@
-"""Launcher para os 10 daemons da VectraClaw.
+"""Launcher dos daemons da VectraClaw — catalog-driven (Regra de Ouro #2).
+
+Lista de daemons vem de `vectraclip.agents WHERE is_daemon=true` (migration
+20260517160000). Antes era lista hardcoded — bug pré-existente: divergência
+entre esta lista e a de `src/api_routes/system.py` causou Daedalus mostrar
+"Ocioso" na UI mesmo heartbeating normalmente (2026-05-17 diagnóstico).
 
 Cada daemon roda como subprocess separado:
 - AGENT_ID injetado via env
@@ -13,9 +18,13 @@ Uso:
 Pra rodar via Task Scheduler do Windows, basta apontar pra este arquivo
 com Python via `pythonw.exe` (sem janela) ou `python.exe` (com console).
 
-Memory ref: VEC-414 — daemon spawnado sem `.env` carregado vira no-op
-silencioso. Por isso o `load_dotenv()` no topo, ANTES de copiar
-`os.environ` pro subprocess.
+Memory refs:
+- VEC-414 — daemon spawnado sem `.env` carregado vira no-op silencioso.
+  `load_dotenv()` no topo, ANTES de copiar `os.environ` pro subprocess.
+- post-merge-live-update-deploy (Regra de Ouro #3) — este arquivo é launcher
+  no host (não no container); não exige `docker cp`, mas requer restart do
+  launcher (matar processo + `python start_all_daemons.py`) pra pegar
+  daemons novos do catálogo.
 """
 from __future__ import annotations
 
@@ -33,19 +42,63 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-DAEMONS: list[tuple[str, str]] = [
-    ("Morpheus",       "00000000-0000-0000-0000-000000000001"),
-    ("Oracle",         "00000000-0000-0000-0000-000000000002"),
-    ("Mnemos",         "00000000-0000-0000-0000-000000000003"),
-    ("Hermes",         "59b7a69e-cc53-4063-85f9-5dcc5619ac96"),
-    ("Mercator",       "c7de1b0f-7c74-42f1-9de4-7210349e668e"),
-    ("Plutus",         "80fd6d0e-53ab-4638-b6e9-05cbbd121092"),
-    ("Hodos",          "0d6e56cc-28b6-4382-96cd-1952b890d412"),
-    ("HermesReporter", "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"),
-    ("Kronos",         "9c8d7e6f-5a4b-4321-9876-543210fedcba"),
-    ("Athena",         "ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d"),
-    ("Daedalus",       "d4ed4145-0000-4000-8000-000000000005"),
-]
+
+def _load_daemons_from_db() -> list[tuple[str, str]]:
+    """Lê (name, id) de `vectraclip.agents WHERE is_daemon=true`. Ordenado por name.
+
+    Falha-segura: se Supabase indisponível ou client não instalado, sai com
+    erro EXPLÍCITO (sys.exit 1). NÃO usa fallback hardcoded — mentir sobre
+    quem é daemon é pior que parar (Regra de Ouro #2).
+    """
+    try:
+        from supabase import create_client
+    except ImportError:
+        print(
+            "ERRO: pacote `supabase` não instalado. Roda `pip install supabase` ou ativa o venv.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        print(
+            "ERRO: SUPABASE_URL e/ou SUPABASE_SERVICE_ROLE_KEY ausentes no .env.\n"
+            f"Path .env: {ROOT / '.env'}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        client = create_client(url, key)
+        # Schema da casa é `vectraclip` (NUNCA public — supabase/CLAUDE.md)
+        try:
+            client = client.schema("vectraclip")  # type: ignore[attr-defined]
+        except Exception:
+            pass  # cliente antigo já assume schema via header
+
+        res = (
+            client.table("agents")
+            .select("id,name")
+            .eq("is_daemon", True)
+            .order("name")
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            print(
+                "ERRO: nenhum agent com is_daemon=true em vectraclip.agents.\n"
+                "Migration 20260517160000 foi aplicada? Rode `supabase db push`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return [(str(r["name"]), str(r["id"])) for r in rows]
+    except Exception as e:
+        print(f"ERRO: falha ao consultar agents.is_daemon do Supabase: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+DAEMONS: list[tuple[str, str]] = _load_daemons_from_db()
 
 
 def main() -> int:

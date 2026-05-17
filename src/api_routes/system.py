@@ -38,19 +38,53 @@ router = APIRouter(tags=["system"])
 _SYS_BASE_DIR = Path(__file__).parent.parent.parent
 _SYS_LOCK_DIR = _SYS_BASE_DIR / ".daemon_locks"
 
-# Lista canônica de daemons gerenciáveis. UUIDs são públicos (FK em vectraclip.agents).
-_DAEMON_AGENTS = [
-    ("00000000-0000-0000-0000-000000000001", "Morpheus"),
-    ("00000000-0000-0000-0000-000000000002", "Oracle"),
-    ("00000000-0000-0000-0000-000000000003", "Mnemos"),
-    ("59b7a69e-cc53-4063-85f9-5dcc5619ac96", "Hermes"),
-    ("c7de1b0f-7c74-42f1-9de4-7210349e668e", "Mercator"),
-    ("80fd6d0e-53ab-4638-b6e9-05cbbd121092", "Plutus"),
-    ("0d6e56cc-28b6-4382-96cd-1952b890d412", "Hodos"),
-    ("360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1", "HermesReporter"),
-    ("9c8d7e6f-5a4b-4321-9876-543210fedcba", "Kronos"),
-    ("ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d", "Athena"),  # VEC-388 PR1
-]
+# Lista canônica de daemons gerenciáveis: catalog-driven via `agents.is_daemon`
+# (migration 20260517160000). Regra de Ouro #2 (NO HARDCODE) — antes era lista
+# hardcoded de 10 entries que esqueceu Daedalus → UI mostrava Daedalus "Ocioso"
+# mesmo heartbeating normalmente. Diagnóstico 2026-05-17.
+_DAEMON_AGENTS_CACHE: list = []
+_DAEMON_AGENTS_CACHE_FETCHED_AT: float = 0.0
+_DAEMON_AGENTS_CACHE_TTL_S: float = 60.0
+
+
+def _load_daemon_agents() -> list:
+    """Lê lista canônica de daemons de `vectraclip.agents WHERE is_daemon=true`.
+
+    Cache TTL 60s (espelha padrão de `_load_execution_mode_ids` em api.py).
+    Retorna lista de tuplas (id, name) ordenadas por name. Vazio se Supabase
+    indisponível (fail-safe: endpoint /api/system/daemons retornará [] em vez
+    de crashar).
+    """
+    global _DAEMON_AGENTS_CACHE, _DAEMON_AGENTS_CACHE_FETCHED_AT
+    now = time.time()
+    if _DAEMON_AGENTS_CACHE and (now - _DAEMON_AGENTS_CACHE_FETCHED_AT) < _DAEMON_AGENTS_CACHE_TTL_S:
+        return _DAEMON_AGENTS_CACHE
+
+    try:
+        from src.api import supabase
+        if not supabase:
+            return _DAEMON_AGENTS_CACHE  # devolve cache antigo (pode ser vazio)
+        res = (
+            supabase.table("agents")
+            .select("id,name")
+            .eq("is_daemon", True)
+            .order("name")
+            .execute()
+        )
+        rows = res.data or []
+        new_list = [(str(r["id"]), str(r["name"])) for r in rows if r.get("id")]
+        previous = _DAEMON_AGENTS_CACHE
+        if previous != new_list:
+            logger.info(
+                "daemon_agents cache refreshed: count=%d names=%s",
+                len(new_list), [n for _, n in new_list],
+            )
+        _DAEMON_AGENTS_CACHE = new_list
+        _DAEMON_AGENTS_CACHE_FETCHED_AT = now
+        return new_list
+    except Exception as e:
+        logger.warning("_load_daemon_agents fallback (returning cached=%d): %s", len(_DAEMON_AGENTS_CACHE), e)
+        return _DAEMON_AGENTS_CACHE
 
 
 def _sys_pid_alive(pid: int) -> bool:
@@ -154,12 +188,12 @@ def _sys_stop_daemon(agent_id: str, name: str) -> dict:
 
 @router.get("/api/system/daemons")
 async def system_list_daemons(request: Request):
-    return [_sys_daemon_status(aid, name) for aid, name in _DAEMON_AGENTS]
+    return [_sys_daemon_status(aid, name) for aid, name in _load_daemon_agents()]
 
 
 @router.post("/api/system/daemons/{agent_id}/start")
 async def system_start_daemon(request: Request, agent_id: str):
-    entry = next(((aid, n) for aid, n in _DAEMON_AGENTS if aid == agent_id), None)
+    entry = next(((aid, n) for aid, n in _load_daemon_agents() if aid == agent_id), None)
     if not entry:
         raise HTTPException(status_code=404, detail="agent_id não está na lista de daemons")
     aid, name = entry
@@ -173,7 +207,7 @@ async def system_start_daemon(request: Request, agent_id: str):
 
 @router.post("/api/system/daemons/{agent_id}/stop")
 async def system_stop_daemon(request: Request, agent_id: str):
-    entry = next(((aid, n) for aid, n in _DAEMON_AGENTS if aid == agent_id), None)
+    entry = next(((aid, n) for aid, n in _load_daemon_agents() if aid == agent_id), None)
     if not entry:
         raise HTTPException(status_code=404, detail="agent_id não está na lista de daemons")
     aid, name = entry
@@ -184,7 +218,7 @@ async def system_stop_daemon(request: Request, agent_id: str):
 
 @router.post("/api/system/daemons/{agent_id}/restart")
 async def system_restart_daemon(request: Request, agent_id: str):
-    entry = next(((aid, n) for aid, n in _DAEMON_AGENTS if aid == agent_id), None)
+    entry = next(((aid, n) for aid, n in _load_daemon_agents() if aid == agent_id), None)
     if not entry:
         raise HTTPException(status_code=404, detail="agent_id não está na lista de daemons")
     aid, name = entry
@@ -197,7 +231,7 @@ async def system_restart_daemon(request: Request, agent_id: str):
 
 @router.post("/api/system/daemons/stop-all")
 async def system_stop_all_daemons(request: Request):
-    results = [_sys_stop_daemon(aid, name) for aid, name in _DAEMON_AGENTS]
+    results = [_sys_stop_daemon(aid, name) for aid, name in _load_daemon_agents()]
     logger.info("system.stop_all_daemons count=%d", len(results))
     return {"ok": True, "daemons": results}
 
@@ -205,7 +239,7 @@ async def system_stop_all_daemons(request: Request):
 @router.post("/api/system/daemons/start-all")
 async def system_start_all_daemons(request: Request):
     results = []
-    for aid, name in _DAEMON_AGENTS:
+    for aid, name in _load_daemon_agents():
         results.append(_sys_start_daemon(aid, name))
         time.sleep(0.2)
     logger.info("system.start_all_daemons count=%d", len(results))
@@ -214,11 +248,11 @@ async def system_start_all_daemons(request: Request):
 
 @router.post("/api/system/daemons/restart-all")
 async def system_restart_all_daemons(request: Request):
-    for aid, name in _DAEMON_AGENTS:
+    for aid, name in _load_daemon_agents():
         _sys_stop_daemon(aid, name)
     time.sleep(0.5)
     results = []
-    for aid, name in _DAEMON_AGENTS:
+    for aid, name in _load_daemon_agents():
         r = _sys_start_daemon(aid, name)
         results.append(r)
         time.sleep(0.3)
