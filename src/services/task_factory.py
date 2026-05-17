@@ -295,7 +295,10 @@ class TaskFactory:
             return
 
         final_status = completed_task.get("status")
-        if final_status not in ("done", "skipped"):
+        # Wave 1A: workflow só avança a partir de DONE. Tasks erroradas BLOQUEIAM
+        # o successor (humano precisa intervir/aprovar) — antes `skipped` deixava
+        # passar silenciosamente. Mais seguro.
+        if final_status != "done":
             return
 
         succs = completed_task.get("successor_step_codes") or []
@@ -327,7 +330,8 @@ class TaskFactory:
             deps = t.get("dependency_step_codes") or []
             if isinstance(deps, str):
                 deps = [deps]
-            ok = all(slug_status.get(str(d)) in ("done", "skipped") for d in deps)
+            # Wave 1A: dep deve estar DONE (era done|skipped). Erro bloqueia successor.
+            ok = all(slug_status.get(str(d)) == "done" for d in deps)
             if ok:
                 logger.info(
                     "promote_successors: completed=%s → promoting sibling id=%s slug=%s",

@@ -3700,7 +3700,7 @@ class UpdateTaskInput(BaseModel):
             "review",
             "done",
             "blocked",
-            "skipped",
+            "errored",  # Wave 1A — alinhado com DB CHECK (era 'skipped' divergente)
         ]
     ] = None
     operation_type: Optional[str] = Field(default=None, alias="operationType")

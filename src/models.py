@@ -115,7 +115,11 @@ class Task(CamelModel):
     goal_id: Optional[str] = None
     title: str
     description: str
-    status: Literal["backlog", "queued", "in_progress", "review", "done", "blocked", "skipped"]
+    # Wave 1A (AUDIT-011 do PRD-CONTRATOS): alinhado com DB CHECK `tasks_status_check`.
+    # Antes: `skipped` — divergia do banco que aceita `errored`. 7 tasks com errored
+    # nunca renderizavam status correto. VEC-420 resolvido. Callers que marcavam
+    # `skipped` (heartbeat_doctor SKIP_TASK fix) viraram `errored`.
+    status: Literal["backlog", "queued", "in_progress", "review", "done", "blocked", "errored"]
     # A.2 do ADR Fase A (decidido P10/P13 — 2026-05-17): catalog-driven.
     # `vectraclip.operation_types_catalog` é fonte de verdade (40+ tipos ativos).
     # Antes: Literal[...] hardcoded com 41 valores. Validação real vive em

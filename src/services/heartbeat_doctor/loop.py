@@ -344,9 +344,12 @@ async def handle_symptom(
     for fix in candidates:
         try:
             if fix == Fix.SKIP_TASK and agent_data.get("taskId") and client is not None:
-                client.table("tasks").update({"status": "skipped"}).eq(
-                    "id", agent_data["taskId"]
-                ).execute()
+                # Wave 1A: status 'errored' (era 'skipped' — divergia do DB CHECK).
+                # output_json.reason preserva semântica "skipped por incidente automático".
+                client.table("tasks").update({
+                    "status": "errored",
+                    "output_json": {"reason": "auto_skipped_by_heartbeat_doctor", "fix": str(fix)},
+                }).eq("id", agent_data["taskId"]).execute()
             else:
                 ok = await execute_fix(fix, agent_id, api_state)
                 if not ok:
