@@ -17,6 +17,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from src.services.llm_cost import calc_llm_cost
+
 logger = logging.getLogger("Athena")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,22 +43,23 @@ ATHENA_SCHEMA_VERSION = "v4.1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tabela de custos Gemini 2.5 Pro
-# Fonte: https://ai.google.dev/gemini-api/docs/pricing
-# Confirmar antes de cada commit em produção (preços mudam)
+# Cálculo de custo USD — catalog-driven (A.3 do ADR Fase A — 2026-05-17)
+#
+# ANTES: `_GEMINI_PRO_COST_PER_TOKEN` hardcoded com valores Pro ($1.25/$10.00
+# per 1M) — desalinhado do `ATHENA_DEFAULT_MODEL='gemini-2.5-flash'` real.
+# Resultado: cost_usd em todas as tasks Athena vinha ~16x super-estimado.
+#
+# DEPOIS: lookup contra `vectraclip.llm_models` (PK composta `(id, effective_from)`)
+# via `src/services/llm_cost.py:calc_llm_cost`. Custo agora coerente com o
+# modelo realmente usado. Regra de Ouro #2 (NO HARDCODE).
 # ─────────────────────────────────────────────────────────────────────────────
-_GEMINI_PRO_COST_PER_TOKEN = {
-    "input": 1.25 / 1_000_000,
-    "output": 10.00 / 1_000_000,
-}
+def _calc_cost(supabase: Any, tokens: Dict[str, int]) -> float:
+    """Calcula custo USD a partir do dict de tokens retornado pelo gemini_client.
 
-
-def _calc_cost(tokens: Dict[str, int]) -> float:
-    """Calcula custo USD a partir do dict de tokens retornado pelo gemini_client."""
-    return (
-        tokens.get("input", 0) * _GEMINI_PRO_COST_PER_TOKEN["input"]
-        + tokens.get("output", 0) * _GEMINI_PRO_COST_PER_TOKEN["output"]
-    )
+    Catalog-driven: lê preço do modelo `ATHENA_DEFAULT_MODEL` em `llm_models`.
+    Retorna 0.0 se supabase indisponível ou modelo não encontrado (fail-safe).
+    """
+    return calc_llm_cost(supabase, ATHENA_DEFAULT_MODEL, tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,7 +300,7 @@ async def _handle_classify(prompt: str, input_data: Dict[str, Any]) -> Dict[str,
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     logger.info(
         "athena-classify done task=%s goal=%s kind=%s confidence=%.2f case=%s tokens=%d cost=%.6f",
@@ -616,7 +619,7 @@ async def _handle_charter(prompt: str, input_data: Dict[str, Any]) -> Dict[str, 
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     logger.info(
         "athena-charter done task=%s goal=%s selection=%s tokens=%d cost=%.6f",
@@ -940,7 +943,7 @@ async def _handle_stakeholder_map(prompt: str, input_data: Dict[str, Any]) -> Di
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     logger.info(
         "athena-stakeholder-map done task=%s goal=%s stakeholders=%d tokens=%d cost=%.6f",
@@ -1265,7 +1268,7 @@ async def _handle_risk_register(prompt: str, input_data: Dict[str, Any]) -> Dict
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     risks_count = len(gemini_payload.get("risks", []))
     logger.info(
@@ -1845,7 +1848,7 @@ async def _handle_evm(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     logger.info(
         "athena-evm done task=%s goal=%s pv=%.2f ev=%.2f ac=%.2f cpi=%s spi=%s alerts=%d tokens=%d",
@@ -2199,7 +2202,7 @@ async def _handle_audit(prompt: str, input_data: Dict[str, Any]) -> Dict[str, An
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     logger.info(
         "athena-audit done task=%s scope=%s agents=%d below_threshold=%d tokens=%d",
@@ -2638,7 +2641,7 @@ async def _handle_recommend(prompt: str, input_data: Dict[str, Any]) -> Dict[str
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     try:
         from src.ws_manager import manager as _ws
@@ -3285,7 +3288,7 @@ async def _handle_prioritize(prompt: str, input_data: Dict[str, Any]) -> Dict[st
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
 
     logger.info(
         "athena-prioritize done task=%s goals=%d criteria=%d top=%s(%.2f) tokens=%d cost=%.6f",
@@ -3670,7 +3673,7 @@ async def _handle_onboarding(prompt: str, input_data: Dict[str, Any]) -> Dict[st
             "output": int(tk.get("output", 0) or 0),
             "total": int(tk.get("total", 0) or 0),
         }
-        cost = _calc_cost(tokens)
+        cost = _calc_cost(supabase, tokens)
     except Exception as exc:
         logger.warning("athena-onboarding gemini insights failed (degradando): %s", exc)
         insights_block = "## Insights iniciais\n\n_Não gerado nesta execução. Bloco será preenchido em consulta futura quando a Athena interpretar este perfil em contexto de Goal/Project._\n"
@@ -3941,7 +3944,7 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
              (result.get("metadata") or {}).get("tokens", {})
     cost_usd = result.get("cost_usd")
     if cost_usd is None:
-        cost_usd = _calc_cost(tokens)
+        cost_usd = _calc_cost(supabase, tokens)
 
     logger.info(
         "athena.execute_specialty done op=%s task=%s tokens=%s cost=%.6f",

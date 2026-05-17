@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from src.services.gemini_client import DEFAULT_MODEL, generate, stream_generate, extract_metadata, get_client
+from src.services.llm_cost import calc_llm_cost
 
 logger = logging.getLogger("Oracle")
 
@@ -195,7 +196,12 @@ async def stream_oracle_chat(payload: dict) -> AsyncIterator[str]:
 # Fase 2 — Daemon Oracle: execute_specialty + handlers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_GEMINI_FLASH_COST_PER_TOKEN = {"input": 0.075 / 1_000_000, "output": 0.30 / 1_000_000}
+# Cálculo de custo USD — catalog-driven (A.3 do ADR Fase A — 2026-05-17).
+# ANTES: `_GEMINI_FLASH_COST_PER_TOKEN` ($0.075/$0.30 per 1M) desalinhado do
+# `model="gemini-2.5-pro"` real usado (linha 741/760). Cost ~16x sub-estimado.
+# DEPOIS: lookup em `vectraclip.llm_models` via `src/services/llm_cost.py`.
+# Regra de Ouro #2 (NO HARDCODE).
+ORACLE_DEFAULT_MODEL = "gemini-2.5-pro"
 
 _VECTRA_CONTEXT = (
     "Contexto da empresa: Vectra Cargo é uma transportadora brasileira de modal EXCLUSIVAMENTE RODOVIÁRIO. "
@@ -206,11 +212,11 @@ _VECTRA_CONTEXT = (
 )
 
 
-def _calc_cost(tokens: Dict[str, int]) -> float:
-    return (
-        tokens.get("input", 0) * _GEMINI_FLASH_COST_PER_TOKEN["input"]
-        + tokens.get("output", 0) * _GEMINI_FLASH_COST_PER_TOKEN["output"]
-    )
+def _calc_cost(supabase: Any, tokens: Dict[str, int]) -> float:
+    """Calcula custo USD via lookup em `llm_models` pra ORACLE_DEFAULT_MODEL.
+    Retorna 0.0 se supabase indisponível ou modelo não encontrado (fail-safe).
+    """
+    return calc_llm_cost(supabase, ORACLE_DEFAULT_MODEL, tokens)
 
 
 async def _handle_extract(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -900,7 +906,7 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
         }
 
     tokens = (result.get("metadata") or {}).get("tokens", {})
-    cost_usd = _calc_cost(tokens)
+    cost_usd = _calc_cost(supabase, tokens)
     require_review = bool(input_data.get("require_human_review"))
 
     logger.info(
