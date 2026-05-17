@@ -61,13 +61,23 @@ logger = logging.getLogger("KronosPlanner")
 
 # ── Selectors mapeados na recon (VEC-416, 2026-05-12) ─────────────────────
 
-PLANNER_LANCAMENTOS_URL = (
-    "https://web.meuplannerfinanceiro.com.br/controle/lancamentos"
+# F5 N4: URL externa de SaaS (Meu Planner Financeiro) — endpoint canônico do produto.
+# Cai no P6 do CODE-PATTERNS (decisão registrada): SaaS terceiro com URL fixa,
+# não há catalog interno equivalente. Env override pra dev/staging.
+PLANNER_LANCAMENTOS_URL = os.getenv(
+    "KRONOS_PLANNER_URL",
+    "https://web.meuplannerfinanceiro.com.br/controle/lancamentos",
 )
-# Task #43 — Default recipient mantido como fallback do shared_config.
+
+# F5 N4 + N5: email pessoal era literal hardcoded. Mover pra env var.
+# Idealmente este recipient virá de agent_specialty_configs.values.recipient
+# (já é o caminho preferido — vide HermesReporter:319). Env é fallback dev/test.
 # `_HERMESREPORTER_AGENT_ID` REMOVIDO — handoff agora é Step 3 do workflow
 # kronos-planner-flow (relacional, via specialty_slug='oracle-report').
-_DEFAULT_REPORT_RECIPIENT = "marcelo.rosas@vectracargo.com.br"
+_DEFAULT_REPORT_RECIPIENT = os.getenv(
+    "KRONOS_DEFAULT_REPORT_RECIPIENT",
+    "marcelo.rosas@vectracargo.com.br",  # fallback dev
+)
 
 # VEC-423: categorização inline pós-import
 _DEFAULT_RULES_PATH = Path(__file__).parent / "kronos_category_rules.yaml"

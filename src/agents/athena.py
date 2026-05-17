@@ -325,7 +325,7 @@ async def _handle_classify(prompt: str, input_data: Dict[str, Any]) -> Dict[str,
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     logger.info(
         "athena-classify done task=%s goal=%s kind=%s confidence=%.2f case=%s tokens=%d cost=%.6f",
@@ -644,7 +644,7 @@ async def _handle_charter(prompt: str, input_data: Dict[str, Any]) -> Dict[str, 
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     logger.info(
         "athena-charter done task=%s goal=%s selection=%s tokens=%d cost=%.6f",
@@ -968,7 +968,7 @@ async def _handle_stakeholder_map(prompt: str, input_data: Dict[str, Any]) -> Di
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     logger.info(
         "athena-stakeholder-map done task=%s goal=%s stakeholders=%d tokens=%d cost=%.6f",
@@ -1293,7 +1293,7 @@ async def _handle_risk_register(prompt: str, input_data: Dict[str, Any]) -> Dict
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     risks_count = len(gemini_payload.get("risks", []))
     logger.info(
@@ -1873,7 +1873,7 @@ async def _handle_evm(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     logger.info(
         "athena-evm done task=%s goal=%s pv=%.2f ev=%.2f ac=%.2f cpi=%s spi=%s alerts=%d tokens=%d",
@@ -2227,7 +2227,7 @@ async def _handle_audit(prompt: str, input_data: Dict[str, Any]) -> Dict[str, An
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     logger.info(
         "athena-audit done task=%s scope=%s agents=%d below_threshold=%d tokens=%d",
@@ -2666,7 +2666,7 @@ async def _handle_recommend(prompt: str, input_data: Dict[str, Any]) -> Dict[str
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     try:
         from src.ws_manager import manager as _ws
@@ -3313,7 +3313,7 @@ async def _handle_prioritize(prompt: str, input_data: Dict[str, Any]) -> Dict[st
     }
     tokens["total"] = tokens["input"] + tokens["output"]
     envelope["metadata"] = {"tokens": tokens}
-    cost_usd = _calc_cost(supabase, tokens)
+    cost_usd = _calc_cost(supabase, _resolve_model(input_data), tokens)
 
     logger.info(
         "athena-prioritize done task=%s goals=%d criteria=%d top=%s(%.2f) tokens=%d cost=%.6f",
@@ -3698,7 +3698,7 @@ async def _handle_onboarding(prompt: str, input_data: Dict[str, Any]) -> Dict[st
             "output": int(tk.get("output", 0) or 0),
             "total": int(tk.get("total", 0) or 0),
         }
-        cost = _calc_cost(supabase, tokens)
+        cost = _calc_cost(supabase, _resolve_model(input_data), tokens)
     except Exception as exc:
         logger.warning("athena-onboarding gemini insights failed (degradando): %s", exc)
         insights_block = "## Insights iniciais\n\n_Não gerado nesta execução. Bloco será preenchido em consulta futura quando a Athena interpretar este perfil em contexto de Goal/Project._\n"

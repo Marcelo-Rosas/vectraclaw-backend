@@ -14,6 +14,23 @@ class CamelModel(BaseModel):
         alias_generator = to_camel
         validate_by_name = True  # pydantic v2.13+ (replaces allow_population_by_field_name)
 
+
+# F5 N10 (2026-05-17): mapping LEGADO de DB-internal adapter_type values para
+# slugs canônicos do adapter_catalog atual. NÃO é hardcode de catalog — são
+# valores HISTÓRICOS de antes do adapter_catalog existir (rows antigas em
+# vectraclip.agents ainda têm adapter_type='cursor', 'bot', 'claude', 'internal').
+# Consumido em Agent.to_zod_dict pra normalizar serialização ao frontend.
+# Quando todas as rows antigas forem migradas (DB cleanup futuro), este dict
+# fica letra-morta e pode ser dropado. Cai no P6 do CODE-PATTERNS — decisão
+# registrada (legacy compat, não duplicação ativa de catálogo).
+_LEGACY_ADAPTER_SLUG_MAP = {
+    "cursor": "codex",
+    "bot": "shell",
+    "claude": "claude_code",
+    "internal": "claude_code",  # Oracle system agent legacy slug
+}
+
+
 class Agent(CamelModel):
     id: str
     company_id: str
@@ -65,16 +82,16 @@ class Agent(CamelModel):
         if "updatedAt" in d:
             del d["updatedAt"]
 
-        # Reverse-map DB-internal values to Zod enum values.
-        # 'internal' (Oracle system agent) maps to claude_code in the Zod schema.
-        _adapter_reverse = {
-            "cursor": "codex",
-            "bot": "shell",
-            "claude": "claude_code",
-            "internal": "claude_code",
-        }
-        if d.get("adapterType") in _adapter_reverse:
-            d["adapterType"] = _adapter_reverse[d["adapterType"]]
+        # Reverse-map DB-internal LEGACY values to Zod enum values.
+        # F5 N10 (2026-05-17): movido pra constante module-level _LEGACY_ADAPTER_SLUG_MAP
+        # (vide topo do arquivo). Aqui só consume. Dict NÃO duplica adapter_catalog —
+        # são valores históricos pré-adapter_catalog que ainda aparecem em rows
+        # antigas (cursor/bot/claude/internal). Quando uma row tem adapter_type
+        # nesses valores legados, normaliza pro slug atual antes de serializar
+        # pro frontend (Zod aceita string livre desde VEC-319 — esse mapping é
+        # cleanup cosmético pra alinhar UI).
+        if d.get("adapterType") in _LEGACY_ADAPTER_SLUG_MAP:
+            d["adapterType"] = _LEGACY_ADAPTER_SLUG_MAP[d["adapterType"]]
 
         # Zod expects string (not null) for optional text fields
         if d.get("systemPrompt") is None:
