@@ -708,6 +708,10 @@ class OperationType(CamelModel):
     primary_agent_id: Optional[str] = None
     default_specialty_slug: Optional[str] = None
     is_active: bool = True
+    # A.4 do ADR Fase A (P13 Opção 1 — 2026-05-17): score 0-100 do Decision Engine
+    # (CMA × Harness). Default 60 = "lean CMA". Lido por decision_engine.py via
+    # helper _load_operation_type_routing_scores (cache 60s). Regra de Ouro #2.
+    routing_score: int = 60
 
     def to_zod_dict(self):
         d = self.dict(by_alias=True)
