@@ -6346,6 +6346,92 @@ def _validate_operation_type(value: Any) -> str:
     return v
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# W3 — Validators catalog-driven (Regra Ouro #2): connector_session_statuses,
+# connector_channels, prospect_statuses. Mesmo shape de _OPERATION_TYPE_CACHE
+# (cache 60s + log de drift). Cada catalog tem cache próprio porque TTLs
+# poderiam divergir no futuro e a invariante de log "added/removed" precisa
+# de previous por catalog.
+# ──────────────────────────────────────────────────────────────────────────
+_W3_CATALOG_CACHES: Dict[str, Dict[str, Any]] = {
+    "connector_session_statuses": {"slugs": None, "fetched_at": 0.0},
+    "connector_channels": {"slugs": None, "fetched_at": 0.0},
+    "prospect_statuses": {"slugs": None, "fetched_at": 0.0},
+}
+_W3_CATALOG_TTL_S = 60.0
+
+
+def _load_catalog_slugs(table: str) -> set:
+    """Lê slugs de um catalog cross-tenant (PK text slug) cacheado 60s.
+    Set vazio se supabase indisponível: skip validation gracioso (FK no DB
+    rejeita slug inválido no INSERT — segunda linha de defesa). Catalog-driven."""
+    import time
+    if table not in _W3_CATALOG_CACHES:
+        return set()
+    now = time.time()
+    cache = _W3_CATALOG_CACHES[table]
+    cached = cache.get("slugs")
+    if cached is not None and (now - cache.get("fetched_at", 0.0)) < _W3_CATALOG_TTL_S:
+        return cached
+    if not supabase:
+        return set()
+    try:
+        res = (
+            supabase.table(table)
+            .select("slug")
+            .eq("is_active", True)
+            .execute()
+        )
+        rows = res.data or []
+        slugs = {str(r["slug"]) for r in rows if r.get("slug")}
+        previous = cache.get("slugs")
+        if previous is None:
+            logger.info("w3_catalog cache primed: table=%s count=%d", table, len(slugs))
+        elif previous != slugs:
+            added = slugs - previous
+            removed = previous - slugs
+            logger.warning(
+                "w3_catalog cache changed: table=%s added=%s removed=%s",
+                table, sorted(added), sorted(removed),
+            )
+        cache["slugs"] = slugs
+        cache["fetched_at"] = now
+        return slugs
+    except Exception as e:
+        logger.warning(f"_load_catalog_slugs(%s) fallback: %s", table, e)
+        return set()
+
+
+def _validate_catalog_slug(value: Any, table: str, default: Optional[str] = None) -> Optional[str]:
+    """Normaliza + valida slug contra catalog. Se default informado, None vira default.
+    Se default None, None passa. Set vazio (cache miss) também passa — FK no DB pega."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    v = str(value).strip()
+    valid = _load_catalog_slugs(table)
+    if valid and v not in valid:
+        raise ValueError(
+            f"unknown_{table}_slug: '{v}' (válidos: {sorted(valid)}) — "
+            f"adicione row em vectraclip.{table} antes de usar"
+        )
+    return v
+
+
+def _validate_connector_session_status(value: Any) -> str:
+    return _validate_catalog_slug(value, "connector_session_statuses", default="open") or "open"
+
+
+def _validate_connector_channel(value: Any) -> str:
+    v = _validate_catalog_slug(value, "connector_channels", default=None)
+    if not v:
+        raise ValueError("connector_channel_required")
+    return v
+
+
+def _validate_prospect_status(value: Any) -> str:
+    return _validate_catalog_slug(value, "prospect_statuses", default="COLD") or "COLD"
+
+
 class AgentExecutionSetupInput(BaseModel):
     # str + validator que normaliza UPPER + valida contra catalog
     # `vectraclip.agent_execution_modes`. Sem Literal — o catalog cresce
@@ -9070,6 +9156,7 @@ from src.api_routes import athena as _athena_routes  # noqa: E402
 from src.api_routes import sipoc_taxonomy as _sipoc_taxonomy_routes  # noqa: E402
 from src.api_routes import admin as _admin_routes  # noqa: E402
 from src.api_routes import sipoc_diagnose as _sipoc_diagnose_routes  # noqa: E402
+from src.api_routes import connectors as _connectors_routes  # noqa: E402  # W3 PRD Fundação
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -9084,4 +9171,5 @@ app.include_router(_athena_routes.router)
 app.include_router(_sipoc_taxonomy_routes.router)
 app.include_router(_admin_routes.router)
 app.include_router(_sipoc_diagnose_routes.router)
+app.include_router(_connectors_routes.router)  # W3 PRD Fundação Orchestration
 

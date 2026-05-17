@@ -1182,3 +1182,88 @@ class ResearchTemplate(CamelModel):
 
     def to_zod_dict(self):
         return self.dict(by_alias=True)
+
+
+# =====================================================================
+# W3 — PRD Fundação Orchestration: ConnectorSession + Prospect (GymSite)
+# Regra Ouro #2: status/channel são `str` (NÃO Literal[...]). Validação
+# real fica em src/api.py via _validate_connector_*/_validate_prospect_status
+# chamados pelos input models de POST/PATCH. Coexistência intencional com
+# ProspectProfile (Oracle research) — propósitos distintos, tabelas distintas.
+# =====================================================================
+
+class ConnectorSession(CamelModel):
+    """Sessão de conversa de canal externo (Navi/WhatsApp, Hermes/email, etc).
+    Tabela vectraclip.connector_sessions (migration 20260517230000).
+    Channel/status validados contra catalog (regra #2)."""
+    id: str
+    company_id: str
+    # FK pra vectraclip.connector_channels(slug)
+    channel: str
+    connector_id: str
+    external_id: str
+    external_name: Optional[str] = None
+    external_meta: Optional[Dict[str, Any]] = None
+    # FK pra vectraclip.connector_session_statuses(slug). Default 'open'
+    status: str = "open"
+    last_message: Optional[str] = None
+    last_message_at: Optional[str] = None
+    active_task_id: Optional[str] = None
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    routed_to_agent: Optional[str] = None
+    routing_score: Optional[int] = None
+    opened_at: Optional[str] = None
+    closed_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+
+class Prospect(CamelModel):
+    """Lead RFB monitoring (GymSite product). Tabela vectraclip.prospects
+    (migration 20260517240000). Distinto de ProspectProfile (Oracle research).
+    Status validado contra vectraclip.prospect_statuses (regra #2)."""
+    id: str
+    company_id: str
+    cnpj: str
+    razao_social: Optional[str] = None
+    nome_fantasia: Optional[str] = None
+    cnae_fiscal: str = "9313100"
+    cnae_descricao: Optional[str] = None
+    data_abertura: Optional[str] = None
+    situacao_cadastral: Optional[str] = None
+    logradouro: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    municipio: Optional[str] = None
+    uf: Optional[str] = None
+    cep: Optional[str] = None
+    telefone: Optional[str] = None
+    email: Optional[str] = None
+    socios: List[Dict[str, Any]] = Field(default_factory=list)
+    capital_social: Optional[float] = None
+    natureza_juridica: Optional[str] = None
+    porte: Optional[str] = None
+    score_prospeccao: Optional[int] = None
+    score_breakdown: Optional[Dict[str, Any]] = None
+    # FK pra vectraclip.prospect_statuses(slug). Default 'COLD'
+    status: str = "COLD"
+    oracle_research: Optional[Dict[str, Any]] = None
+    oracle_task_id: Optional[str] = None
+    source: str = "cnpj-monitor"
+    source_batch: Optional[str] = None
+    dias_aberto: Optional[int] = None
+    contacted_at: Optional[str] = None
+    # FK pra vectraclip.contact_channels(slug). NULL até primeiro contato.
+    contacted_via: Optional[str] = None
+    contact_notes: Optional[str] = None
+    captured_at: Optional[str] = None
+    converted_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)

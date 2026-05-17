@@ -75,6 +75,12 @@ ATHENA_AGENT_ID = "ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d"
 DAEDALUS_AGENT_ID = "d4ed4145-0000-4000-8000-000000000005"
 """Daedalus: bpmn-modeling. Em retrofit (memory `agent-hiring-ritual`)."""
 
+GYMSITE_AGENT_ID = "917e51b3-9413-4000-8000-000000000006"
+"""GymSite: prospecção de academias (CNAE 9313-1/00). Nome técnico do produto,
+sem persona mitológica. UUID v4 temático (gym) grepável. Registrado em
+vectraclip.agents pelo seed 20260517250000_gymsite_seed.sql. operation_types:
+gymsite-prospect-scan, gymsite-enrich-lead, gymsite-location-roi."""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience map para iteração (ex: start_all_daemons, dashboards)
@@ -92,4 +98,5 @@ ALL_AGENT_IDS = {
     "Kronos": KRONOS_AGENT_ID,
     "Athena": ATHENA_AGENT_ID,
     "Daedalus": DAEDALUS_AGENT_ID,
+    "GymSite": GYMSITE_AGENT_ID,
 }
