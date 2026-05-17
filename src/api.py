@@ -787,6 +787,11 @@ async def auth_middleware(request: Request, call_next):
         "/sw.js",
         "/mockServiceWorker.js",
         "/login",
+        # W3.1 — Meta WhatsApp Cloud API webhook. NUNCA tem JWT Supabase (callback
+        # externo). Auth real é hub.verify_token (GET) + HMAC X-Hub-Signature-256
+        # (POST) verificados dentro do handler contra agent_adapter_configs.
+        "/api/connectors/whatsapp/webhook",
+        "/connectors/whatsapp/webhook",
     ]
     if any(path == p for p in public_paths):
         return await call_next(request)
