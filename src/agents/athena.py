@@ -29,37 +29,62 @@ logger = logging.getLogger("Athena")
 # NUNCA alterar — quebraria a FK em milhares de tasks futuras.
 from src.agent_ids import ATHENA_AGENT_ID, MNEMOS_AGENT_ID  # SSOT — ver src/agent_ids.py
 
-# Modelo Gemini default para Athena.
-# VEC-399 smoke 2026-05-11: gemini-2.5-pro EXIGE thinking_config.thinking_budget>0
-# e o wrapper gemini_client.generate força thinking_budget=0 ("custo mínimo em chat"),
-# causando "Budget 0 is invalid. This model only works in thinking mode" no handler.
-# Workaround: usar gemini-2.5-flash (aceita budget=0) para todos handlers Athena por
-# enquanto. Fix robusto (parametrizar thinking_budget em gemini_client.generate)
-# fica para PR follow-up — afeta TODOS os agents, escopo separado.
-ATHENA_DEFAULT_MODEL = "gemini-2.5-flash"
-
 # Versão dos schemas Pydantic de output (para validation.schema_version)
 ATHENA_SCHEMA_VERSION = "v4.1"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cálculo de custo USD — catalog-driven (A.3 do ADR Fase A — 2026-05-17)
+# F2 do GSD ampliado (2026-05-17): `ATHENA_DEFAULT_MODEL` hardcoded foi aposentado.
+# Modelo agora vem 100% do catalog via cadeia: input_json > agent_specialty_configs.values >
+# agent_shared_config.values > agent_specialties.config_schema.defaults. Helper abaixo
+# resolve em 1 chamada. Handler deve passar `input_data` (recebido em execute_specialty).
 #
-# ANTES: `_GEMINI_PRO_COST_PER_TOKEN` hardcoded com valores Pro ($1.25/$10.00
-# per 1M) — desalinhado do `ATHENA_DEFAULT_MODEL='gemini-2.5-flash'` real.
-# Resultado: cost_usd em todas as tasks Athena vinha ~16x super-estimado.
-#
-# DEPOIS: lookup contra `vectraclip.llm_models` (PK composta `(id, effective_from)`)
-# via `src/services/llm_cost.py:calc_llm_cost`. Custo agora coerente com o
-# modelo realmente usado. Regra de Ouro #2 (NO HARDCODE).
-# ─────────────────────────────────────────────────────────────────────────────
-def _calc_cost(supabase: Any, tokens: Dict[str, int]) -> float:
-    """Calcula custo USD a partir do dict de tokens retornado pelo gemini_client.
+# Histórico do antigo `gemini-2.5-pro EXIGE thinking_config.thinking_budget>0`:
+# se voltar a quebrar com modelo gemini-2.5-pro, fix é parametrizar thinking_budget
+# em gemini_client.generate (escopo separado — afeta todos agentes).
 
-    Catalog-driven: lê preço do modelo `ATHENA_DEFAULT_MODEL` em `llm_models`.
-    Retorna 0.0 se supabase indisponível ou modelo não encontrado (fail-safe).
+
+def _resolve_model(input_data: Dict[str, Any]) -> str:
+    """Resolve model_id da cadeia catalog-driven (Regra de Ouro #2 NO HARDCODE).
+
+    Cadeia de precedência (ver specialty_resolver.resolve_value):
+        1. input_data["model_id"]                   (override por execução)
+        2. input_data["_resolved_config"]["model_id"] (agent_specialty_configs.values)
+        3. input_data["_resolved_shared"]["model_id"] (agent_shared_config.values)
+        4. input_data["_resolved_specialty"].defaults["model_id"] (config_schema default)
+
+    Raise ValueError se nada resolver — caller decide se isso é fatal ou
+    se há env_default específico do contexto.
     """
-    return calc_llm_cost(supabase, ATHENA_DEFAULT_MODEL, tokens)
+    from src.services.specialty_resolver import resolve_value
+
+    specialty = input_data.get("_resolved_specialty")
+    specialty_defaults = specialty.defaults if specialty else {}
+
+    model = resolve_value(
+        "model_id",
+        payload=input_data,
+        config_values=input_data.get("_resolved_config") or {},
+        shared_values=input_data.get("_resolved_shared") or {},
+        specialty_defaults=specialty_defaults,
+    )
+    if not model:
+        raise ValueError(
+            "Athena: model_id não resolvido pela cadeia catalog. "
+            "Configure 'model_id' em agent_specialty_configs.values "
+            "(via UI /admin/agents/{id}/specialty-config) ou em "
+            "agent_shared_config.values, ou defina default em "
+            "agent_specialties.config_schema."
+        )
+    return str(model)
+
+
+def _calc_cost(supabase: Any, model: str, tokens: Dict[str, int]) -> float:
+    """Calcula custo USD do modelo recebido (catalog-driven via llm_models).
+
+    F2 do GSD: param `model` agora obrigatório. Antes era hardcoded em
+    `ATHENA_DEFAULT_MODEL` — drift garantido vs modelo realmente usado quando
+    user configurasse outro modelo via UI.
+    """
+    return calc_llm_cost(supabase, model, tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,7 +237,7 @@ async def _handle_classify(prompt: str, input_data: Dict[str, Any]) -> Dict[str,
 
     try:
         text, metadata = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=system_instruction,
             response_mime_type="application/json",
@@ -556,7 +581,7 @@ async def _handle_charter(prompt: str, input_data: Dict[str, Any]) -> Dict[str, 
     user_prompt = _build_charter_prompt(goal, company_context, rag_chunks)
     try:
         text, metadata = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=_CHARTER_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -882,7 +907,7 @@ async def _handle_stakeholder_map(prompt: str, input_data: Dict[str, Any]) -> Di
     user_prompt = _build_stakeholder_map_prompt(goal, company_context, rag_chunks, stakeholders_hint)
     try:
         text, metadata = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=_STAKEHOLDER_MAP_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -1208,7 +1233,7 @@ async def _handle_risk_register(prompt: str, input_data: Dict[str, Any]) -> Dict
     user_prompt = _build_risk_register_prompt(goal, company_context, rag_chunks)
     try:
         text, metadata = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=_RISK_REGISTER_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -1779,7 +1804,7 @@ async def _handle_evm(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]
     user_prompt = _build_evm_prompt(goal, metrics, deterministic_alerts, interpretation_period)
     try:
         text, llm_meta = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=_EVM_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -2138,7 +2163,7 @@ async def _handle_audit(prompt: str, input_data: Dict[str, Any]) -> Dict[str, An
     user_prompt = _build_audit_prompt(scorecards, rag_chunks, scope)
     try:
         text, llm_meta = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=_AUDIT_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -2519,7 +2544,7 @@ async def _handle_recommend(prompt: str, input_data: Dict[str, Any]) -> Dict[str
     )
     try:
         text, llm_meta = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=_RECOMMEND_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -3176,7 +3201,7 @@ async def _handle_prioritize(prompt: str, input_data: Dict[str, Any]) -> Dict[st
     user_prompt = _build_prioritize_prompt(goals, criteria, scope_note)
     try:
         text, llm_meta = await gemini_generate(
-            ATHENA_DEFAULT_MODEL,
+            _resolve_model(input_data),
             user_prompt,
             system_instruction=_PRIORITIZE_SYSTEM_PROMPT,
             response_mime_type="application/json",
@@ -3664,7 +3689,7 @@ async def _handle_onboarding(prompt: str, input_data: Dict[str, Any]) -> Dict[st
         gen_result = await asyncio.to_thread(
             gemini_generate,
             insight_prompt,
-            model=ATHENA_DEFAULT_MODEL,
+            model=_resolve_model(input_data),
         )
         insights_block = (gen_result.get("text") or "").strip()
         tk = gen_result.get("tokens") or {}
@@ -3899,13 +3924,21 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
             "status_override": "blocked",
         }
 
-    # Enriquecimento do input com handles que os handlers reais (PR3+) vão precisar
+    # Enriquecimento do input com handles que os handlers reais (PR3+) vão precisar.
+    # F2 GSD ampliado (2026-05-17): PROPAGA _resolved_* (config/shared/specialty)
+    # populados pelo daemon (_populate_resolved_specialty). Antes, esses campos
+    # eram populados mas Athena execute_specialty descartava ao montar enriched_input
+    # — handlers ficavam cegos ao agent_specialty_configs.values (UI placebo).
+    # Agora _resolve_model(input_data) consome essa cadeia catalog-driven.
     enriched_input = {
         **input_data,
         "_supabase": supabase,
         "_company_id": task.get("company_id"),
         "_task_id": task.get("id"),
         "_agent_id": ATHENA_AGENT_ID,
+        "_resolved_config": task.get("_resolved_config") or {},
+        "_resolved_shared": task.get("_resolved_shared") or {},
+        "_resolved_specialty": task.get("_resolved_specialty"),
     }
 
     try:
@@ -3943,7 +3976,13 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
              (result.get("metadata") or {}).get("tokens", {})
     cost_usd = result.get("cost_usd")
     if cost_usd is None:
-        cost_usd = _calc_cost(supabase, tokens)
+        # F2: model resolvido via cadeia catalog. Se nada resolver (handler falhou
+        # cedo sem chegar a definir model_used em metadata), passa string vazia →
+        # calc_llm_cost retorna 0 fail-safe.
+        model_used = (output_json.get("metadata") or {}).get("model_used") \
+            or (result.get("metadata") or {}).get("model_used") \
+            or ""
+        cost_usd = _calc_cost(supabase, model_used, tokens) if model_used else 0.0
 
     logger.info(
         "athena.execute_specialty done op=%s task=%s tokens=%s cost=%.6f",

@@ -815,19 +815,13 @@ class ResilientHarnessDaemon:
 
         meta = (result.get("output_json") or {}).get("metadata") or {}
         tokens = meta.get("tokens") or {}
-        model_used = meta.get("model_used") or "gemini-2.5-flash"
-        # Normalize preview suffixes and research agents to registered llm_models IDs
-        _mu = model_used.lower()
-        if "deep-research" in _mu:
-            model_id = "gemini-2.5-pro"   # deep-research runs on 2.5-pro tier
-        elif "gemini-2.5-flash" in _mu:
-            model_id = "gemini-2.5-flash"
-        elif "gemini-2.5-pro" in _mu:
-            model_id = "gemini-2.5-pro"
-        elif "gemini-2.0-flash" in _mu:
-            model_id = "gemini-2.0-flash"
-        else:
-            model_id = "gemini-2.5-flash"  # safe fallback — never use raw model_used
+        # F2 GSD (2026-05-17): drop chain elif hardcoded de model normalization.
+        # Handler agora resolve model_id via catalog (`_resolve_model(input_data)`)
+        # e seta `metadata.model_used = resolved_model` antes do return — trust direto.
+        # Cost calc usa lookup em llm_models (id é PK), aceita string vazia fail-safe.
+        # Se aparecer suffix legacy (deep-research-*), fica como historic raw — não
+        # tentar normalizar em allowlist hardcoded (era violação Regra Ouro #2).
+        model_id = meta.get("model_used") or ""
 
         cost_usd = round(float(result.get("cost_usd") or 0.0), 8)
         company_id = task.get("company_id")
