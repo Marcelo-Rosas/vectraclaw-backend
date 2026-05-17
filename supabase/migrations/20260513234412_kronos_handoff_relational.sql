@@ -41,16 +41,26 @@ delete from vectraclip.agent_specialty_configs
    and agent_id = '00000000-0000-0000-0000-000000000002';  -- Oracle UUID
 
 -- Adiciona atribuição correta (Hermes Reporter — executor real)
-insert into vectraclip.agent_specialty_configs
-  (company_id, agent_id, specialty_id, values)
-values
-  ('01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2',
-   '360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1',
-   'oracle-report',
-   '{}'::jsonb)
-on conflict (agent_id, specialty_id) do update
-  set values = excluded.values,
-      updated_at = now();
+do $$
+begin
+  if not exists (
+    select 1 from vectraclip.agents
+    where id = '360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1'
+  ) then
+    raise notice 'oracle-report → Hermes Reporter skipped: agent ausente (shadow/replay OK)';
+    return;
+  end if;
+  insert into vectraclip.agent_specialty_configs
+    (company_id, agent_id, specialty_id, values)
+  values
+    ('01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2',
+     '360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1',
+     'oracle-report',
+     '{}'::jsonb)
+  on conflict (agent_id, specialty_id) do update
+    set values = excluded.values,
+        updated_at = now();
+end $$;
 
 -- ════════════════════════════════════════════════════════════════════════════
 -- 2. Workflow `kronos-planner-flow` ganha Step 3 (Hermes Report)

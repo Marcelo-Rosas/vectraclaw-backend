@@ -50,16 +50,23 @@ BEGIN
   END LOOP;
 END $$;
 
--- Verificação: ao menos 1 row foi inserida (em Vectra Cargo)
+-- Verificação: falha só se há companies mas Mnemos não foi inserido.
+-- Shadow DB do `db pull` reaplica migrations sem seed de companies → skip OK.
 DO $$
 DECLARE v_count int;
+DECLARE v_companies int;
 BEGIN
+  SELECT count(*) INTO v_companies FROM vectraclip.companies;
   SELECT count(*) INTO v_count FROM vectraclip.agents
   WHERE id = '00000000-0000-0000-0000-000000000003';
-  IF v_count = 0 THEN
-    RAISE EXCEPTION 'Mnemos seed falhou: 0 rows em vectraclip.agents. Existem companies cadastradas?';
+  IF v_companies > 0 AND v_count = 0 THEN
+    RAISE EXCEPTION 'Mnemos seed falhou: 0 rows em vectraclip.agents com % companies cadastradas', v_companies;
   END IF;
-  RAISE NOTICE 'Mnemos registrado em % company(ies)', v_count;
+  IF v_count > 0 THEN
+    RAISE NOTICE 'Mnemos registrado em % company(ies)', v_count;
+  ELSE
+    RAISE NOTICE 'Mnemos seed skipped: nenhuma company ainda (shadow/replay OK)';
+  END IF;
 END $$;
 
 NOTIFY pgrst, 'reload schema';

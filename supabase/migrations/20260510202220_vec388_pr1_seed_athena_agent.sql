@@ -72,16 +72,21 @@ BEGIN
 
   END LOOP;
 
-  IF NOT EXISTS (SELECT 1 FROM vectraclip.agents WHERE id = v_athena_id) THEN
-    RAISE EXCEPTION 'Seed Athena falhou: nenhuma linha em vectraclip.agents';
-  END IF;
+  -- Shadow DB do `db pull` não tem companies → skip verificação (remoto com tenants OK).
+  IF (SELECT count(*) FROM vectraclip.companies) = 0 THEN
+    RAISE NOTICE 'Seed Athena skipped: nenhuma company ainda (shadow/replay OK)';
+  ELSE
+    IF NOT EXISTS (SELECT 1 FROM vectraclip.agents WHERE id = v_athena_id) THEN
+      RAISE EXCEPTION 'Seed Athena falhou: nenhuma linha em vectraclip.agents';
+    END IF;
 
-  IF (SELECT count(*) FROM vectraclip.agent_specialty_configs WHERE agent_id = v_athena_id) = 0 THEN
-    RAISE EXCEPTION 'Seed Athena falhou: nenhuma linha em vectraclip.agent_specialty_configs';
-  END IF;
+    IF (SELECT count(*) FROM vectraclip.agent_specialty_configs WHERE agent_id = v_athena_id) = 0 THEN
+      RAISE EXCEPTION 'Seed Athena falhou: nenhuma linha em vectraclip.agent_specialty_configs';
+    END IF;
 
-  RAISE NOTICE 'Seed Athena OK: % company(ies) processed',
-    (SELECT count(DISTINCT company_id) FROM vectraclip.agents WHERE id = v_athena_id);
+    RAISE NOTICE 'Seed Athena OK: % company(ies) processed',
+      (SELECT count(DISTINCT company_id) FROM vectraclip.agents WHERE id = v_athena_id);
+  END IF;
 
 END $$;
 

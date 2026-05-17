@@ -302,6 +302,11 @@ declare
   v_company_id  uuid := '01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2';
   v_kronos_id   uuid := '9c8d7e6f-5a4b-4321-9876-543210fedcba';
 begin
+  -- Shadow DB do `db pull` não tem agents seed → skip sem falhar FK.
+  if not exists (select 1 from vectraclip.agents where id = v_kronos_id) then
+    raise notice 'Kronos specialty configs skipped: agent % ausente (shadow/replay OK)', v_kronos_id;
+    return;
+  end if;
   insert into vectraclip.agent_specialty_configs
     (company_id, agent_id, specialty_id, values)
   values
