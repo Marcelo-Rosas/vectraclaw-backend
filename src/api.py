@@ -6221,6 +6221,74 @@ async def upsert_company_secret(request: Request, company_id: str, payload: Comp
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# W4 — Secret Management Integration via Supabase Vault.
+# Convenção: valores `vault://<vault_secret_id>` em field_values_json (JSONB)
+# são REFs pra vault.secrets. Helper abaixo resolve ref → valor real (lendo
+# vault.decrypted_secrets que retorna texto claro via service_role).
+# Frontend usa POST /api/companies/{id}/secrets ao salvar field secret e
+# substitui valor por ref antes de gravar agent_adapter_configs.
+# ──────────────────────────────────────────────────────────────────────────
+
+VAULT_REF_PREFIX = "vault://"
+
+
+def _is_vault_ref(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(VAULT_REF_PREFIX) and len(value) > len(VAULT_REF_PREFIX)
+
+
+def resolve_secret_ref(value: Any, company_id: str) -> Optional[str]:
+    """Se `value` for ref `vault://<uuid>`, lê texto claro de
+    vault.decrypted_secrets validando que o secret pertence à company.
+    Se for string normal, retorna value como está. Retorna None se inválido
+    (ref órfão, company mismatch, supabase down).
+
+    Caller usa este helper TODA vez que ler um secret field do field_values_json.
+    Nunca exponha o valor decifrado em log/response — só em hand-off pra biblioteca
+    (ex: hmac.new(<secret>, ...)).
+    """
+    if value is None:
+        return None
+    if not _is_vault_ref(value):
+        # Backwards-compat: string crua (configs legados) ou int/bool — devolve.
+        return str(value) if isinstance(value, (str, int, float)) else None
+    if not supabase:
+        return None
+    secret_id = value[len(VAULT_REF_PREFIX):].strip()
+    if not secret_id:
+        return None
+    try:
+        # Confirmar ownership: company_secrets é fronteira per-tenant; mesmo que
+        # o caller já tenha company_id correto, double-check (defense in depth).
+        owner = (
+            supabase.table("company_secrets")
+            .select("vault_secret_id,company_id")
+            .eq("vault_secret_id", secret_id)
+            .eq("company_id", company_id)
+            .limit(1)
+            .execute()
+        )
+        if not owner.data:
+            logger.warning("resolve_secret_ref: vault_secret_id=%s not owned by company_id=%s",
+                           secret_id[:8], company_id)
+            return None
+        # Lê valor claro do Vault (service_role tem acesso a vault.decrypted_secrets).
+        res = (
+            supabase.schema("vault")
+            .table("decrypted_secrets")
+            .select("decrypted_secret")
+            .eq("id", secret_id)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return None
+        return str(res.data[0].get("decrypted_secret") or "")
+    except Exception as e:
+        logger.error("resolve_secret_ref failed for ref=%s: %s", value[:20], e)
+        return None
+
+
 # Cache TTL curto pra evitar round-trip por PUT mas refletir mudanças
 # no catalog em <60s sem restart. Idempotente — ignorado se supabase=None.
 _EXECUTION_MODE_CACHE: Dict[str, Any] = {"ids": None, "default": None, "fetched_at": 0.0}
