@@ -158,3 +158,27 @@ Sem isso, o ciclo PMBOK fica em "Execução = manual" (gap mapeado na seção "M
 7. **B8** — display.ts massive refactor (último — mais arquivo tocado)
 
 A7 (Agent.status) e A10 (NewAdapterFieldInput.fieldType) precisam **decisão antes** de implementar: vira catálogo ou fica local (P6 do CODE-PATTERNS)?
+
+---
+
+## ⏸️ INTENTIONAL BROKEN — "Gerar rascunho de resposta" Hermes (2026-05-17)
+
+**Componente:** `VectraClip/src/components/agents/InboxDigest.tsx`
+**Sintoma original (relatado por Marcelo 2026-05-17):** botão "Gerar rascunho de resposta" mostrava toast `"Rascunho gerado para '<subject>'"` mas NÃO criava rascunho real — UI mentia ao usuário.
+
+**Diagnóstico:**
+- Frontend: função `generateDraft()` era `toast.success(...)` puro, zero backend call
+- Backend: NÃO existe `POST /api/hermes/inbox/{email_id}/draft` (grep confirmado)
+- Feature foi planejada na UI sem nunca conectar executor real
+
+**Decisão (P8 do CODE-PATTERNS — Broken windows intencionais):**
+Botão fica **desabilitado** com `<Tooltip>` explicando "Feature aguardando executor real no backend Hermes". Preserva sinal de feature planejada (vs apagar) e para de mentir (vs manter toast falso).
+
+**Condição de reverter:** implementar `POST /api/hermes/inbox/{email_id}/draft` que:
+1. Resolve modelo via specialty config (mesma cadeia catalog do oracle-extract)
+2. Gera resposta via LLM com prompt: `<email_subject> + <email_excerpt> + system_instruction PT-BR`
+3. Persiste como rascunho IMAP via `hermes_imap.create_draft()` OU retorna texto pra usuário copiar
+
+Quando endpoint existir, remover `disabled` + Tooltip do botão e implementar `useGenerateHermesDraft` hook que chama endpoint.
+
+**Sem ticket Linear ainda** — abrir VEC-NNN quando priorizar.
