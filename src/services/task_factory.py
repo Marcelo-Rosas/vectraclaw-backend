@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from src.agent_ids import ORACLE_AGENT_ID  # SSOT — ver src/agent_ids.py
 from src.models import MaterializedWorkflow, Task, TaskBlueprint
 from src.services import workflow_graph
 from src.services.morpheus_dispatcher import MORPHEUS_AGENT_ID, MorpheusDispatcher
@@ -188,7 +189,7 @@ class TaskFactory:
                 if spec_slug:
                     agent_id = self._dispatcher._find_agent(company_id, spec_slug)
                 if not agent_id and str(op_type).startswith("oracle-"):
-                    agent_id = "00000000-0000-0000-0000-000000000002"
+                    agent_id = ORACLE_AGENT_ID
 
                 merged_child_input = dict(step_inputs.get(step_code, {}) or {})
                 merged_child_input["workflowStepSlug"] = step_code

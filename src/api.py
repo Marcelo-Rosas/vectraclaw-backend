@@ -25,6 +25,12 @@ except ImportError:
 
 from postgrest.exceptions import APIError as PostgrestAPIError
 
+from src.agent_ids import (  # SSOT AGENT_IDs — ver src/agent_ids.py
+    ATHENA_AGENT_ID,
+    HERMES_REPORTER_AGENT_ID,
+    KRONOS_AGENT_ID,
+    ORACLE_AGENT_ID,
+)
 from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
@@ -3398,7 +3404,6 @@ async def auth_signup(payload: SignupPayload):
         # Goal, Athena classify/charter já tem contexto do negócio dele.
         # Não bloqueia signup: se cair, user faz onboarding manualmente depois.
         try:
-            _ATHENA_AGENT_ID = "ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d"
             onboarding_input: Dict[str, Any] = {
                 "company_name": company_name,
                 "user_name": user_name,
@@ -3431,7 +3436,7 @@ async def auth_signup(payload: SignupPayload):
                 "status": "queued",
                 "budget_limit": 50_000,
                 "executor_type": "harness",
-                "assigned_to_agent_id": _ATHENA_AGENT_ID,
+                "assigned_to_agent_id": ATHENA_AGENT_ID,
                 "input_json": onboarding_input,
             }).execute()
             logger.info(f"signup: athena-onboarding dispatched company={company_id}")
@@ -5069,14 +5074,46 @@ async def list_agent_routines(request: Request, agent_id: str):
         raise HTTPException(500, str(e))
 
 
-KRONOS_AGENT_ID = "9c8d7e6f-5a4b-4321-9876-543210fedcba"
-_KRONOS_ROUTINE_OPERATIONS = (
-    "financial-audit",
-    "financial-bookkeeping",
-    "conciliacao-backlog",
-    "planner-import-ofx",
-    "planner-categorize-pendings",
-)
+# KRONOS_AGENT_ID importado de src.agent_ids (SSOT). Lista de op_types do Kronos
+# vinha do tuple `_KRONOS_ROUTINE_OPERATIONS` hardcoded — APOSENTADO em F3 GSD.
+# Agora vem de vectraclip.operation_types_catalog WHERE primary_agent_id=KRONOS_AGENT_ID
+# (auditor descobriu que tuple tinha 5 valores mas catalog tem 7 ativos — 2 op_types
+# ficavam fora do branch que monta input_json em run_routine_now).
+
+_KRONOS_OP_TYPES_CACHE: Dict[str, Any] = {"value": None, "fetched_at": 0.0}
+_KRONOS_OP_TYPES_TTL_S = 60.0
+
+
+def _load_kronos_operation_types() -> set[str]:
+    """Op_types do Kronos via operation_types_catalog (catalog-driven).
+
+    Cache TTL 60s (catálogo muda raro; lookup acontece a cada run_routine_now
+    + qualquer outro caller futuro). Falha silenciosa: retorna set vazio se DB
+    indisponível — caller decide se isso é problema (run_routine_now apenas
+    pula montagem de input_json especializada nesse caso).
+    """
+    import time
+    if not supabase:
+        return set()
+    now = time.time()
+    cached = _KRONOS_OP_TYPES_CACHE.get("value")
+    if cached is not None and (now - _KRONOS_OP_TYPES_CACHE.get("fetched_at", 0.0)) < _KRONOS_OP_TYPES_TTL_S:
+        return cached
+    try:
+        res = (
+            supabase.table("operation_types_catalog")
+            .select("id")
+            .eq("primary_agent_id", KRONOS_AGENT_ID)
+            .eq("is_active", True)
+            .execute()
+        )
+        ids = {row["id"] for row in (res.data or []) if row.get("id")}
+        _KRONOS_OP_TYPES_CACHE["value"] = ids
+        _KRONOS_OP_TYPES_CACHE["fetched_at"] = now
+        return ids
+    except Exception as e:
+        logger.warning(f"_load_kronos_operation_types fallback empty: {e}")
+        return set()
 
 
 def _routine_wire_dict(row: dict) -> dict:
@@ -5153,7 +5190,7 @@ async def run_routine_now(request: Request, routine_id: str):
             .replace("{{lastRun}}", routine_row.get("last_run_at") or "nunca")
         operation_type = _resolve_routine_operation_type(routine_row)
         input_json = None
-        if operation_type in _KRONOS_ROUTINE_OPERATIONS:
+        if operation_type in _load_kronos_operation_types():
             from src.agents.kronos import build_kronos_input_json
 
             metadata = routine_row.get("metadata")
@@ -8969,8 +9006,10 @@ async def run_flow_orchestrator(request: Request):
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants compartilhadas com src/api_routes/* (importadas lazy nos submodules)
 # ─────────────────────────────────────────────────────────────────────────────
-_ORACLE_AGENT_ID = "00000000-0000-0000-0000-000000000002"
-HERMES_REPORTER_AGENT_ID = "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"
+# _ORACLE_AGENT_ID + HERMES_REPORTER_AGENT_ID importados de src.agent_ids (SSOT).
+# Mantém alias `_ORACLE_AGENT_ID` apenas para compat de imports legados em
+# src/api_routes/*. Novos consumidores devem usar `ORACLE_AGENT_ID` direto.
+_ORACLE_AGENT_ID = ORACLE_AGENT_ID
 
 
 # ─────────────────────────────────────────────────────────────────────────────

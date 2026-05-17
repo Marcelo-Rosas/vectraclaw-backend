@@ -31,7 +31,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("Mnemos")
 
-MNEMOS_AGENT_ID = "00000000-0000-0000-0000-000000000003"
+from src.agent_ids import MNEMOS_AGENT_ID  # SSOT — ver src/agent_ids.py
 DEFAULT_BUCKET = "rag-documents"
 
 

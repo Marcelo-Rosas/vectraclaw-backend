@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone  # noqa: F401 — used in _save_company_context
 
+from src.agent_ids import ORACLE_AGENT_ID
+
 # Configura o Logger nativo para o Daemon
 logging.basicConfig(
     level=logging.INFO, 
@@ -622,8 +624,7 @@ class ResilientHarnessDaemon:
 
     def _poll_research_tasks(self) -> None:
         """Verifica oracle-research tasks em in_progress e finaliza quando o Deep Research completa."""
-        _ORACLE_ID = "00000000-0000-0000-0000-000000000002"
-        if self.agent_id != _ORACLE_ID:
+        if self.agent_id != ORACLE_AGENT_ID:
             return
 
         import asyncio as _aio
@@ -806,8 +807,6 @@ class ResilientHarnessDaemon:
                 self._complete_task(task["id"], False, output_json=error_output)
                 logger.warning("oracle-research blocked (all fallbacks failed) task=%s", task["id"])
 
-    _ORACLE_AGENT_ID = "00000000-0000-0000-0000-000000000002"
-
     def _emit_oracle_records(self, task: dict, result: dict) -> None:
         """Inserts a heartbeat and a run record after each Oracle Gemini execution."""
         client = self._get_supabase()
@@ -842,7 +841,7 @@ class ResilientHarnessDaemon:
 
         hb_row = {
             "company_id": company_id,
-            "agent_id": self._ORACLE_AGENT_ID,
+            "agent_id": ORACLE_AGENT_ID,
             "task_id": task_id,
             "status": "working",
             "tokens_used": tokens_total,
@@ -866,7 +865,7 @@ class ResilientHarnessDaemon:
 
         run_row = {
             "company_id": company_id,
-            "agent_id": self._ORACLE_AGENT_ID,
+            "agent_id": ORACLE_AGENT_ID,
             "task_id": task_id,
             "status": "succeeded",
             "finished_at": now,
@@ -889,13 +888,13 @@ class ResilientHarnessDaemon:
         if tokens_total > 0:
             try:
                 existing_res = client.table("agents").select("current_burn_rate").eq(
-                    "id", self._ORACLE_AGENT_ID
+                    "id", ORACLE_AGENT_ID
                 ).execute()
                 existing = int((existing_res.data[0].get("current_burn_rate") or 0) if existing_res.data else 0)
                 client.table("agents").update({
                     "current_burn_rate": existing + tokens_total,
                     "updated_at": now,
-                }).eq("id", self._ORACLE_AGENT_ID).execute()
+                }).eq("id", ORACLE_AGENT_ID).execute()
             except Exception as e:
                 logger.warning("_emit_oracle_records agent update failed: %s", e)
 
