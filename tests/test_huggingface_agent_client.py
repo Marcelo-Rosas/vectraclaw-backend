@@ -50,16 +50,28 @@ def mock_openai(monkeypatch):
 # 1. Resposta direta — caminho feliz
 # ---------------------------------------------------------------------------
 
+_HF_BASE_URL_TEST = "https://router.huggingface.co/v1"
+
+
+def _hf_config(**overrides) -> dict:
+    """Fixture-style helper: base_url + token padrão para todos os testes
+    (PR #194: base_url agora é catalog-driven, sem constante HF_BASE_URL)."""
+    cfg = {
+        "base_url": _HF_BASE_URL_TEST,
+        "hf_token": "hf_test",
+        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+    }
+    cfg.update(overrides)
+    return cfg
+
+
 @pytest.mark.asyncio
 async def test_execute_task_direct_response(mock_openai):
     from src.managed_agents.huggingface_agent_client import HuggingFaceAgentClient
 
     mock_openai.chat.completions.create.return_value = _mk_response(content="ok")
 
-    client = HuggingFaceAgentClient(config={
-        "hf_token": "hf_test_xxx",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-    })
+    client = HuggingFaceAgentClient(config=_hf_config(hf_token="hf_test_xxx"))
     result = await client.execute_task("teste")
 
     assert result.success is True
@@ -86,10 +98,7 @@ async def test_execute_task_with_tool_call(mock_openai):
         "src.managed_agents.huggingface_agent_client.dispatch_tool_call",
         return_value='{"cbm": 0.001}',
     ) as mock_dispatch:
-        client = HuggingFaceAgentClient(config={
-            "hf_token": "hf_test",
-            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-        })
+        client = HuggingFaceAgentClient(config=_hf_config())
         result = await client.execute_task("calcule")
 
     mock_dispatch.assert_called_once_with(
@@ -121,10 +130,7 @@ async def test_max_turns_guard(mock_openai):
         "src.managed_agents.huggingface_agent_client.dispatch_tool_call",
         return_value="{}",
     ):
-        client = HuggingFaceAgentClient(config={
-            "hf_token": "hf_test",
-            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-        })
+        client = HuggingFaceAgentClient(config=_hf_config())
         result = await client.execute_task("loop")
 
     assert result.success is False
@@ -140,9 +146,10 @@ async def test_max_turns_guard(mock_openai):
 async def test_missing_token_returns_clear_error(mock_openai):
     from src.managed_agents.huggingface_agent_client import HuggingFaceAgentClient
 
+    # sem hf_token (mas base_url presente — obrigatório no __init__)
     client = HuggingFaceAgentClient(config={
+        "base_url": _HF_BASE_URL_TEST,
         "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-        # sem hf_token
     })
     result = await client.execute_task("teste")
 
@@ -167,10 +174,7 @@ async def test_auth_error_returns_clear_message(mock_openai):
         body=None,
     )
 
-    client = HuggingFaceAgentClient(config={
-        "hf_token": "hf_invalid",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-    })
+    client = HuggingFaceAgentClient(config=_hf_config(hf_token="hf_invalid"))
     result = await client.execute_task("teste")
 
     assert result.success is False
@@ -191,10 +195,7 @@ async def test_connection_error_returns_clear_message(mock_openai):
         request=MagicMock(),
     )
 
-    client = HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-    })
+    client = HuggingFaceAgentClient(config=_hf_config())
     result = await client.execute_task("teste")
 
     assert result.success is False
@@ -213,10 +214,7 @@ async def test_token_counting_handles_none_usage(mock_openai):
     resp.usage = None
     mock_openai.chat.completions.create.return_value = resp
 
-    client = HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-    })
+    client = HuggingFaceAgentClient(config=_hf_config())
     result = await client.execute_task("teste")
 
     assert result.success is True
@@ -238,10 +236,7 @@ async def test_tokens_per_second_calculated(mock_openai):
         completion_tokens=40,
     )
 
-    client = HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-    })
+    client = HuggingFaceAgentClient(config=_hf_config())
     result = await client.execute_task("teste")
 
     assert result.success is True
@@ -250,23 +245,45 @@ async def test_tokens_per_second_calculated(mock_openai):
 
 
 # ---------------------------------------------------------------------------
-# 9. base_url SEMPRE fixo (não vem do config)
+# 9. base_url agora vem do config (catalog-driven, PR #194)
 # ---------------------------------------------------------------------------
 
-def test_base_url_is_fixed(mock_openai):
-    from src.managed_agents.huggingface_agent_client import (
-        HF_BASE_URL,
-        HuggingFaceAgentClient,
-    )
+def test_base_url_required_raises_when_missing(mock_openai):
+    """Sem base_url no config, __init__ deve dar ValueError.
+    PR #194: dropou constante HF_BASE_URL hardcoded — agora é
+    adapter_field_definitions.base_url (mesmo pattern Ollama)."""
+    from src.managed_agents.huggingface_agent_client import HuggingFaceAgentClient
 
-    # Mesmo que o usuário passe base_url no config, é IGNORADO.
-    HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-        "base_url": "http://hacker.example.com/",  # tentativa de override
-    })
+    with pytest.raises(ValueError, match="base_url ausente"):
+        HuggingFaceAgentClient(config={
+            "hf_token": "hf_test",
+            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+            # sem base_url
+        })
 
-    assert HF_BASE_URL == "https://router.huggingface.co/v1"
+
+def test_base_url_used_from_config(mock_openai):
+    """O base_url do config é o que vai pro OpenAI client."""
+    captured = {}
+
+    def fake_openai(**kw):
+        captured.update(kw)
+        return MagicMock()
+
+    import src.managed_agents.huggingface_agent_client as mod
+    original = mod.OpenAI
+    mod.OpenAI = fake_openai
+    try:
+        from src.managed_agents.huggingface_agent_client import HuggingFaceAgentClient
+
+        HuggingFaceAgentClient(config={
+            "hf_token": "hf_test",
+            "model_id": "meta-llama/Llama-3.3-70B-Instruct",
+            "base_url": "https://my-mirror.example.com/v1",
+        })
+        assert captured["base_url"] == "https://my-mirror.example.com/v1"
+    finally:
+        mod.OpenAI = original
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +296,7 @@ async def test_inference_provider_routed_via_extra_body(mock_openai):
 
     mock_openai.chat.completions.create.return_value = _mk_response(content="ok")
 
-    client = HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-        "provider": "groq",
-    })
+    client = HuggingFaceAgentClient(config=_hf_config(provider="groq"))
     await client.execute_task("teste")
 
     kwargs = mock_openai.chat.completions.create.call_args.kwargs
@@ -296,11 +309,7 @@ async def test_inference_provider_auto_omits_extra_body(mock_openai):
 
     mock_openai.chat.completions.create.return_value = _mk_response(content="ok")
 
-    client = HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-        "provider": "auto",
-    })
+    client = HuggingFaceAgentClient(config=_hf_config(provider="auto"))
     await client.execute_task("teste")
 
     kwargs = mock_openai.chat.completions.create.call_args.kwargs
@@ -308,30 +317,9 @@ async def test_inference_provider_auto_omits_extra_body(mock_openai):
 
 
 # ---------------------------------------------------------------------------
-# 11. Warning de tool support para modelo fora da allowlist
+# 11. Tool capability — capacidade saiu do client (PR #194).
+# Agora vem de vectraclip.llm_models.supports_tool_calling, lido por
+# src.services.llm_cost.is_tool_capable (que deve ser chamado pelo
+# decision_engine ANTES de rotear — não pelo client).
+# Tests dessa lógica vivem em tests/test_llm_cost.py.
 # ---------------------------------------------------------------------------
-
-def test_warn_for_non_tool_capable_model(caplog, mock_openai):
-    from src.managed_agents.huggingface_agent_client import HuggingFaceAgentClient
-
-    caplog.set_level(logging.WARNING, logger="ManagedAgents.HuggingFace")
-    HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "google/gemma-2b",  # fora da allowlist
-    })
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("pode não suportar tool calling" in m for m in messages)
-
-
-def test_no_warn_for_tool_capable_model(caplog, mock_openai):
-    from src.managed_agents.huggingface_agent_client import HuggingFaceAgentClient
-
-    caplog.set_level(logging.WARNING, logger="ManagedAgents.HuggingFace")
-    HuggingFaceAgentClient(config={
-        "hf_token": "hf_test",
-        "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-    })
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert not any("pode não suportar tool calling" in m for m in messages)

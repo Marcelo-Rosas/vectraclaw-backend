@@ -4,8 +4,10 @@ Groq oferece free tier generoso (Llama 3.3 70B, Qwen 32B, etc.) com latência
 extremamente baixa (~500-1000 tokens/s). API é compatível OpenAI — endpoint
 único, mesmo SDK.
 
-Endpoint: https://api.groq.com/openai/v1
-Auth:     Bearer {GROQ_API_KEY}
+Auth:     Bearer {api_key}
+Endpoint: vem de `config["base_url"]` (adapter_field_definitions.base_url,
+          padrão Ollama). NÃO existe constante GROQ_BASE_URL — Regra de Ouro
+          #2 NO HARDCODE (docs/CODE-PATTERNS.md §P1, caso 2026-05-17).
 
 Mesma interface (`async def execute_task -> ExecutionResult`) que
 ManagedAgentClient / OllamaAgentClient / HuggingFaceAgentClient — o router
@@ -16,8 +18,10 @@ Mais simples, sem dependência intermediária. Use este quando tiver
 API key Groq dedicada; use HF Router quando quiser rotear por múltiplos
 providers (Groq + Cerebras + Together) com 1 token só.
 
-Catalog-driven (Regra de Ouro #2): api_key, model_id, temperature, max_tokens
-vêm de `agent_adapter_configs.field_values_json`. Fallback env: GROQ_API_KEY.
+Catalog-driven: base_url, api_key, model_id, temperature, max_tokens vêm de
+`agent_adapter_configs.field_values_json` (preenchido pela UI). Capacidade
+de tool calling vem de `llm_models.supports_tool_calling` — quem checa é o
+`decision_engine` (via `src.services.llm_cost.is_tool_capable`), não o client.
 """
 from __future__ import annotations
 
@@ -35,30 +39,26 @@ from .tool_translator import OPENAI_TOOLS, dispatch_tool_call
 
 logger = logging.getLogger("ManagedAgents.Groq")
 
-# Endpoint fixo do Groq (OpenAI-compat).
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-
 # Mesmo guard contra loop infinito dos outros clients.
 _MAX_TURNS = 20
 
-# Allowlist best-effort de modelos Groq com suporte conhecido a tool calling.
-# Fonte: https://console.groq.com/docs/tool-use
-# Pode ficar desatualizada; usado só para warning, não bloqueia.
-GROQ_TOOL_CAPABLE_MODELS = {
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "llama-3.1-70b-versatile",  # legado
-    "qwen-2.5-32b",
-    "deepseek-r1-distill-llama-70b",
-    "mixtral-8x7b-32768",
-}
-
 
 class GroqAgentClient:
-    """Cliente para Groq Cloud (API compatível OpenAI)."""
+    """Cliente para Groq Cloud (API compatível OpenAI). 100% catalog-driven."""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         config = config or {}
+
+        # base_url: catalog-driven. SEM default Python — admin preenche na UI
+        # (adapter_field_definitions.options_json.default sugere o valor canônico
+        # https://api.groq.com/openai/v1, mas o cliente exige config).
+        base_url = config.get("base_url")
+        if not base_url:
+            raise ValueError(
+                "GroqAgentClient: base_url ausente no config. "
+                "Configure 'base_url' em agent_adapter_configs.field_values_json "
+                "(default sugerido: https://api.groq.com/openai/v1)."
+            )
 
         # api_key híbrido: campo do adapter > env var > fail.
         api_key = (
@@ -82,19 +82,9 @@ class GroqAgentClient:
         except (TypeError, ValueError):
             self.max_tokens = 4096
 
-        self._client = OpenAI(base_url=GROQ_BASE_URL, api_key=api_key or "missing")
+        self._base_url = base_url
+        self._client = OpenAI(base_url=base_url, api_key=api_key or "missing")
         self._has_key = bool(api_key)
-        self._warn_if_no_tool_support()
-
-    def _warn_if_no_tool_support(self) -> None:
-        if self.model not in GROQ_TOOL_CAPABLE_MODELS:
-            logger.warning(
-                "GroqAgentClient: modelo '%s' pode não suportar tool calling. "
-                "Modelos confirmados: %s. "
-                "Se o agente entrar em loop ou retornar vazio, troque para um da lista.",
-                self.model,
-                sorted(GROQ_TOOL_CAPABLE_MODELS),
-            )
 
     async def execute_task(
         self,

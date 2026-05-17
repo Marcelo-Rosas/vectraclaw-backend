@@ -159,7 +159,7 @@ LIMIT 1
 
 ## Pitfalls conhecidos
 
-- **Modelos sem tool calling** (Ollama: modelos fora da `OLLAMA_TOOL_CAPABLE_MODELS`; HF: fora da `HF_TOOL_CAPABLE_MODELS`) podem entrar em loop infinito. `_MAX_TURNS = 20` é a rede de proteção.
+- **Modelos sem tool calling** podem entrar em loop infinito. Capacidade vive em `vectraclip.llm_models.supports_tool_calling` (PR #194 — aposentou constantes `*_TOOL_CAPABLE_MODELS` em cada client). Quem deve checar antes de rotear é o `decision_engine` via `src.services.llm_cost.is_tool_capable(supabase, model_id) -> Optional[bool]`. `_MAX_TURNS = 20` é a rede de proteção quando a checagem falha (modelo desconhecido).
 - **`tokens_per_second` é eval-only** — exclui tempo de `dispatch_tool_call`. Se a tool é lenta, `execution_time_seconds` cresce mas `tokens_per_second` não cai (porque mede só inferência).
 - **Ollama ignora `api_key`** mas o SDK exige string não vazia → passar `"ollama"`. Não usar `""`.
 - **Pacote `anthropic` ou `openai` ausente** → `__init__` do client levanta erro. Cobrir em decision_engine para não rotear pra provider sem SDK.

@@ -74,8 +74,37 @@ no validator do PUT (backend) e na render (frontend lista via GET endpoint).
 **Sinais de violação (red flags):**
 - Adicionando `HERMES_FOO=...` ou `GEMINI_FOO=...` em `.env.example` → tem tabela espelho?
 - Adicionando `CONSTANT_DICT = {...}` em `.py` → tem tabela espelho?
+- `XXX_BASE_URL = "https://..."` em `src/managed_agents/*.py` → `adapter_field_definitions.base_url` é o pattern
+- `XXX_TOOL_CAPABLE_MODELS = {...}` set em `.py` → coluna `llm_models.supports_tool_calling` é o pattern
 - Hardcoding slug de model em config (ex: `"hermes-4-405b"`) → `llm_models.id` é a fonte
 - "Vou hardcodar pra MVP e migrar depois" → migrar nunca acontece. Fazer certo desde o início.
+
+### Caso real (2026-05-17) — Groq adapter (regravado pós-2-violações-no-mesmo-dia)
+
+Tentei adicionar Groq adapter com 2 hardcodes:
+```python
+# ❌ ERRADO — duas violações no mesmo arquivo
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"           # url hardcoded
+GROQ_TOOL_CAPABLE_MODELS = {"llama-3.3-70b-versatile", ...}  # set hardcoded
+```
+
+Pulei a regra "espelhar antes" — `adapter_field_definitions` do Ollama já mostra o pattern:
+```
+ollama.base_url → field_type=text, required=true, sort_order=10
+```
+
+E `llm_models` é versionado, deveria carregar capacidades. Correção:
+```python
+# ✅ CORRETO — sem constantes Python
+base_url = config["base_url"]  # vem de adapter_field_definitions seed
+if not base_url:
+    raise ValueError("base_url ausente: configure no adapter UI")
+# tool_capable lê de llm_models.supports_tool_calling (coluna nova)
+```
+
+Lição: `src/managed_agents/*_agent_client.py` **não deve ter NENHUMA constante de URL ou de set de modelos**. Guardrail em runtime: `__init__` levanta `ValueError("base_url ausente")` se config não tem — sistema falha alto na primeira chamada em vez de silenciosamente usar default Python.
+
+**Vault do projeto = Supabase com RLS.** `agent_adapter_configs.field_values_json` (por agente, RLS por company_id) guarda secrets; `adapter_field_definitions` guarda shape. Nenhum secret/config vai em `.env`, `.py` ou hook git — fonte única é o catálogo.
 
 ### Já aplicado a
 
@@ -342,6 +371,86 @@ export const recommendationKindSchema = z.enum([...])  // proposital — não co
 // ⏸️ INTENTIONAL BROKEN — ver docs/AUDIT-CONSOLIDADO.md §"<seção>"
 // Não consertar sem ler primeiro. Condição de reverter: <X>.
 ```
+
+---
+
+## P8 — Invocar hardcode-auditor ANTES de toda melhoria — **REGRA DE OURO #4**
+
+> **Origem 2026-05-17:** 3 violações da Regra de Ouro #2 (NO HARDCODE) no mesmo
+> dia (GROQ_BASE_URL, GROQ_TOOL_CAPABLE_MODELS, INSERT ignorando company_id NOT
+> NULL). Memórias `mirror-before-create` e `metadata-driven-no-hardcode` não
+> estavam sendo aplicadas pró-ativamente — só reativamente quando o usuário
+> cortava. Agente dedicado força auditoria **PRÉ-implementação**.
+
+**Regra:** TODA nova melhoria (PR, refactor, feature, bugfix que toca módulo)
+→ invocar `Agent(subagent_type='hardcode-auditor')` ANTES de propor
+implementação. O agente vive em `.claude/agents/hardcode-auditor.md`
+(project-local, versionado).
+
+**Como invocar:**
+
+```python
+Agent(
+  description="Audit <escopo> pre-merge",
+  subagent_type="hardcode-auditor",
+  prompt="""
+  Escopo: <arquivos/módulos afetados>
+  Mudança proposta: <1 parágrafo>
+  Hardcodes pré-identificados (se já varreu): <lista>
+  Veredito esperado: confirmar/refutar achados + adicionar próprios.
+  """
+)
+```
+
+**Output:** relatório padronizado P0/P1/P2 + impacto na mudança + recomendação
+("Prossiga" / "Prossiga + amplie pra X,Y" / "Pause e fatie" / "Bloqueie").
+
+**Exceções aceitáveis** (pode pular auditor):
+- Edição puramente cosmética (docstring, formatação, whitespace)
+- Update de doc `.md` sem mudar código
+- Hotfix de typo em string de log/erro
+- Em dúvida → invocar.
+
+**Caso real (2026-05-17) — PR Groq:** auditor pego depois de 3 violações
+identificou +4 itens que estavam fora do meu radar (HF_INFERENCE_PROVIDERS
+letra morta, case `Google`/`google` no adapter gemini, dados de Oracle/Athena
+com `model` em vez de `model_id`, field_def GEMINI_API_KEY letra morta).
+PR original (Groq cirúrgico) virou PR ampliado catalog-hygiene — escolha do
+operador, sustentada por dados objetivos do relatório.
+
+**Padrão de saída do auditor** é determinístico — code review consegue cruzar
+PR com o relatório linha a linha.
+
+---
+
+## P7 — Cabeçalho de auditoria em migrations novas
+
+> **Origem 2026-05-17:** 3 violações de Regra de Ouro #1 (espelhar antes) no
+> mesmo dia. Cabeçalho força o autor a *parar e checar* antes do INSERT/ALTER.
+
+**Toda migration nova** em `supabase/migrations/` começa com 2 linhas
+(qualquer lugar nas primeiras 30 linhas, como comentário SQL):
+
+```sql
+-- ESPELHEI ANTES: SELECT column_name, is_nullable FROM information_schema.columns
+--                 WHERE table_schema='vectraclip' AND table_name='adapter_catalog'
+--                 (descobri: company_id NOT NULL, UNIQUE (company_id, slug),
+--                  display_name NOT NULL, id PK global)
+-- PADRÃO ADOTADO: loop por companies + gen_random_uuid() (mesmo shape de
+--                 20260506150000_add_huggingface_adapter.sql)
+
+DO $$ ...
+```
+
+**Por quê:**
+- Força documentar **qual tabela espelhou** (auditável no `git blame`)
+- Força declarar **qual padrão da casa** adotou (não inventou shape novo)
+- PR reviewer verifica em 5s sem precisar entrar no DB
+- Esquecer = pego no code review (não há hook git — DB é a fonte da
+  verdade; runtime falha em quem hardcoda; review humano valida quem
+  ignorou espelhar)
+
+**Aplica a:** toda migration `supabase/migrations/*.sql` nova.
 
 ---
 

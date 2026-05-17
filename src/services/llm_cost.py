@@ -98,6 +98,58 @@ def _load_llm_cost(supabase: Any, model_id: str) -> Optional[Dict[str, float]]:
         return None
 
 
+_LLM_CAPABILITIES_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def is_tool_capable(supabase: Any, model_id: str) -> Optional[bool]:
+    """Modelo suporta function/tool calling?
+
+    Lookup contra `vectraclip.llm_models.supports_tool_calling`. Substitui
+    constantes hardcoded `*_TOOL_CAPABLE_MODELS` que viviam em
+    `src/managed_agents/*_agent_client.py` (Regra de Ouro #2 — ver
+    `docs/CODE-PATTERNS.md` §P1).
+
+    Returns:
+        True/False se modelo está no catálogo;
+        None se supabase indisponível OU modelo não encontrado (capacidade
+        desconhecida — caller decide se loga warning ou prossegue silencioso).
+    """
+    if not supabase or not model_id:
+        return None
+
+    now = time.time()
+    cached = _LLM_CAPABILITIES_CACHE.get(model_id)
+    if cached and (now - cached.get("fetched_at", 0.0)) < _LLM_COST_CACHE_TTL_S:
+        return cached.get("supports_tool_calling")
+
+    try:
+        res = (
+            supabase.table("llm_models")
+            .select("supports_tool_calling,effective_from,is_active")
+            .eq("id", model_id)
+            .eq("is_active", True)
+            .order("effective_from", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            _LLM_CAPABILITIES_CACHE[model_id] = {
+                "supports_tool_calling": None,
+                "fetched_at": now,
+            }
+            return None
+        value = bool(rows[0].get("supports_tool_calling", True))
+        _LLM_CAPABILITIES_CACHE[model_id] = {
+            "supports_tool_calling": value,
+            "fetched_at": now,
+        }
+        return value
+    except Exception as e:
+        logger.warning("is_tool_capable fallback model=%s err=%s", model_id, e)
+        return None
+
+
 def calc_llm_cost(
     supabase: Any,
     model_id: str,
