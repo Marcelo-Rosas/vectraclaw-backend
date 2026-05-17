@@ -905,8 +905,16 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
             "status_override": None,
         }
 
+    # Smoke do PR #189 (2026-05-17) detectou que `_calc_cost` assumia
+    # `ORACLE_DEFAULT_MODEL='gemini-2.5-pro'` pra TODOS os handlers — mas
+    # Oracle tem 3 modelos em uso: DEFAULT_MODEL (gemini-2.5-flash) em
+    # _handle_summarize/extract, gemini-2.5-pro em _handle_research_sync,
+    # e DEEP_RESEARCH_AGENT (deep-research-preview-04-2026) em _handle_research.
+    # Cada handler grava `metadata.model_used` — fonte de verdade do que
+    # foi REALMENTE executado. Catalog lookup via calc_llm_cost direto.
     tokens = (result.get("metadata") or {}).get("tokens", {})
-    cost_usd = _calc_cost(supabase, tokens)
+    model_used = (result.get("metadata") or {}).get("model_used") or ORACLE_DEFAULT_MODEL
+    cost_usd = calc_llm_cost(supabase, model_used, tokens)
     require_review = bool(input_data.get("require_human_review"))
 
     logger.info(
