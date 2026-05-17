@@ -67,29 +67,7 @@ begin
         description = excluded.description,
         is_active = true;
 
-  -- Step 1: Import OFX
-  insert into vectraclip.workflow_steps
-    (id, workflow_id, step_order, name, slug, specialty_slug,
-     logic_pattern, responsavel,
-     current_operation_type, next_operation_type, default_operation_type,
-     on_success_step_id, on_failure_action,
-     requires_approval, active)
-  values
-    (v_step1_id, v_wf_id, 1,
-     'Import OFX', 'import-ofx', 'planner-import-ofx',
-     'SIMPLE', 'agente',
-     'planner-import-ofx', 'planner-categorize-pendings', 'planner-import-ofx',
-     v_step2_id, 'block',
-     false, true)
-  on conflict (id) do update
-    set logic_pattern = excluded.logic_pattern,
-        responsavel = excluded.responsavel,
-        current_operation_type = excluded.current_operation_type,
-        next_operation_type = excluded.next_operation_type,
-        default_operation_type = excluded.default_operation_type,
-        on_success_step_id = excluded.on_success_step_id;
-
-  -- Step 2: Categorize
+  -- Step 2 primeiro (FK on_success_step_id do step 1 aponta para step 2)
   insert into vectraclip.workflow_steps
     (id, workflow_id, step_order, name, slug, specialty_slug,
      logic_pattern, responsavel,
@@ -110,6 +88,28 @@ begin
         current_operation_type = excluded.current_operation_type,
         next_operation_type = excluded.next_operation_type,
         default_operation_type = excluded.default_operation_type;
+
+  -- Step 1: Import OFX (após step 2 existir para satisfazer FK)
+  insert into vectraclip.workflow_steps
+    (id, workflow_id, step_order, name, slug, specialty_slug,
+     logic_pattern, responsavel,
+     current_operation_type, next_operation_type, default_operation_type,
+     on_success_step_id, on_failure_action,
+     requires_approval, active)
+  values
+    (v_step1_id, v_wf_id, 1,
+     'Import OFX', 'import-ofx', 'planner-import-ofx',
+     'SIMPLE', 'agente',
+     'planner-import-ofx', 'planner-categorize-pendings', 'planner-import-ofx',
+     v_step2_id, 'block',
+     false, true)
+  on conflict (id) do update
+    set logic_pattern = excluded.logic_pattern,
+        responsavel = excluded.responsavel,
+        current_operation_type = excluded.current_operation_type,
+        next_operation_type = excluded.next_operation_type,
+        default_operation_type = excluded.default_operation_type,
+        on_success_step_id = excluded.on_success_step_id;
 end $$;
 
 -- ════════════════════════════════════════════════════════════════════════════
