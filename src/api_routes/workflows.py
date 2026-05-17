@@ -794,7 +794,8 @@ async def get_task_tree(request: Request, company_id: str, parent_id: str):
             deps = t.get("dependency_step_codes") or []
             if isinstance(deps, str):
                 deps = [deps]
-            if all(slug_status.get(str(d)) in ("done", "skipped") for d in deps):
+            # Wave 1A: dep deve estar DONE (era done|skipped). Erro bloqueia successor.
+            if all(slug_status.get(str(d)) == "done" for d in deps):
                 ready_backlog_codes.append(str(slug))
 
     parent_input = parent_row.get("input_json") or {}
