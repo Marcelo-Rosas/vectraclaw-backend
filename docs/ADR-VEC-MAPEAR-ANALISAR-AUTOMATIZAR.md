@@ -122,7 +122,19 @@ Cada provocação Marcelo expôs um item ignorado por Claude. Registro com cita�
 
 ## 3. Identidade do produto (declarada por Marcelo)
 
-### 3.1 Dois entregáveis em escada
+### 3.1 Três entregáveis (atualizado 2026-05-17)
+
+> **Nota de evolução:** originalmente declarado como "2 entregáveis em escada" (Mapeamento + Orquestração). Em 2026-05-17, durante auditoria do GymSite Intelligence, Marcelo confirmou que **Project on-demand** (escopo finito, 1 entregável = 1 venda, modelo Heldman puro) é **3º entregável formal**, não sub-modo de Mapeamento. GymSite (análise de ponto comercial pra investidor que vai abrir academia) é o caso canônico — usa `projects.kind='project'` com template Athena, multi-tenant via `company_id`.
+
+| # | Entregável | Modelo de receita | Recorrência | Caso canônico atual |
+|---|---|---|---|---|
+| 1 | **Mapeamento** | Consultoria leve (SIPOC+BPMN+classify+automation-design) | One-shot por processo | Vectra Cargo dogfood (transporte) |
+| 2 | **Orquestração** | SaaS recurring por agente/operação ativa | Contínuo (Operations + Routines) | Vectra Cargo dogfood (cotação, conciliação, prospect) |
+| 3 | **Project on-demand** | Cobra por entregável finito (1 análise = R$ X) | Finito por demanda | GymSite Intelligence (análise ponto comercial) |
+
+**Cliente pode entrar por qualquer um dos 3** — não é mais escada estrita. Mapeamento pode levar pra Orquestração (caso original); Project on-demand é entrada paralela com lógica própria (Heldman p.3).
+
+### 3.1.1 Diagrama dos 2 entregáveis originais em escada (preservado)
 
 ```mermaid
 flowchart LR
@@ -173,7 +185,7 @@ Citação Marcelo:
 
 > "MVP - telemetria é um passo importante para decisão do cliente em seguir para o segundo projeto que é módulo de orquestração diferente do Mapeamento - o cliente pode ficar só no mapeamento mas não seguir para o uso dos agentes e para que isso se materialize precisamos ter uma estimativa de custo para o cliente entender que hoje o custo fixo de um humano para um determinada tarefa não faz sentido nenhum é onde o aumento de margem está"
 
-Rótulos "primeiro/segundo entregável" são descritivos — nomenclatura final pra venda externa fica em §8 pendência #1.
+Rótulos "primeiro/segundo entregável" são descritivos — nomenclatura final pra venda externa fica em §10 pendência P1.
 
 ### 3.2 Tríade canônica (formulada por Marcelo)
 
@@ -320,25 +332,27 @@ flowchart TD
 
 ## 6. Decisões consolidadas de Marcelo
 
-Lista das respostas literais de Marcelo às perguntas levantadas por Claude:
+Lista das respostas literais de Marcelo às perguntas levantadas por Claude.
 
-| # | Tema | Decisão Marcelo (citação) |
+> **Convenção de IDs:** decisões usam prefixo `D` (D1..D13). Pendências em §10 usam prefixo `P` (P1..P13).
+
+| ID | Tema | Decisão Marcelo (citação) |
 |---|---|---|
-| 1 | Goal vs Target | "Goals é o bjetivo não mexa crie target depois explicito como seção" |
-| 2 | Workflow ↔ Routine | "Cria workflow amarrado a rotina - definido por campo toggle pode procurar ai" — já existe `routines.workflow_definition_id` |
-| 3 | automation-design output | "automation desing deve mostrar como é hoje e como ficara uma comparação (...) tarefas que antes eram 10 para um output depois da automação viraram 5" |
-| 4 | Athena materializa hire | "Sim" — `request_type='hire_agent'` em approvals |
-| 5 | Workflow obrigatório | "Sempre é uma arvore/cadeia sem o workflow não existe as tasks" |
-| 6 | Retrofit Daedalus | "Sim mas deixe na mão da Athena o retrofit" |
-| 7 | Perfis McKinsey | "adaptado" — perfis do domínio, não literais |
-| 8 | Telemetria no MVP | "MVP - telemetria é um passo importante para decisão do cliente em seguir para o segundo projeto" |
-| 9 | tune_decision_engine | "essa análise é posterior ao inicio da orchetração pode ser uma rotina da Athena após 15 dias de execução para operações e não projetos" |
-| 10 | classify bloqueante | "de maneira nenhuma é uma logica de fluxo" — não bloqueia, conduz |
-| 11 | Oracle contexto cumulativo | "sempre o Oracle precisa revisar a resposta anterior que poderá servir de gatilho pra pergunta subsequente" |
-| 12 | ERP SaaS — custo | "quando envolver respostas com ERP SaaS - identificar o custo dessa plataforma - para podermos analisar a viabilidade de troca ou não" |
-| 13 | UI é fonte de dados | "a UI em MVP vira a fonte de dados para criação dos comandos dos agentes - workflow + tasks nada sera editado via CLT" |
+| D1 | Goal vs Target | "Goals é o bjetivo não mexa crie target depois explicito como seção" |
+| D2 | Workflow ↔ Routine | "Cria workflow amarrado a rotina - definido por campo toggle pode procurar ai" — já existe `routines.workflow_definition_id` |
+| D3 | automation-design output | "automation desing deve mostrar como é hoje e como ficara uma comparação (...) tarefas que antes eram 10 para um output depois da automação viraram 5" |
+| D4 | Athena materializa hire | "Sim" — `request_type='hire_agent'` em approvals |
+| D5 | Workflow obrigatório | "Sempre é uma arvore/cadeia sem o workflow não existe as tasks" |
+| D6 | Retrofit Daedalus | "Sim mas deixe na mão da Athena o retrofit" |
+| D7 | Perfis McKinsey | "adaptado" — perfis do domínio, não literais |
+| D8 | Telemetria no MVP | "MVP - telemetria é um passo importante para decisão do cliente em seguir para o segundo projeto" |
+| D9 | tune_decision_engine | "essa análise é posterior ao inicio da orchetração pode ser uma rotina da Athena após 15 dias de execução para operações e não projetos" |
+| D10 | classify bloqueante | "de maneira nenhuma é uma logica de fluxo" — não bloqueia, conduz |
+| D11 | Oracle contexto cumulativo | "sempre o Oracle precisa revisar a resposta anterior que poderá servir de gatilho pra pergunta subsequente" |
+| D12 | ERP SaaS — custo | "quando envolver respostas com ERP SaaS - identificar o custo dessa plataforma - para podermos analisar a viabilidade de troca ou não" |
+| D13 | UI é fonte de dados | "a UI em MVP vira a fonte de dados para criação dos comandos dos agentes - workflow + tasks nada sera editado via CLT" |
 
-### 6.1 Perfis adaptados de agente (decisão #7)
+### 6.1 Perfis adaptados de agente (D7)
 
 Inspirado em McKinsey (Especialista/Generalista/Líder de Desempenho/Campeão de Growth) — **proposta Claude** dos 4 perfis adaptados, aguarda validação Marcelo na primeira aplicação prática:
 
@@ -510,7 +524,7 @@ CREATE TABLE vectraclip.tenant_tool_inventory (
 | `athena_recommendations.kind` | Migration leve CHECK + novos valores: `hire_new_agent`, `retrofit_existing_agent`, `add_skill`, `downgrade_model`, `upgrade_model`, `migrate_runtime`, `tune_thinking_budget`, `tune_decision_engine`, `discontinue` |
 | 3 listas hardcoded de `operation_type` | Migrar pra ler `operation_types_catalog` (já tem REST endpoint `operationTypes.ts`) |
 | `_GEMINI_PRO_COST_PER_TOKEN` em athena.py | Ler `llm_models` versionado (UI `AdminModels.tsx` já gerencia) |
-| `_OPERATION_TYPE_SCORES` em decision_engine | Adicionar coluna `score` em `operation_types_catalog` e ler dela |
+| `_OPERATION_TYPE_SCORES` em decision_engine | ✅ **Decidido P13 Opção 1 (2026-05-17):** adicionar coluna `routing_score smallint` em `operation_types_catalog` (ALTER aditivo dentro da Fase A) e ler dela. Migration pronta em §7.7 |
 | `_handle_classify` v2 | SELECT ampliado pra incluir SIPOC+BPMN+RAG; retorna `outputs.status='needs_sipoc'` se faltar; cria Target row + materializa Project/Operation conforme kind |
 | NOVO `_handle_automation_design` | Cria automation_proposals row; usa `services/roi_calculator.py` (já existe) |
 | NOVO `_handle_telemetry_review` | Agrega tasks/heartbeats por agente/op; produz propostas downgrade/upgrade/etc |
@@ -523,9 +537,63 @@ CREATE TABLE vectraclip.tenant_tool_inventory (
 - `csat_surveys` — pós-MVP
 - `agent_relationships` — `agents.metadata` jsonb por enquanto
 
+### 7.7 Evidência da varredura — gap `_OPERATION_TYPE_SCORES` × `operation_types_catalog`
+
+Registro técnico da varredura feita em 2026-05-17 que originou a pendência §10 P13.
+
+**Schema atual (`vectraclip.operation_types_catalog`)** — 12 colunas:
+`id, name, description, category, icon, color, display_order, primary_agent_id, default_specialty_slug, is_active, created_at, updated_at`. **Não há coluna `score` / `routing_score` / `weight`.**
+
+**Colunas "*_score" existentes no schema servem a outros domínios** (não confundir):
+
+| Tabela | Coluna | Domínio |
+|---|---|---|
+| `incidents` | `severity_score` | gravidade de incidente |
+| `tasks` | `evaluation_score` | nota de avaliação da execução |
+| `risks` | `risk_score` | matriz prob × impacto (Cap 11) |
+| `kronos_rules` | `priority` | ordem de aplicação de regra |
+
+**`display_order` ≠ `score`:** é ordenação visual da UI catálogo (10, 20, 30 … 9999), sem semântica de roteamento CMA. Reutilizar viola metadata-driven.
+
+**Gap de cobertura entre código e catálogo (estado em 2026-05-17):**
+
+| Métrica | Valor |
+|---|---|
+| Operation types ativos em `operation_types_catalog` | **40** |
+| Entradas hardcoded em `_OPERATION_TYPE_SCORES` (`decision_engine.py:21-32`) | **11** |
+| Tipos que caem no default `60` (vai pra CMA por omissão) | **29** |
+
+Os 11 declarados são: `orchestration` (0), `code_generation` (15), `qa_testing` (35), `email_lead` (10), `freight-quotation` (80), `code_review` (65), `document_generation` (75), `other` (60), `research` (85), `athena-onboarding` (85). Default em `decision_engine.py:54` aplica `60` ao restante — funciona porque `CMA_THRESHOLD = 50`, então 29 tipos vão pra CMA sem decisão explícita (`athena-*`, `oracle-*`, `kronos-*`, `crm-*`, `planner-*`, `bpmn-generate`, `rag-ingest`, etc.).
+
+**Migration aditiva — ✅ APROVADA (P13 Opção 1, 2026-05-17). Vai pra Fase A.4:**
+
+```sql
+ALTER TABLE vectraclip.operation_types_catalog
+  ADD COLUMN routing_score smallint NOT NULL DEFAULT 60
+  CHECK (routing_score BETWEEN 0 AND 100);
+
+-- Backfill dos 11 conhecidos (os 29 restantes herdam o default 60 — mesmo comportamento atual)
+UPDATE vectraclip.operation_types_catalog SET routing_score =   0 WHERE id = 'orchestration';
+UPDATE vectraclip.operation_types_catalog SET routing_score =  15 WHERE id = 'code_generation';
+UPDATE vectraclip.operation_types_catalog SET routing_score =  35 WHERE id = 'qa_testing';
+UPDATE vectraclip.operation_types_catalog SET routing_score =  10 WHERE id = 'email_lead';
+UPDATE vectraclip.operation_types_catalog SET routing_score =  80 WHERE id = 'freight-quotation';
+UPDATE vectraclip.operation_types_catalog SET routing_score =  65 WHERE id = 'code_review';
+UPDATE vectraclip.operation_types_catalog SET routing_score =  75 WHERE id = 'document_generation';
+UPDATE vectraclip.operation_types_catalog SET routing_score =  85 WHERE id = 'research';
+-- 'other' e 'athena-onboarding' já são 60/85 — manter via UPDATE explícito ou aceitar default
+UPDATE vectraclip.operation_types_catalog SET routing_score =  85 WHERE id = 'athena-onboarding';
+```
+
+Tudo aditivo (ADD COLUMN com DEFAULT + UPDATE não-destrutivo). Risco operacional ~zero — comportamento pré-migration permanece idêntico porque os 29 tipos sem declaração já vinham do default 60.
+
+**UI já cobre o catálogo:** existe form/CRUD pra `operation_types_catalog` (endpoint `operationTypes.ts` no frontend) — adicionar campo `routing_score` no editor é incremento pequeno, não criação de tela nova.
+
+**Custo total se Opção 1 vencer:** 1 PR cirúrgico — migration aditiva + leitura no `decision_engine.py` (com fallback pro hardcoded se SELECT falhar) + 1 campo no editor UI.
+
 ---
 
-## 8. Princípio operacional — UI é fonte de dados (decisão #13)
+## 8. Princípio operacional — UI é fonte de dados (D13)
 
 Citação Marcelo:
 
@@ -553,13 +621,23 @@ Aplicação nas 4 entidades de §7:
 
 **Redução ~45% do escopo original** após cruzada que expôs UI/components/queries existentes. Unidade de medida (sprint/PR) é placeholder — Marcelo define cadência.
 
-### Fase A — Connect (sem migration nova, ~5 PRs)
+### Marcos cravados (decisão P10 — 2026-05-17)
+
+| Marco | Data | Critério objetivo |
+|---|---|---|
+| **M-30d** | **16/jun/2026** | GymSite M1+M2 (Linear `gymsite-intelligence`) entregues + 1 lead real captado e processado end-to-end |
+| **M-60d** | **16/jul/2026** | Fase E (telemetria Athena HR — E.1+E.2+E.3) em produção; Vectra + GymSite com `R$ economizado/agente/mês` mensurável em `CostAnalytics.tsx` |
+| **M-90d** | **15/ago/2026** | Meta-PMBOK rodando — `projects` row "VectraClaw" criada + 9 handlers Athena executados ≥1x sobre o backlog real. Critério de validação dos 2 dogfoods. Após esse marco: começa busca de advisor + 1ª PME externa |
+
+**Se M-90d não bater, replanejar em vez de empurrar.** Sem deadline objetivo, validação interna vira eterna.
+
+### Fase A — Connect (~5 PRs; A.4 inclui 1 ALTER aditivo conforme decisão P13 Opção 1)
 
 - A.1 `_handle_classify` v2: SELECT amplo (goal + sipoc + bpmn + rag), criar Target row, retornar `outputs.status='needs_sipoc'`
 - A.2 Aposentar 3 listas hardcoded de `operation_type` → ler `operation_types_catalog` (endpoint REST existe)
 - A.3 `_GEMINI_PRO_COST_PER_TOKEN` → ler `llm_models` versionado
-- A.4 `_OPERATION_TYPE_SCORES` → ler `operation_types_catalog.score` (adicionar coluna)
-- A.5 Frontend: criação de Goal abre Oracle SIPOC chat como próximo passo natural (decisão #10)
+- A.4 **(decisão P13 Opção 1 — 2026-05-17)** `ALTER TABLE vectraclip.operation_types_catalog ADD COLUMN routing_score smallint NOT NULL DEFAULT 60 CHECK (routing_score BETWEEN 0 AND 100)` + backfill dos 11 valores conhecidos (29 herdam default — comportamento idêntico ao atual). `_OPERATION_TYPE_SCORES` deixa de ser hardcode em `decision_engine.py` e passa a ler da coluna. Migration completa em §7.7
+- A.5 Frontend: criação de Goal abre Oracle SIPOC chat como próximo passo natural (D10)
 
 ### Fase B — Targets + Operations + automation-design (~4 PRs)
 
@@ -589,7 +667,7 @@ Aplicação nas 4 entidades de §7:
 
 ### Fase F (pós-MVP) — Otimização contínua
 
-- F.1 Athena cria entrada em `routines` (`operation_type='athena-telemetry-review'`, schedule=15d) só pra operations ativas (decisão #9)
+- F.1 Athena cria entrada em `routines` (`operation_type='athena-telemetry-review'`, schedule=15d) só pra operations ativas (D9)
 - F.2 Após Módulo 2 rodando ≥30 dias, Athena propõe `tune_decision_engine` com evidência estatística
 
 ### Fase G (paralela, oportunística) — Oracle encadeamento dinâmico + tool inventory
@@ -605,20 +683,26 @@ Aplicação nas 4 entidades de §7:
 
 ## 10. Pendências reais (decisões pendentes de Marcelo)
 
-| # | Tema | Aguarda | Bloqueia |
+> **Convenção de IDs:** pendências usam prefixo `P` (P1..P13). Decisões consolidadas em §6 usam prefixo `D` (D1..D13). Evita colisão com numeração de decisões.
+
+| ID | Tema | Aguarda | Bloqueia |
 |---|---|---|---|
-| 1 | Nome final dos 2 entregáveis pra venda externa ("Vectraclip Map" / "Vectraclip Run"? outros?) | Marcelo | Pitch externo |
-| 2 | Mapeamento dos 9 daemons atuais nos 4 perfis adaptados (§6.1) | Marcelo na primeira aplicação | C |
-| 3 | `agent_skills` própria vs `agent_specialties` — investigar bug `/agents/{id}?tab=skills` primeiro | Marcelo | C |
-| 4 | Modelo de cobrança Segundo Entregável (execução / agente ativo / economia compartilhada) | Marcelo + comercial | Primeiro contrato |
-| 5 | `csat_surveys` MVP ou pós | Marcelo | B ou pós |
-| 6 | Multi-tenant primeira venda externa | Aguarda dogfood Vectra Cargo | Pós D |
-| 7 | RACI do `sipoc_raci` integra com `project_roles` ou paralelos | Investigação Marcelo | B |
-| 8 | Cap 11 PMBOK (Encerramento, 7 sub-tipos) MVP só Project ou v2 | Marcelo | B (Project track) |
-| 9 | Encerramento legal — agente "Themis" ou checklist humano | Marcelo | Pós B |
-| 10 | Cadência real (sprints/PRs/dias) — placeholders em §9 | Marcelo | Execução |
-| 11 | Renomear `flow_orchestrator.py` → `oracle_flow_state.py` no mesmo PR ou backlog técnico | Marcelo | Cleanup leve |
-| 12 | UI Mapeamento e Orquestração — SPA única ou apps separados | Marcelo + frontend | B/D |
+| P1 | Nome final dos **3 entregáveis** pra venda externa: Mapeamento, Orquestração e **Project on-demand** (atualizado 2026-05-17 — antes eram 2). Candidatos rascunhados: "Vectraclip Map" / "Vectraclip Run" / "Vectraclip Project"? Outros? | Marcelo | Pitch externo |
+| P2 | Mapeamento dos 9 daemons atuais nos 4 perfis adaptados (§6.1) | Marcelo na primeira aplicação | C |
+| P3 | `agent_skills` própria vs `agent_specialties` — investigar bug `/agents/{id}?tab=skills` primeiro. **Inclui cenário de skills criadas autonomamente por providers externos** (ex: Hermes-Nous skill creation — ver PRD-NOUS-HERMES-INTEGRATION §9 R9) — quem é dono, persistência, auditoria | Marcelo | C |
+| P4 | Modelo de cobrança Segundo Entregável (execução / agente ativo / economia compartilhada) | Marcelo + comercial | Primeiro contrato |
+| P5 | `csat_surveys` MVP ou pós | Marcelo | B ou pós |
+| P6 | Multi-tenant primeira venda externa | Aguarda dogfood Vectra Cargo | Pós D |
+| P7 | RACI do `sipoc_raci` integra com `project_roles` ou paralelos | Investigação Marcelo | B |
+| P8 | Cap 11 PMBOK (Encerramento, 7 sub-tipos) MVP só Project ou v2 | Marcelo | B (Project track) |
+| P9 | Encerramento legal — agente "Themis" ou checklist humano | Marcelo | Pós B |
+| ~~P10~~ | ✅ **DECIDIDO 2026-05-17:** cravados 3 marcos objetivos — **M-30d (16/jun/2026):** GymSite M1+M2 entregues + 1 lead real processado; **M-60d (16/jul/2026):** Fase E telemetria Athena HR em produção (Vectra + GymSite com `R$ economizado/agente/mês` no `CostAnalytics.tsx`); **M-90d (15/ago/2026):** meta-PMBOK rodando — `projects` row "VectraClaw" criada + 9 handlers Athena executados ≥1x cada sobre o backlog real. Se M-90d não bater, replaneja em vez de empurrar | — | — |
+| P11 | Renomear `flow_orchestrator.py` → `oracle_flow_state.py` no mesmo PR ou backlog técnico | Marcelo | Cleanup leve |
+| P12 | UI Mapeamento e Orquestração — SPA única ou apps separados | Marcelo + frontend | B/D |
+| ~~P13~~ | ✅ **DECIDIDO 2026-05-17 — Opção 1:** admitir 1 ALTER TABLE aditivo (`ADD COLUMN routing_score smallint NOT NULL DEFAULT 60 CHECK 0..100`) dentro da Fase A. Backfill dos 11 valores conhecidos + 29 herdam default. Risco operacional ~zero (aditivo). Título da Fase A passa a ler "Connect — sem migration nova **exceto A.4 (ALTER aditivo)**". Migration pronta em §7.7 | — | — |
+| P14 | Canal cliente — OpenClaw (build próprio TypeScript) vs Hermes Gateway (Nous Research) vs Híbrido. Decisão delegada a [`ADR-VEC-CANAL-CLIENTE-OPENCLAW-VS-HERMES.md`](./ADR-VEC-CANAL-CLIENTE-OPENCLAW-VS-HERMES.md) — gates objetivos (§8 daquele ADR) só fecham após Fase 3 do PRD-NOUS-HERMES + 30d de dogfood interno. **Depende de:** P3 (skill creation autônoma), P6 (multi-tenant), P12 (UI SPA única vs separados) | Marcelo + dados dos gates | Produção do canal cliente |
+| ~~P15~~ | ✅ **DECIDIDO 2026-05-17 — Opção C (Híbrido progressivo):** GymSite mantém ADK em produção (zero regressão em R$ 4,45/relatório, 5min, multi-tenant RLS). **Até M-30d (16/jun):** adicionar adapter `meta-maps` no `adapter_catalog` do VectraClaw — débito que GymSite obrigaria de qualquer jeito e que serve TODOS os agentes futuros (não só GymSite). **Até M-60d (16/jul):** telemetria Athena HR (Fase E) cobre GymSite via postagem externa de `state_diagnostics.jsonl` + `relatorios.custo_brl` pro `CostAnalytics.tsx`. **Pós-M-60d:** migração trickle agente-a-agente começando pelo A2 DemoAnalyst (puro REST IBGE + Gemini, sem dep Maps) — run paralelo ADK vs Athena por 7 dias, comparar output, se OK → resto migra trickle. **Sub-decisão A3c cascata (Opção I):** Playwright primário + Hermes-Nous como nível 4 (DOM novo/captcha/site nunca mapeado) — só ativa após F1+F2 do PRD-NOUS-HERMES. Veredicto: Tese horizontal vira verdade técnica gradualmente sem big-bang; bus factor 1 favorece micro-refactors; adapter Maps rende em N produtos | — | — |
+| P16 | **Brand split — naming SaaS separado da Vectra Cargo (transportadora)** — 7 nomes no ecosystem hoje (Vectra Cargo + VectraClaw + VectraClip + cargo-flow-navigator/CFN + GymSite + Navi + Hermes daemon). Marcelo decidiu **pós-MVP** ("mexer em nome agora atrasa"). Risco registrado: cliente que googla "Vectra" acha a transportadora antes do produto SaaS; pitch externo precisa marca clara. Quando reabrir: junto com P1 (nome final dos 3 entregáveis) e antes do 1º cliente externo pagante | Marcelo + 1º cliente externo pagante | Pitch externo / Brand materials |
 
 ---
 
@@ -641,6 +725,9 @@ Aplicação nas 4 entidades de §7:
 ### Documentos do projeto
 - `docs/ADR-VEC-COTACAO-DOGFOOD-FREIGHT.md` — princípio "metadata-driven, não hardcoded"
 - `docs/ADR-VEC-WS-GOVERNANCE-BROADCAST.md` — WS broadcasts em endpoints governance (parqueado)
+- `docs/ADR-VEC-CANAL-CLIENTE-OPENCLAW-VS-HERMES.md` — **ADR filho**: decisão de canal cliente (Opção A/B/C); fechamento delegado a este ADR conforme P14
+- `docs/PRD-NOUS-HERMES-INTEGRATION.md` — runtime interno + MCP + adapter Hermes-Nous; pré-requisito do ADR filho
+- `docs/PRD-ATHENA-HR-TRAJECTORY-INGEST.md` — trajectory ingest pra Athena HR; pré-requisito dos gates G1/G2/G7 do ADR filho
 - `docs/PMO-STATUS-2026-05-17.md` — estado consolidado antes desta sessão
 - `docs/AUDIT-HANDLERS-2026-05-16.md` — auditoria que originou a discussão
 - `CLAUDE.md` raiz + `src/CLAUDE.md` + `src/agents/CLAUDE.md` + `src/managed_agents/CLAUDE.md` + `src/services/CLAUDE.md` + `src/api_routes/CLAUDE.md` + `supabase/CLAUDE.md`
@@ -652,7 +739,7 @@ Aplicação nas 4 entidades de §7:
 - `user_marcelo_profile.md` — perfil cognitivo + stake do autor
 - `project_athena_onboarding_pipeline.md` — PR #180 (RAG inicial do tenant)
 - `project_athena_hr_telemetry_optimization.md` — telemetria + recomendação modelo
-- `project_vectraclaw_2_modules_business_model.md` — dois entregáveis em escada
+- `project_vectraclaw_3_modules_business_model.md` — **3 entregáveis** (Mapeamento + Orquestração + Project on-demand); GymSite valida o 3º. Atualizado 2026-05-17 após auditoria GymSite
 - `project_pmbok_surface_next.md` — origem da discussão (rotulada por Claude)
 
 ### Bibliografia citada por Marcelo
