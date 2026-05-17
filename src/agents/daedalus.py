@@ -29,7 +29,8 @@ from uuid import uuid4
 
 logger = logging.getLogger("Daedalus")
 
-DAEDALUS_AGENT_ID = "d4ed4145-0000-4000-8000-000000000005"
+from src.agent_ids import DAEDALUS_AGENT_ID  # SSOT — ver src/agent_ids.py
+
 DAEDALUS_SPECIALTY = "bpmn-modeling"
 
 

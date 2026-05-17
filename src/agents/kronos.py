@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger("Kronos")
 
-HERMES_REPORTER_UUID = "360a96cb-b1c3-4b65-b9fa-2b9cbb59dac1"
+from src.agent_ids import HERMES_REPORTER_AGENT_ID as HERMES_REPORTER_UUID  # SSOT (alias preserva nome local)
 DEFAULT_RECIPIENT = "marcelo.rosas@vectracargo.com.br"
 
 # ──────────────────────────────────────────────────────────────────────────────

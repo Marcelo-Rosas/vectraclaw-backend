@@ -27,7 +27,7 @@ logger = logging.getLogger("Athena")
 # AGENT_ID fixo — substitui FK em tasks.assigned_to_agent_id.
 # Gerado uma única vez via `python -c "import uuid; print(uuid.uuid4())"`.
 # NUNCA alterar — quebraria a FK em milhares de tasks futuras.
-ATHENA_AGENT_ID = "ad4fc1ad-7e2b-4bb6-8bc3-69016ea18b2d"
+from src.agent_ids import ATHENA_AGENT_ID, MNEMOS_AGENT_ID  # SSOT — ver src/agent_ids.py
 
 # Modelo Gemini default para Athena.
 # VEC-399 smoke 2026-05-11: gemini-2.5-pro EXIGE thinking_config.thinking_budget>0
@@ -3730,7 +3730,6 @@ async def _handle_onboarding(prompt: str, input_data: Dict[str, Any]) -> Dict[st
 
     # 6) Dispatch task rag-ingest pro Mnemos
     ingest_task_id: Optional[str] = None
-    _MNEMOS_AGENT_ID = "00000000-0000-0000-0000-000000000003"
     try:
         t_ins = (
             supabase.table("tasks")
@@ -3745,7 +3744,7 @@ async def _handle_onboarding(prompt: str, input_data: Dict[str, Any]) -> Dict[st
                 "status": "queued",
                 "budget_limit": 50_000,
                 "executor_type": "harness",
-                "assigned_to_agent_id": _MNEMOS_AGENT_ID,
+                "assigned_to_agent_id": MNEMOS_AGENT_ID,
                 "input_json": {
                     "document_id": document_id,
                     "filename": filename,

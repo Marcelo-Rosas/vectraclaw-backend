@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("MorpheusDispatcher")
 
-MORPHEUS_AGENT_ID = "00000000-0000-0000-0000-000000000001"
+from src.agent_ids import MORPHEUS_AGENT_ID  # SSOT — ver src/agent_ids.py
 
 # Fallback quando não há linha em workflow_steps (legado / bootstrap).
 OPERATION_SEQUENCE: dict[str, str] = {
