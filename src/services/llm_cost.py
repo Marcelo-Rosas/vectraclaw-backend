@@ -30,15 +30,22 @@ _LLM_COST_CACHE_TTL_S = 300.0
 
 
 def _load_llm_cost(supabase: Any, model_id: str) -> Optional[Dict[str, float]]:
-    """Busca custo por TOKEN do modelo ativo mais recente em `llm_models`.
+    """Busca custos do modelo ativo mais recente em `llm_models`.
+
+    Retorna 3 componentes (todos em USD):
+    - `input` — custo por token de input
+    - `output` — custo por token de output
+    - `per_request` — custo por chamada de tool/feature (ex: Google Search
+      Grounding $0.035/command). Default 0 = cobra só tokens.
 
     Args:
         supabase: cliente Supabase (None em boot offline → retorna None)
-        model_id: id do modelo em `vectraclip.llm_models` (ex: `gemini-2.5-pro`)
+        model_id: id em `vectraclip.llm_models` (ex: `gemini-2.5-pro`,
+            `deep-research-preview-04-2026`)
 
     Returns:
-        `{"input": float, "output": float}` em USD por TOKEN, ou None se
-        supabase indisponível / modelo não encontrado / row inativa.
+        `{"input": float, "output": float, "per_request": float}` em USD,
+        ou None se supabase indisponível / modelo não encontrado.
     """
     if not supabase or not model_id:
         return None
@@ -51,7 +58,11 @@ def _load_llm_cost(supabase: Any, model_id: str) -> Optional[Dict[str, float]]:
     try:
         res = (
             supabase.table("llm_models")
-            .select("id,input_cost_per_1m,output_cost_per_1m,effective_from,is_active")
+            .select(
+                "id,input_cost_per_1m,output_cost_per_1m,"
+                "per_request_cost_usd,per_request_unit,"
+                "effective_from,is_active"
+            )
             .eq("id", model_id)
             .eq("is_active", True)
             .order("effective_from", desc=True)
@@ -67,12 +78,17 @@ def _load_llm_cost(supabase: Any, model_id: str) -> Optional[Dict[str, float]]:
         cost = {
             "input": float(row["input_cost_per_1m"]) / 1_000_000.0,
             "output": float(row["output_cost_per_1m"]) / 1_000_000.0,
+            "per_request": float(row.get("per_request_cost_usd") or 0),
         }
         previous = (cached or {}).get("cost")
         if previous != cost:
             logger.info(
-                "llm_cost refreshed model=%s input=$%.4f/M output=$%.4f/M effective_from=%s",
-                model_id, float(row["input_cost_per_1m"]), float(row["output_cost_per_1m"]),
+                "llm_cost refreshed model=%s input=$%.4f/M output=$%.4f/M per_request=$%.4f (%s) effective_from=%s",
+                model_id,
+                float(row["input_cost_per_1m"]),
+                float(row["output_cost_per_1m"]),
+                cost["per_request"],
+                row.get("per_request_unit") or "-",
                 row.get("effective_from"),
             )
         _LLM_COST_CACHE[model_id] = {"cost": cost, "fetched_at": now}
@@ -82,19 +98,28 @@ def _load_llm_cost(supabase: Any, model_id: str) -> Optional[Dict[str, float]]:
         return None
 
 
-def calc_llm_cost(supabase: Any, model_id: str, tokens: Dict[str, int]) -> float:
-    """Calcula custo USD a partir de tokens dict + model_id.
+def calc_llm_cost(
+    supabase: Any,
+    model_id: str,
+    tokens: Dict[str, int],
+    n_requests: int = 0,
+) -> float:
+    """Calcula custo USD a partir de tokens + n_requests (tool calls).
 
-    Padrão chamado por `_calc_cost(supabase, tokens)` em athena.py / oracle.py.
+    Soma:
+    - `tokens.input * cost.input + tokens.output * cost.output`  (tokens)
+    - `n_requests * cost.per_request`                              (tools/searches)
 
     Args:
-        supabase: cliente Supabase (None → retorna 0.0)
-        model_id: id em `vectraclip.llm_models` (ex: `gemini-2.5-flash`)
-        tokens: dict com chaves `"input"` e `"output"` (int)
+        supabase: cliente (None → retorna 0.0)
+        model_id: id em `vectraclip.llm_models`
+        tokens: dict com `"input"` e `"output"` (int)
+        n_requests: nº de chamadas de tool/feature cobradas separadamente
+            (ex: Google Search queries do grounding). Default 0 (só tokens)
 
     Returns:
-        Custo USD (float). 0.0 se supabase indisponível ou modelo não
-        encontrado (fail-safe — não cravar valor errado).
+        Custo USD (float). 0.0 se supabase indisponível ou modelo não em
+        catálogo (fail-safe — não cravar valor errado).
     """
     cost = _load_llm_cost(supabase, model_id)
     if cost is None:
@@ -102,4 +127,5 @@ def calc_llm_cost(supabase: Any, model_id: str, tokens: Dict[str, int]) -> float
     return (
         tokens.get("input", 0) * cost["input"]
         + tokens.get("output", 0) * cost["output"]
+        + max(0, int(n_requests)) * cost.get("per_request", 0.0)
     )

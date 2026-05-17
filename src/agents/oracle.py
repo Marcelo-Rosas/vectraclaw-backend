@@ -767,8 +767,11 @@ async def _handle_research_sync(prompt: str, input_data: Dict[str, Any]) -> Dict
     metadata["research_output_format"] = _normalize_research_output_format(input_data.get("output_format"))
     report_text = response.text or ""
 
-    # Extract citations from grounding metadata
+    # Extract citations from grounding metadata + contagem de searches
+    # (search_count = nº de queries Google executadas, base do billing
+    # Search Grounding $0.035/command Gemini 2.5).
     citations: list = []
+    search_count = 0
     for candidate in (response.candidates or []):
         gm = getattr(candidate, "grounding_metadata", None)
         if gm:
@@ -779,6 +782,9 @@ async def _handle_research_sync(prompt: str, input_data: Dict[str, Any]) -> Dict
                         "title": getattr(web, "title", ""),
                         "uri": web.uri,
                     })
+            # web_search_queries[] é a métrica de billing real
+            search_count += len(getattr(gm, "web_search_queries", []) or [])
+    metadata["search_count"] = search_count
 
     structured_data = await persist_prospect_from_oracle_research(
         supabase,
@@ -905,8 +911,17 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
             "status_override": None,
         }
 
-    tokens = (result.get("metadata") or {}).get("tokens", {})
-    cost_usd = _calc_cost(supabase, tokens)
+    # Cost-aware multi-modelo (fix smoke #189 + Opção C 2026-05-17):
+    # - `model_used` da metadata = qual modelo o handler realmente rodou
+    #   (Flash, Pro, ou Deep Research). Cada um tem preço próprio em llm_models.
+    # - `search_count` = nº de Google Search queries que o grounding executou.
+    #   Cobrado separadamente ($0.035/command Gemini 2.5). Capturado em
+    #   _handle_research_sync via web_search_queries da grounding_metadata.
+    metadata_out = result.get("metadata") or {}
+    tokens = metadata_out.get("tokens", {})
+    model_used = metadata_out.get("model_used") or ORACLE_DEFAULT_MODEL
+    n_requests = int(metadata_out.get("search_count") or 0)
+    cost_usd = calc_llm_cost(supabase, model_used, tokens, n_requests=n_requests)
     require_review = bool(input_data.get("require_human_review"))
 
     logger.info(
