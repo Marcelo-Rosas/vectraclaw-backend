@@ -107,13 +107,30 @@ def test_huggingface_passes_config_dict(monkeypatch):
     assert captured[0]["config"]["hf_token"] == "hf_xxx"
 
 
+def test_groq_passes_config_dict(monkeypatch):
+    """GroqAgentClient deve receber `config=` (mesmo padrão dos demais OpenAI-compat)."""
+    captured: list = []
+
+    class FakeGroq:
+        def __init__(self, **kw):
+            captured.append(kw)
+
+    monkeypatch.setitem(PROVIDER_CLIENT_MAP, "groq", FakeGroq)
+    get_agent_client("groq", config={
+        "api_key": "gsk_test",
+        "model_id": "llama-3.3-70b-versatile",
+    })
+    assert captured[0]["config"]["api_key"] == "gsk_test"
+
+
 def test_provider_map_has_expected_slots():
     """Sentinel de regressão — garante que todos os slots conhecidos existem."""
     assert set(PROVIDER_CLIENT_MAP.keys()) == {
-        "anthropic", "ollama", "huggingface", "openai", "google",
+        "anthropic", "ollama", "huggingface", "groq", "openai", "google",
     }
     assert PROVIDER_CLIENT_MAP["openai"] is None
     assert PROVIDER_CLIENT_MAP["google"] is None
     assert PROVIDER_CLIENT_MAP["anthropic"] is not None
     assert PROVIDER_CLIENT_MAP["ollama"] is not None
     assert PROVIDER_CLIENT_MAP["huggingface"] is not None
+    assert PROVIDER_CLIENT_MAP["groq"] is not None
