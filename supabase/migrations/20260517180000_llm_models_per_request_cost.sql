@@ -32,16 +32,18 @@ COMMENT ON COLUMN vectraclip.llm_models.per_request_unit IS
 -- Entry pro Deep Research: alias dos preços do Gemini 2.5 Pro +
 -- Search Grounding $0.035/search (tier paid Gemini 2.5, após free 1.5k RPD).
 -- DEEP_RESEARCH_AGENT em src/services/gemini_interactions.py:8 grava esse id.
+-- Nota: cache_read_cost_per_1m é NOT NULL no schema (constatado no 1º push
+-- que falhou). Setamos 0 — Deep Research não tem cache pricing distinto.
 INSERT INTO vectraclip.llm_models (
   id, provider, display_name,
-  input_cost_per_1m, output_cost_per_1m,
+  input_cost_per_1m, output_cost_per_1m, cache_read_cost_per_1m,
   per_request_cost_usd, per_request_unit,
   context_window_k, effective_from, is_active
 ) VALUES (
   'deep-research-preview-04-2026',
   'google',
   'Deep Research (Gemini 2.5 Pro + Search Grounding)',
-  1.25, 10.00,
+  1.25, 10.00, 0,
   0.035, 'search_command',
   2000, '2026-01-01', true
 ) ON CONFLICT (id, effective_from) DO NOTHING;
