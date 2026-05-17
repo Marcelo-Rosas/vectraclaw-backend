@@ -2805,7 +2805,15 @@ MOCK_HEARTBEATS = [{
     "createdAt": "2026-04-19T00:00:00Z"
 }]
 
-_REAL_COMPANY_ID = "01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2"
+# F5 N2: era literal "01b9b40e-..." (UUID real da company Vectra Cargo em PROD).
+# Aparece em 13 mocks de heartbeats/agents/tasks usados em modo dev (supabase=None).
+# Mover pra env var documenta que é DEV FIXTURE pra alinhar dashboard mock com
+# dados que existem em prod — facilita teste cross-mock/real. NÃO é hardcode de
+# negócio (P6 — decisão registrada: dev fixture; secret-like UUID fora do código).
+_REAL_COMPANY_ID = os.getenv(
+    "VECTRACLAW_DEV_COMPANY_ID",
+    "01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2",  # fallback Vectra Cargo prod company_id
+)
 # IDs abaixo são apenas para modo mock (supabase=None). No DB real os UUIDs são gerados pelo gen_random_uuid().
 
 MOCK_ADAPTERS = [
@@ -8496,12 +8504,46 @@ async def patch_llm_model(request: Request, model_id: str, payload: Dict[str, An
         update_data = {field_map[k]: v for k, v in payload.items() if k in field_map}
         if not update_data:
             raise HTTPException(status_code=400, detail="no_fields_to_update")
+        # F5 bug fix (PR-AUDIT-original): UPDATE WHERE composto (id, effective_from).
+        # llm_models PK é composta (id, effective_from) — UPDATE WHERE id=X cobria
+        # TODAS as versões; quando havia múltiplas, mudar effective_from violava
+        # UNIQUE (id, effective_from). F4 hygiene migration consolidou 1 ativa por id,
+        # mas o handler ainda precisa cobrir caso de quem queira editar versão
+        # histórica (effectiveFrom explícito no payload).
+        #
+        # Compat retro: se payload não trouxer effectiveFrom, busca a row ATIVA
+        # mais recente (mesmo lookup do llm_cost.py:_load_llm_cost). UI atual
+        # (EditLlmModelDialog) será atualizada em PR frontend pra mandar explícito.
+        target_effective_from = (
+            payload.get("effectiveFrom")
+            or payload.get("effective_from")
+        )
+        if not target_effective_from:
+            latest = (
+                supabase.table("llm_models")
+                .select("effective_from")
+                .eq("id", model_id)
+                .eq("is_active", True)
+                .order("effective_from", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if not latest.data:
+                raise HTTPException(status_code=404, detail="llm_model_not_found")
+            target_effective_from = latest.data[0]["effective_from"]
+
         # ACCEPTED bypass: llm_models é catalog CROSS-TENANT (não tem company_id).
         # G2.1 (PR #168) criou policy WRITE platform_admin no DB, mas Marcelo
         # (tenant admin) NÃO é platform_admin — UI tenant não consegue gerenciar.
         # Mantém service_role aqui; UI de gerência futura via admin console de
         # plataforma quando RBAC platform_admin estiver implementado.
-        res = supabase.table("llm_models").update(update_data).eq("id", model_id).execute()
+        res = (
+            supabase.table("llm_models")
+            .update(update_data)
+            .eq("id", model_id)
+            .eq("effective_from", target_effective_from)
+            .execute()
+        )
         if not res.data:
             raise HTTPException(status_code=404, detail="llm_model_not_found")
         return LlmModel(**res.data[0]).to_zod_dict()

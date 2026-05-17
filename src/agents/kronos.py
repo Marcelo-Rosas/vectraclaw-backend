@@ -29,7 +29,15 @@ from typing import Any, Optional
 logger = logging.getLogger("Kronos")
 
 from src.agent_ids import HERMES_REPORTER_AGENT_ID as HERMES_REPORTER_UUID  # SSOT (alias preserva nome local)
-DEFAULT_RECIPIENT = "marcelo.rosas@vectracargo.com.br"
+
+# F5 N5: email pessoal era literal hardcoded em 3 callsites (default param +
+# 2 fallbacks `.get("RECIPIENT", DEFAULT_RECIPIENT)`). Mover pra env var.
+# Idealmente recipient vem de agent_specialty_configs.values.recipient (mesmo
+# pattern de HermesReporter) — env é fallback dev/test.
+DEFAULT_RECIPIENT = os.getenv(
+    "KRONOS_DEFAULT_RECIPIENT",
+    "marcelo.rosas@vectracargo.com.br",  # fallback dev
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data types

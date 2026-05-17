@@ -628,7 +628,7 @@ class ResilientHarnessDaemon:
             return
 
         import asyncio as _aio
-        from src.services.gemini_interactions import get_research_status, _calc_cost
+        from src.services.gemini_interactions import get_research_status  # _calc_cost dropped — unused import
         from src.agents.oracle import (
             persist_prospect_from_oracle_research,
             _normalize_research_output_format,

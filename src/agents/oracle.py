@@ -246,15 +246,6 @@ def _resolve_model(input_data: Dict[str, Any]) -> str:
     return str(model)
 
 
-def _calc_cost(supabase: Any, model: str, tokens: Dict[str, int]) -> float:
-    """Calcula custo USD do modelo recebido (catalog-driven via llm_models).
-
-    F2 do GSD: param `model` agora obrigatório. Antes hardcoded em
-    `ORACLE_DEFAULT_MODEL`.
-    """
-    return calc_llm_cost(supabase, model, tokens)
-
-
 async def _handle_extract(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
     ctx = input_data.get("_company_context") or _VECTRA_CONTEXT
     system = (

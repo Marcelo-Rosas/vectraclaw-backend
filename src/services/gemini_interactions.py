@@ -6,7 +6,13 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("GeminiInteractions")
 
 DEEP_RESEARCH_AGENT = "deep-research-preview-04-2026"
-_COST_PER_TOKEN = {"input": 0.075 / 1_000_000, "output": 0.30 / 1_000_000}
+
+# F5 N3 (2026-05-17): `_COST_PER_TOKEN` hardcoded ($0.075/$0.30 per 1M tokens
+# era preço Flash sub-estimado) aposentado. Custo agora vem de
+# `vectraclip.llm_models` via `src.services.llm_cost.calc_llm_cost` — preço
+# do `DEEP_RESEARCH_AGENT` foi seedado em llm_models pelo PR #192 (Opção C
+# Deep Research) com `per_request_cost_usd=0.035` (Google Search grounding).
+# Regra de Ouro #2 NO HARDCODE.
 
 
 def normalize_research_documents(documents: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -42,11 +48,15 @@ def enrich_research_prompt_with_documents(prompt: str, documents: Optional[List[
     return f"{block}\n\n{prompt}"
 
 
-def _calc_cost(tokens: Dict[str, int]) -> float:
-    return (
-        tokens.get("input", 0) * _COST_PER_TOKEN["input"]
-        + tokens.get("output", 0) * _COST_PER_TOKEN["output"]
-    )
+def _calc_cost(tokens: Dict[str, int], supabase: Optional[Any] = None) -> float:
+    """Custo USD do DEEP_RESEARCH_AGENT via lookup catalog-driven em llm_models.
+
+    F5 N3: substitui hardcoded `_COST_PER_TOKEN`. Supabase é opcional pra preservar
+    callers de `get_research_status` (utility sem supabase no escopo) — se ausente,
+    `calc_llm_cost` retorna 0.0 fail-safe.
+    """
+    from src.services.llm_cost import calc_llm_cost
+    return calc_llm_cost(supabase, DEEP_RESEARCH_AGENT, tokens)
 
 
 async def start_research(
