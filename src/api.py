@@ -8536,7 +8536,9 @@ async def list_operation_types(request: Request):
             supabase.table("operation_types_catalog")
             .select(
                 "id,name,description,category,icon,color,display_order,"
-                "primary_agent_id,default_specialty_slug,is_active"
+                "primary_agent_id,default_specialty_slug,is_active,"
+                # A.4 do ADR Fase A (P13): score CMA × Harness lido pelo decision_engine
+                "routing_score"
             )
             .eq("is_active", True)
             .order("display_order")

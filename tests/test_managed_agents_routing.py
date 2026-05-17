@@ -1,8 +1,39 @@
 """
 Tests para o Decision Engine e roteamento CMA vs Harness.
 """
+import time
 import pytest
 from src.managed_agents.decision_engine import should_use_managed_agent, CMA_THRESHOLD
+
+
+# A.4 do ADR Fase A (2026-05-17): decision_engine virou catalog-driven —
+# routing_score vem de operation_types_catalog. Em testes sem Supabase, o
+# cache do helper fica vazio e cai no default 60 (CMA), quebrando testes que
+# esperam orchestration→harness etc.
+#
+# Fixture autouse pre-popula o cache com os 10 valores historicamente
+# hardcoded pra preservar comportamento dos testes pré-A.4. Em produção, esses
+# valores vêm do DB (migration 20260517170000 fez backfill idêntico).
+@pytest.fixture(autouse=True)
+def _seed_routing_score_cache(monkeypatch):
+    from src.managed_agents import decision_engine
+    monkeypatch.setattr(
+        decision_engine,
+        "_ROUTING_SCORE_CACHE",
+        {
+            "orchestration": 0,
+            "code_generation": 15,
+            "qa_testing": 35,
+            "email_lead": 10,
+            "freight-quotation": 80,
+            "code_review": 65,
+            "document_generation": 75,
+            "other": 60,
+            "research": 85,
+            "athena-onboarding": 85,
+        },
+    )
+    monkeypatch.setattr(decision_engine, "_ROUTING_SCORE_CACHE_FETCHED_AT", time.time())
 
 
 def _task(operation_type="other", description="", budget_limit=1000):
