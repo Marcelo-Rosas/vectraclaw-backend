@@ -51,12 +51,31 @@ descriptors, qualquer payload JSONB consumido pelo frontend com Zod schema rígi
 
 ---
 
-## P1 — Catalog-driven enums (no Literal hardcoded)
+## P1 — Catalog-driven enums (no Literal hardcoded) — **REGRA DE OURO #2**
 
-**Regra:** se existe tabela `vectraclip.X_catalog` (ou `X_types`, `X_modes`, `X_status`),
-TODO valor que seria `Literal[...]` ou `z.enum([...])` deve ser **`str` / `z.string().min(1)`**
-+ comentário curto apontando o catálogo. Validação contra o catálogo acontece
+> **Citação Marcelo 2026-05-17 (caps lock):** _"O projeto foi contruido com base em metadados e tabelas independentes configuraveis - NÃO PODE EXISTIR NADA HARDCODADO"_
+
+**Regra:** se existe tabela `vectraclip.X_catalog` (ou `X_types`, `X_modes`, `X_status`,
+`llm_models`, `adapter_catalog`, `agent_specialties`), TODO valor que seria `Literal[...]`
+ou `z.enum([...])` ou `CONSTANT = [...]` em código ou env-var deve ser **`str` /
+`z.string().min(1)` + lookup no catálogo**. Validação contra o catálogo acontece
 no validator do PUT (backend) e na render (frontend lista via GET endpoint).
+
+**Escopo amplo (não só enums):**
+- Constantes de modelos / cost-per-token → `llm_models` (versionado)
+- Lista de providers / adapters → `adapter_catalog`
+- Specialties / prompts editáveis → `agent_specialties` + `agent_specialty_configs`
+- Fallback chains / hyperparams (max_turns, temperature, approval_mode) → `agent_adapter_configs.field_values_json`
+- Routing scores → `operation_types_catalog.routing_score` (após P13)
+- Feature flags por tenant → `adapter_catalog.is_active` ou catálogo dedicado
+- Tipos de operação / status → catálogos respectivos
+- Keys de API → `agent_adapter_configs` ou referência a vault (não env compartilhado)
+
+**Sinais de violação (red flags):**
+- Adicionando `HERMES_FOO=...` ou `GEMINI_FOO=...` em `.env.example` → tem tabela espelho?
+- Adicionando `CONSTANT_DICT = {...}` em `.py` → tem tabela espelho?
+- Hardcoding slug de model em config (ex: `"hermes-4-405b"`) → `llm_models.id` é a fonte
+- "Vou hardcodar pra MVP e migrar depois" → migrar nunca acontece. Fazer certo desde o início.
 
 ### Já aplicado a
 
