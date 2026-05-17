@@ -3,11 +3,17 @@ HuggingFaceAgentClient: executa tasks via HuggingFace Inference Providers,
 uma API OpenAI-compatible que roteia para 15+ inference providers
 (Groq, Cerebras, Together, Fireworks, etc.) através de endpoint único.
 
-Endpoint: https://router.huggingface.co/v1
-Auth:     Bearer {HF_TOKEN}
+Auth:     Bearer {hf_token}
+Endpoint: vem de `config["base_url"]` (adapter_field_definitions.base_url,
+          padrão Ollama). NÃO existe constante HF_BASE_URL — Regra de Ouro
+          #2 NO HARDCODE (docs/CODE-PATTERNS.md §P1, caso 2026-05-17).
 
 Mesma interface (`async def execute_task -> ExecutionResult`) que
 ManagedAgentClient e OllamaAgentClient — o router permanece agnóstico.
+
+Catalog-driven: base_url, hf_token, model_id, provider (inference router),
+temperature, max_tokens vêm de `agent_adapter_configs.field_values_json`.
+Capacidade de tool calling vem de `llm_models.supports_tool_calling`.
 """
 from __future__ import annotations
 
@@ -24,36 +30,13 @@ from .tool_translator import OPENAI_TOOLS, dispatch_tool_call
 
 logger = logging.getLogger("ManagedAgents.HuggingFace")
 
-# Endpoint fixo do roteador HF — não vem do config (intencional).
-HF_BASE_URL = "https://router.huggingface.co/v1"
-
 # Mesmo guard contra loop infinito do Ollama.
 _MAX_TURNS = 20
 
-# Allowlist best-effort de modelos com suporte a tool calling no roteador HF.
-# Verifica-se pelo prefixo (split("/")[0] + "/" + ...) — formato "owner/repo".
-# Lista pode ficar desatualizada; usado só para warning, não bloqueia.
-HF_TOOL_CAPABLE_MODELS = {
-    "meta-llama/Llama-3.3-70B-Instruct",
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "meta-llama/Llama-3.1-70B-Instruct",
-    "meta-llama/Llama-3.1-405B-Instruct",
-    "Qwen/Qwen2.5-72B-Instruct",
-    "Qwen/Qwen2.5-32B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen3-235B-A22B",
-    "moonshotai/Kimi-K2-Instruct-0905",
-    "deepseek-ai/DeepSeek-R1",
-    "mistralai/Mistral-7B-Instruct-v0.3",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "mistralai/Mixtral-8x22B-Instruct-v0.1",
-}
-
-# Providers aceitos pelo campo `provider` (inference router). 'auto' deixa o HF decidir.
-HF_INFERENCE_PROVIDERS = {
-    "auto", "groq", "cerebras", "together", "fireworks",
-    "sambanova", "novita", "deepinfra",
-}
+# Lista de inference providers do HF Router vive em
+# adapter_field_definitions.options_json.values do field `provider` do adapter
+# huggingface. Antiga constante HF_INFERENCE_PROVIDERS era letra morta (zero
+# referências) — removida pelo hardcode-auditor (Regra de Ouro #2, PR #194).
 
 
 class HuggingFaceAgentClient:
@@ -62,11 +45,19 @@ class HuggingFaceAgentClient:
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         config = config or {}
 
+        # base_url: catalog-driven (mesmo pattern Groq/Ollama). SEM default
+        # Python — UI sugere via adapter_field_definitions.options_json.default
+        # https://router.huggingface.co/v1; admin pode mudar (mirror, proxy).
+        base_url = config.get("base_url")
+        if not base_url:
+            raise ValueError(
+                "HuggingFaceAgentClient: base_url ausente no config. "
+                "Configure 'base_url' em agent_adapter_configs.field_values_json "
+                "(default sugerido: https://router.huggingface.co/v1)."
+            )
+
         hf_token = config.get("hf_token") or ""
         if not hf_token:
-            # Em vez de crashar no __init__, deixa execute_task retornar erro
-            # claro. Útil pra que o factory possa ser chamado em testes que não
-            # exercitam a chamada real.
             logger.warning(
                 "HuggingFaceAgentClient: hf_token ausente no config. "
                 "Configure 'hf_token' em agent_adapter_configs antes de executar."
@@ -84,22 +75,10 @@ class HuggingFaceAgentClient:
         except (TypeError, ValueError):
             self.max_tokens = 2048
 
-        # Cliente OpenAI síncrono apontando para o roteador HF; chamadas
-        # vão por asyncio.to_thread (mesmo padrão do OllamaAgentClient).
         # api_key="placeholder" se vazio; execute_task captura o AuthError.
-        self._client = OpenAI(base_url=HF_BASE_URL, api_key=hf_token or "missing")
+        self._base_url = base_url
+        self._client = OpenAI(base_url=base_url, api_key=hf_token or "missing")
         self._has_token = bool(hf_token)
-        self._warn_if_no_tool_support()
-
-    def _warn_if_no_tool_support(self) -> None:
-        if self.model not in HF_TOOL_CAPABLE_MODELS:
-            logger.warning(
-                "HuggingFaceAgentClient: modelo '%s' pode não suportar tool calling. "
-                "Modelos confirmados: %s. "
-                "Se o agente entrar em loop ou retornar vazio, troque para um da lista.",
-                self.model,
-                sorted(HF_TOOL_CAPABLE_MODELS),
-            )
 
     async def execute_task(
         self,
@@ -271,7 +250,7 @@ class HuggingFaceAgentClient:
                 execution_time_seconds=round(elapsed, 3),
                 tokens_per_second=_tps(),
                 error=(
-                    f"HuggingFace Inference inacessível em {HF_BASE_URL}. "
+                    f"HuggingFace Inference inacessível em {self._base_url}. "
                     f"Verifique conectividade e status em status.huggingface.co. Detalhe: {e}"
                 ),
             )

@@ -28,21 +28,9 @@ logger = logging.getLogger("ManagedAgents.Ollama")
 # infinito ignorando o tool_choice="auto" — _MAX_TURNS é a rede de proteção.
 _MAX_TURNS = 20
 
-# Allowlist best-effort de modelos Ollama com suporte conhecido a tool calling.
-# Pode ficar desatualizada — usado apenas para warning, não para bloquear.
-# Modelos fora da lista podem funcionar; se o agente loopar ou retornar vazio,
-# trocar para um confirmado.
-OLLAMA_TOOL_CAPABLE_MODELS = {
-    "llama3.2",
-    "llama3.1",
-    "llama3",
-    "qwen2.5",
-    "qwen2.5-coder",
-    "mistral",
-    "mistral-nemo",
-    "deepseek-r1",
-    "command-r",
-}
+# Capacidade de tool calling agora vem de vectraclip.llm_models.supports_tool_calling
+# (catalog-driven, Regra de Ouro #2). Use src.services.llm_cost.is_tool_capable
+# no decision_engine antes de rotear, em vez de checar aqui no client.
 
 
 class OllamaAgentClient:
@@ -71,18 +59,6 @@ class OllamaAgentClient:
         # Ollama ignora api_key, mas o SDK exige string não-vazia.
         self._client = OpenAI(base_url=base_url, api_key="ollama")
         self._base_url = base_url
-        self._warn_if_no_tool_support()
-
-    def _warn_if_no_tool_support(self) -> None:
-        base = (self.model or "").split(":")[0]
-        if base not in OLLAMA_TOOL_CAPABLE_MODELS:
-            logger.warning(
-                "OllamaAgentClient: modelo '%s' pode não suportar tool calling. "
-                "Modelos confirmados: %s. "
-                "Se o agente entrar em loop ou retornar vazio, troque para um da lista.",
-                self.model,
-                sorted(OLLAMA_TOOL_CAPABLE_MODELS),
-            )
 
     async def execute_task(
         self,

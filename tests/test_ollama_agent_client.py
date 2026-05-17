@@ -180,29 +180,11 @@ async def test_token_counting_handles_none_usage(mock_openai):
 
 
 # ---------------------------------------------------------------------------
-# 6. Warning para modelo fora da allowlist de tool calling
+# 6. Tool capability — capacidade saiu do client (PR #194).
+# Agora vem de vectraclip.llm_models.supports_tool_calling, lido por
+# src.services.llm_cost.is_tool_capable. Tests dessa lógica vivem em
+# tests/test_llm_cost.py.
 # ---------------------------------------------------------------------------
-
-def test_warn_for_non_tool_capable_model(caplog, mock_openai):
-    from src.managed_agents.ollama_agent_client import OllamaAgentClient
-
-    caplog.set_level(logging.WARNING, logger="ManagedAgents.Ollama")
-    OllamaAgentClient(config={"model_id": "phi3:mini"})
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("pode não suportar tool calling" in m for m in messages), (
-        f"Warning ausente. Mensagens capturadas: {messages}"
-    )
-
-
-def test_no_warn_for_tool_capable_model(caplog, mock_openai):
-    from src.managed_agents.ollama_agent_client import OllamaAgentClient
-
-    caplog.set_level(logging.WARNING, logger="ManagedAgents.Ollama")
-    OllamaAgentClient(config={"model_id": "llama3.2:3b"})
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert not any("pode não suportar tool calling" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------

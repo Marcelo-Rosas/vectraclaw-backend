@@ -624,6 +624,21 @@ class LlmModel(CamelModel):
     input_cost_per_1m: float
     output_cost_per_1m: float
     cache_read_cost_per_1m: float
+    # PR #192 — Opção C Deep Research: cobra também por request (search grounding)
+    per_request_cost_usd: float = 0.0
+    per_request_unit: Optional[str] = None
+    # PR #194 — Free tier rate limits (Groq, Gemini free, OpenRouter free).
+    # NULL = sem limite documentado ou paid tier sem cap. Catalog-driven
+    # (decision_engine pode consultar pra decidir fallback se estourar).
+    rate_limit_req_per_min: Optional[int] = None
+    rate_limit_req_per_day: Optional[int] = None
+    rate_limit_tok_per_min: Optional[int] = None
+    rate_limit_tok_per_day: Optional[int] = None
+    # PR #194 — substitui constantes hardcoded `*_TOOL_CAPABLE_MODELS` que
+    # viviam em src/managed_agents/*_agent_client.py (Regra de Ouro #2 NO
+    # HARDCODE — docs/CODE-PATTERNS.md §P1). Default TRUE (LLMs instruct
+    # modernos suportam tool calling); FALSE em guards/embeddings.
+    supports_tool_calling: bool = True
     context_window_k: int
     is_active: bool
     effective_from: str
