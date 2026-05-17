@@ -9,6 +9,23 @@ logger = logging.getLogger("GeminiClient")
 
 _client = None
 
+# F2 GSD (2026-05-17): catalog-drive defaults — Regra de Ouro #2.
+# Handlers de operation_type (athena-*, oracle-research, etc) NÃO USAM mais este
+# default — resolvem via `_resolve_model(input_data)` lendo de
+# agent_specialty_configs.values / agent_shared_config / specialty defaults.
+#
+# `DEFAULT_MODEL` permanece como FALLBACK DE PLATAFORMA legado pra:
+#   - Oracle chat SSE (`stream_generate` em oracle.py:191, oracle_maker.py:105)
+#   - Oracle checker validators (oracle_checker.py:64,84,101)
+#   - sipoc_researcher (utility legada)
+#
+# Esses fluxos recebem `state` langgraph (sem task/input_data) — refator pra
+# catalog-driven exige mudança de assinatura em N callers (escopo separado F2b).
+# Cai no P6 do CODE-PATTERNS (decisão registrada): fallback técnico SDK, não
+# config de negócio per-tenant. Oracle chat hoje é fluxo SIPOC interno Vectra.
+#
+# TODO F2b: substituir por leitura de agent_shared_config.values["model_id"]
+# pro ORACLE_AGENT_ID — Oracle chat fica catalog-driven sem mexer em N callers.
 DEFAULT_MODEL = "gemini-2.5-flash"
 
 # Retryable HTTP status codes: rate-limit (429) and transient server errors (500, 503).

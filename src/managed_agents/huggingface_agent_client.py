@@ -63,7 +63,13 @@ class HuggingFaceAgentClient:
                 "Configure 'hf_token' em agent_adapter_configs antes de executar."
             )
 
-        self.model = config.get("model_id") or "meta-llama/Llama-3.3-70B-Instruct"
+        self.model = config.get("model_id")
+        if not self.model:
+            raise ValueError(
+                "HuggingFaceAgentClient: model_id ausente no config. "
+                "Configure 'model_id' em agent_adapter_configs.field_values_json "
+                "(catalog-driven via adapter_field_definitions.options_json.source='llm_models')."
+            )
         self._inference_provider = (config.get("provider") or "auto").strip() or "auto"
 
         try:

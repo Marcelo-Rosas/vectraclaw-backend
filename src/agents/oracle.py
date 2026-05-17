@@ -196,12 +196,12 @@ async def stream_oracle_chat(payload: dict) -> AsyncIterator[str]:
 # Fase 2 — Daemon Oracle: execute_specialty + handlers
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Cálculo de custo USD — catalog-driven (A.3 do ADR Fase A — 2026-05-17).
-# ANTES: `_GEMINI_FLASH_COST_PER_TOKEN` ($0.075/$0.30 per 1M) desalinhado do
-# `model="gemini-2.5-pro"` real usado (linha 741/760). Cost ~16x sub-estimado.
-# DEPOIS: lookup em `vectraclip.llm_models` via `src/services/llm_cost.py`.
-# Regra de Ouro #2 (NO HARDCODE).
-ORACLE_DEFAULT_MODEL = "gemini-2.5-pro"
+# F2 do GSD ampliado (2026-05-17): `ORACLE_DEFAULT_MODEL` hardcoded aposentado.
+# Modelo agora vem 100% do catalog via cadeia: input_json > agent_specialty_configs.values >
+# agent_shared_config.values > agent_specialties.config_schema.defaults.
+# Histórico antigo (`_GEMINI_FLASH_COST_PER_TOKEN` $0.075/$0.30 per 1M desalinhado
+# do `model="gemini-2.5-pro"` real → cost ~16x sub-estimado) resolvido por
+# catalog-driven via `src/services/llm_cost.py:calc_llm_cost`.
 
 _VECTRA_CONTEXT = (
     "Contexto da empresa: Vectra Cargo é uma transportadora brasileira de modal EXCLUSIVAMENTE RODOVIÁRIO. "
@@ -212,11 +212,47 @@ _VECTRA_CONTEXT = (
 )
 
 
-def _calc_cost(supabase: Any, tokens: Dict[str, int]) -> float:
-    """Calcula custo USD via lookup em `llm_models` pra ORACLE_DEFAULT_MODEL.
-    Retorna 0.0 se supabase indisponível ou modelo não encontrado (fail-safe).
+def _resolve_model(input_data: Dict[str, Any]) -> str:
+    """Resolve model_id via cadeia catalog (Regra de Ouro #2 NO HARDCODE).
+
+    Idêntico ao helper de athena.py. Cadeia:
+        1. input_data["model_id"]
+        2. input_data["_resolved_config"]["model_id"] (agent_specialty_configs.values)
+        3. input_data["_resolved_shared"]["model_id"] (agent_shared_config.values)
+        4. input_data["_resolved_specialty"].defaults["model_id"] (config_schema default)
+
+    Raise ValueError se nada resolver.
     """
-    return calc_llm_cost(supabase, ORACLE_DEFAULT_MODEL, tokens)
+    from src.services.specialty_resolver import resolve_value
+
+    specialty = input_data.get("_resolved_specialty")
+    specialty_defaults = specialty.defaults if specialty else {}
+
+    model = resolve_value(
+        "model_id",
+        payload=input_data,
+        config_values=input_data.get("_resolved_config") or {},
+        shared_values=input_data.get("_resolved_shared") or {},
+        specialty_defaults=specialty_defaults,
+    )
+    if not model:
+        raise ValueError(
+            "Oracle: model_id não resolvido pela cadeia catalog. "
+            "Configure 'model_id' em agent_specialty_configs.values "
+            "(via UI /admin/agents/{id}/specialty-config) ou em "
+            "agent_shared_config.values, ou defina default em "
+            "agent_specialties.config_schema."
+        )
+    return str(model)
+
+
+def _calc_cost(supabase: Any, model: str, tokens: Dict[str, int]) -> float:
+    """Calcula custo USD do modelo recebido (catalog-driven via llm_models).
+
+    F2 do GSD: param `model` agora obrigatório. Antes hardcoded em
+    `ORACLE_DEFAULT_MODEL`.
+    """
+    return calc_llm_cost(supabase, model, tokens)
 
 
 async def _handle_extract(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -227,7 +263,7 @@ async def _handle_extract(prompt: str, input_data: Dict[str, Any]) -> Dict[str, 
         "Extraia os dados solicitados e retorne exclusivamente JSON válido, sem texto extra."
     )
     text, metadata = await generate(
-        DEFAULT_MODEL, prompt,
+        _resolve_model(input_data), prompt,
         system_instruction=system,
         response_mime_type="application/json",
     )
@@ -253,7 +289,7 @@ async def _handle_summarize(prompt: str, input_data: Dict[str, Any]) -> Dict[str
         "Você é um especialista em síntese. "
         "Produza um sumário claro e objetivo em PT-BR usando markdown."
     )
-    text, metadata = await generate(DEFAULT_MODEL, prompt, system_instruction=system)
+    text, metadata = await generate(_resolve_model(input_data), prompt, system_instruction=system)
     return {"report_markdown": text, "structured_data": None, "metadata": metadata}
 
 
@@ -267,7 +303,7 @@ async def _handle_rag(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]
         "Você é um assistente RAG. Responda com base no contexto fornecido. "
         "Se a resposta não estiver no contexto, diga explicitamente. Responda em PT-BR."
     )
-    text, metadata = await generate(DEFAULT_MODEL, full_prompt, system_instruction=system)
+    text, metadata = await generate(_resolve_model(input_data), full_prompt, system_instruction=system)
     return {"report_markdown": text, "structured_data": None, "metadata": metadata}
 
 
@@ -372,7 +408,7 @@ async def _handle_vision(prompt: str, input_data: Dict[str, Any]) -> Dict[str, A
     ctx = input_data.get("_company_context") or _VECTRA_CONTEXT
     t0 = time.monotonic()
     response = await client.aio.models.generate_content(
-        model=DEFAULT_MODEL,
+        model=_resolve_model(input_data),
         contents=contents,
         config=_gt.GenerateContentConfig(
             system_instruction=f"{ctx}\n\nAnalise os documentos e responda em PT-BR.",
@@ -410,15 +446,20 @@ def _normalize_research_output_format(value: Any) -> str:
     return "markdown"
 
 
-async def _extract_company_profile(report_markdown: str) -> Optional[Dict[str, Any]]:
-    """Compat: extrai perfil enxuto. Preferir _extract_prospect_bundle em fluxos novos."""
-    bundle = await _extract_prospect_bundle(report_markdown, [])
+async def _extract_company_profile(report_markdown: str, model: str) -> Optional[Dict[str, Any]]:
+    """Compat: extrai perfil enxuto. Preferir _extract_prospect_bundle em fluxos novos.
+
+    F2 GSD: param `model` obrigatório (catalog-driven).
+    """
+    bundle = await _extract_prospect_bundle(report_markdown, [], model=model)
     return bundle
 
 
 async def _extract_prospect_bundle(
     report_markdown: str,
     submitted_urls: List[str],
+    *,
+    model: str,
 ) -> Optional[Dict[str, Any]]:
     """
     Extrai o máximo possível para `prospect_profiles` + fontes + e-mail (Seção 7).
@@ -462,7 +503,7 @@ async def _extract_prospect_bundle(
             f"RELATÓRIO:\n{report_markdown[:12000]}"
         )
         text, _meta = await generate(
-            model=DEFAULT_MODEL,
+            model=model,
             prompt=extraction_prompt,
             response_mime_type="application/json",
         )
@@ -476,7 +517,7 @@ async def _extract_prospect_bundle(
 _RESEARCH_SECTIONS_MAX_CHARS = 120_000
 
 
-async def _extract_research_sections(report_markdown: str) -> Optional[Dict[str, Any]]:
+async def _extract_research_sections(report_markdown: str, *, model: str) -> Optional[Dict[str, Any]]:
     """
     Segunda passagem: extrai do relatório um JSON rico (SIPOC, scores, mídias, artigos, abordagem).
     Usado quando input_json.output_format é json ou both.
@@ -500,7 +541,7 @@ async def _extract_research_sections(report_markdown: str) -> Optional[Dict[str,
             f"RELATÓRIO:\n{body}"
         )
         text, _meta = await generate(
-            model=DEFAULT_MODEL,
+            model=model,
             prompt=extraction_prompt,
             response_mime_type="application/json",
         )
@@ -525,7 +566,7 @@ async def enrich_research_structured_output(
         return structured_profile
     if not report_markdown or len(report_markdown) < 200:
         return structured_profile
-    sections = await _extract_research_sections(report_markdown)
+    sections = await _extract_research_sections(report_markdown, model=_resolve_model(input_data))
     if not sections:
         return structured_profile
     merged: Dict[str, Any] = {}
@@ -643,7 +684,7 @@ async def persist_prospect_from_oracle_research(
             supabase, company_id=company_id, task_id=task_id, urls=urls
         )
 
-    bundle = await _extract_prospect_bundle(report_markdown, urls) or {}
+    bundle = await _extract_prospect_bundle(report_markdown, urls, model=_resolve_model(input_data)) or {}
     structured = await enrich_research_structured_output(
         report_markdown, bundle, input_data
     )
@@ -741,9 +782,11 @@ async def _handle_research_sync(prompt: str, input_data: Dict[str, Any]) -> Dict
     except Exception as _cap_err:
         logger.warning("_handle_research_sync: playwright pre-capture falhou: %s", _cap_err)
 
+    # F2 GSD: model vem do catalog (specialty_config.model_id) — antes era literal "gemini-2.5-pro".
+    resolved_model = _resolve_model(input_data)
     t0 = time.monotonic()
     response = await client.aio.models.generate_content(
-        model="gemini-2.5-pro",
+        model=resolved_model,
         contents=[enriched_prompt],
         config=_gt.GenerateContentConfig(
             system_instruction=(
@@ -762,7 +805,7 @@ async def _handle_research_sync(prompt: str, input_data: Dict[str, Any]) -> Dict
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
     metadata = extract_metadata(response, duration_ms)
-    metadata["model_used"] = "gemini-2.5-pro"
+    metadata["model_used"] = resolved_model  # F2: telemetria honesta (era literal antes)
     metadata["backend"] = "sync_fallback"
     metadata["research_output_format"] = _normalize_research_output_format(input_data.get("output_format"))
     report_text = response.text or ""
@@ -890,12 +933,18 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
         }
 
     company_context = await _get_company_context(supabase, task.get("company_id", ""))
+    # F2 GSD: PROPAGA _resolved_* (config/shared/specialty) populados pelo daemon.
+    # Antes, esses campos eram descartados aqui e os handlers usavam
+    # ORACLE_DEFAULT_MODEL hardcoded — agent_specialty_configs.values era placebo.
     enriched_input = {
         **input_data,
         "_company_context": company_context,
         "_supabase": supabase,
         "_company_id": task.get("company_id"),
         "_task_id": task.get("id"),
+        "_resolved_config": task.get("_resolved_config") or {},
+        "_resolved_shared": task.get("_resolved_shared") or {},
+        "_resolved_specialty": task.get("_resolved_specialty"),
     }
 
     handler = _SPECIALTY_DISPATCH.get(op, _handle_summarize)
@@ -919,9 +968,16 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
     #   _handle_research_sync via web_search_queries da grounding_metadata.
     metadata_out = result.get("metadata") or {}
     tokens = metadata_out.get("tokens", {})
-    model_used = metadata_out.get("model_used") or ORACLE_DEFAULT_MODEL
+    # F2 GSD: fallback chain `metadata.model_used > _resolve_model(input_data)` —
+    # handler já resolveu via catalog em _handle_research_sync, mas se ele falhar
+    # antes de setar metadata.model_used, ainda há resolução pela mesma cadeia.
+    try:
+        model_used = metadata_out.get("model_used") or _resolve_model(input_data)
+    except ValueError:
+        # Nada resolvido (sem config). Cost vira 0 fail-safe (em vez de raise pós-execução).
+        model_used = ""
     n_requests = int(metadata_out.get("search_count") or 0)
-    cost_usd = calc_llm_cost(supabase, model_used, tokens, n_requests=n_requests)
+    cost_usd = calc_llm_cost(supabase, model_used, tokens, n_requests=n_requests) if model_used else 0.0
     require_review = bool(input_data.get("require_human_review"))
 
     logger.info(

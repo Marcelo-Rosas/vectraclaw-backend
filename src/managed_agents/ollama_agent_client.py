@@ -45,7 +45,13 @@ class OllamaAgentClient:
             config.get("base_url")
             or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
         )
-        self.model = config.get("model_id") or "llama3.2"
+        self.model = config.get("model_id")
+        if not self.model:
+            raise ValueError(
+                "OllamaAgentClient: model_id ausente no config. "
+                "Configure 'model_id' em agent_adapter_configs.field_values_json "
+                "(catalog-driven via adapter_field_definitions.options_json.source='llm_models')."
+            )
 
         try:
             self.temperature = float(config.get("temperature", 0.3))
