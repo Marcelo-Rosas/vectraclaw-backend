@@ -16,6 +16,14 @@
 -- HuggingFaceAgentClient (que roteia pra Groq via HF Router), este adapter
 -- chama Groq direto. Vantagem: menos hop, ~30% mais rápido (smoke: 0.55s
 -- direto vs 0.82s via HF Router).
+-- Adiciona adapter `groq` ao catálogo, com field_definitions pra UI editar
+-- config (api_key, model_id, temperature, max_tokens) + seed 4 modelos Groq
+-- populares em llm_models pra alimentar o select de model_id.
+--
+-- Origem: 2026-05-17 — Marcelo trouxe API key Groq direta. Em paralelo ao
+-- HuggingFaceAgentClient (que roteia pra Groq via HF Router), este adapter
+-- chama Groq direto (https://api.groq.com/openai/v1). Vantagem: menos hop,
+-- ~30% mais rápido (smoke: 0.55s direto vs 0.82s via HF Router).
 --
 -- Cliente Python: src/managed_agents/groq_agent_client.py (registrado em
 -- PROVIDER_CLIENT_MAP['groq'] do factory).
