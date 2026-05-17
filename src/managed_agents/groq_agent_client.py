@@ -71,7 +71,13 @@ class GroqAgentClient:
                 "execute_task vai retornar erro claro até que seja configurado."
             )
 
-        self.model = config.get("model_id") or "llama-3.3-70b-versatile"
+        self.model = config.get("model_id")
+        if not self.model:
+            raise ValueError(
+                "GroqAgentClient: model_id ausente no config. "
+                "Configure 'model_id' em agent_adapter_configs.field_values_json "
+                "(catalog-driven via adapter_field_definitions.options_json.source='llm_models')."
+            )
 
         try:
             self.temperature = float(config.get("temperature", 0.3))
