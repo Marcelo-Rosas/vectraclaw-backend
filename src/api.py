@@ -3648,17 +3648,10 @@ class NewTaskInput(BaseModel):
     title: str
     description: str
     budgetLimit: int
-    operationType: Optional[
-        Literal[
-            "orchestration",
-            "code_generation",
-            "code_review",
-            "research",
-            "document_generation",
-            "qa_testing",
-            "other",
-        ]
-    ] = "other"
+    # A.2 do ADR Fase A: operation_type catalog-driven (regra de ouro #2).
+    # Antes: Literal restrito a 7 valores (subset arbitrário). Agora: str + validator
+    # contra operation_types_catalog (40+ ativos). Aceita None → "other".
+    operationType: Optional[str] = "other"
     status: Optional[
         Literal["backlog", "queued", "in_progress", "review", "done", "blocked"]
     ] = "backlog"
@@ -3672,6 +3665,10 @@ class NewTaskInput(BaseModel):
         if v == "":
             return None
         return v
+
+    @validator("operationType", pre=True)
+    def normalize_and_validate_operation_type(cls, v):
+        return _validate_operation_type(v)
 
 
 class UpdateTaskInput(BaseModel):
@@ -3720,6 +3717,13 @@ class UpdateTaskInput(BaseModel):
         if v == "":
             return None
         return v
+
+    @validator("operation_type", pre=True)
+    def normalize_and_validate_operation_type(cls, v):
+        # A.2 do ADR Fase A: catalog-driven. None = sem mudança no PATCH.
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        return _validate_operation_type(v)
 
 
 def _task_patch_payload_to_camel(patch_snake: Dict[str, Any]) -> Dict[str, Any]:
@@ -6227,6 +6231,74 @@ def _default_execution_mode() -> str:
     (boot offline). Documentado: NÃO é constante semântica, é degenerado."""
     _load_execution_mode_ids()  # populates cache
     return _EXECUTION_MODE_CACHE.get("default") or "REALTIME"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# A.2 do ADR Fase A — `operation_type` catalog-driven
+# Espelha pattern de `_load_execution_mode_ids()` acima (CODE-PATTERNS P1).
+# Aposenta 3 listas hardcoded (Pydantic Literal em models.py, DB CHECK em
+# tasks_operation_type_check + routines_operation_type_check) — ver decisão
+# do ADR §10 P15 (decidida 2026-05-17) e migration drop_operation_type_checks.
+# ──────────────────────────────────────────────────────────────────────────
+_OPERATION_TYPE_CACHE: Dict[str, Any] = {"ids": None, "default": None, "fetched_at": 0.0}
+_OPERATION_TYPE_CACHE_TTL_S = 60.0
+
+
+def _load_operation_type_ids() -> set:
+    """Lê IDs ativos de operation_types_catalog (cacheado 60s).
+    Retorna set vazio se supabase indisponível (skip validation — Pydantic
+    aceita qualquer str e DB rejeita silenciosamente se row órfã, mas catalog
+    é fonte de verdade). Catalog-driven: nada hardcoded. Regra de ouro #2."""
+    import time
+    now = time.time()
+    cached = _OPERATION_TYPE_CACHE.get("ids")
+    if cached is not None and (now - _OPERATION_TYPE_CACHE.get("fetched_at", 0.0)) < _OPERATION_TYPE_CACHE_TTL_S:
+        return cached
+    if not supabase:
+        return set()
+    try:
+        res = (
+            supabase.table("operation_types_catalog")
+            .select("id,display_order,is_active")
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        rows = res.data or []
+        ids = {str(r["id"]) for r in rows if r.get("id")}
+        default = str(rows[0]["id"]) if rows else None
+        previous = _OPERATION_TYPE_CACHE.get("ids")
+        if previous is None:
+            logger.info("operation_type cache primed: count=%d default=%s", len(ids), default)
+        elif previous != ids:
+            added = ids - previous
+            removed = previous - ids
+            logger.warning(
+                "operation_type cache changed: added=%s removed=%s default_now=%s",
+                sorted(added), sorted(removed), default,
+            )
+        _OPERATION_TYPE_CACHE["ids"] = ids
+        _OPERATION_TYPE_CACHE["default"] = default
+        _OPERATION_TYPE_CACHE["fetched_at"] = now
+        return ids
+    except Exception as e:
+        logger.warning(f"_load_operation_type_ids fallback (empty set): {e}")
+        return set()
+
+
+def _validate_operation_type(value: Any) -> str:
+    """Normaliza + valida operation_type contra catálogo. Usado por input
+    models de POST/PATCH. Aceita None → 'other' (default histórico)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "other"
+    v = str(value).strip()
+    valid = _load_operation_type_ids()
+    if valid and v not in valid:
+        raise ValueError(
+            f"unknown_operation_type: '{v}' (válidos: {sorted(valid)[:10]}{'...' if len(valid) > 10 else ''}) — "
+            f"adicione via UI /admin (operation_types_catalog) antes de usar"
+        )
+    return v
 
 
 class AgentExecutionSetupInput(BaseModel):

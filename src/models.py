@@ -99,52 +99,12 @@ class Task(CamelModel):
     title: str
     description: str
     status: Literal["backlog", "queued", "in_progress", "review", "done", "blocked", "skipped"]
-    operation_type: Literal[
-        "orchestration",
-        "code_generation",
-        "code_review",
-        "research",
-        "document_generation",
-        "qa_testing",
-        "email_lead",
-        "freight-quotation",
-        "freight-quotation-approval",
-        "route-cost-calculation",
-        "crm-fill-precheck",
-        "crm-fill-finalize",
-        "crm-fill",
-        "oracle-research",
-        "oracle-extract",
-        "oracle-report",
-        "oracle-rag",
-        "oracle-vision",
-        "oracle-summarize",
-        "dispatch-research",
-        "financial-audit",
-        "financial-bookkeeping",
-        "conciliacao-backlog",
-        "rag-ingest",
-        # VEC-388 PR1: 9 novos operation types da Athena (PMOia Heldman/PMBOK)
-        "athena-classify",
-        "athena-charter",
-        "athena-stakeholder-map",
-        "athena-risk-register",
-        "athena-evm",
-        "athena-rag-ingest",
-        "athena-audit",
-        "athena-recommend",
-        "athena-prioritize",
-        # PR 3 dogfood Vectra Cargo: onboarding markdown → RAG corpus inicial
-        "athena-onboarding",
-        # VEC-416: Kronos pivot — Meu Planner Financeiro via Playwright
-        "planner-import-ofx",
-        "planner-categorize-pendings",
-        # Task #18 (sessão 2026-05-14): workflow kronos-audit-historico
-        "kronos-audit-historico",
-        "audit-review",
-        "planner-apply-corrections",
-        "other",
-    ] = "other"
+    # A.2 do ADR Fase A (decidido P10/P13 — 2026-05-17): catalog-driven.
+    # `vectraclip.operation_types_catalog` é fonte de verdade (40+ tipos ativos).
+    # Antes: Literal[...] hardcoded com 41 valores. Validação real vive em
+    # `api.py:_validate_operation_type()` chamado pelos input models de POST/PATCH
+    # (NewTaskInput, UpdateTaskInput). Regra de ouro #2 (NO HARDCODE).
+    operation_type: str = "other"
     budget_limit: int
     spent: float
     cost_usd: float = 0.0
