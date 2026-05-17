@@ -217,18 +217,53 @@ mesma categoria (read / edit / delete / admin).
 
 ---
 
-## P4 — Live-update container (sem rebuild)
+## P4 — Live-update container (sem rebuild) — **REGRA DE OURO #3 PÓS-MERGE**
+
+> **Citação Marcelo 2026-05-17 (após PR #184):** _"Sim sempre rode — Regra de Ouro após Merge manual do Marcelo rodar `docker cp` + restart para aplicação do smoke"_
+
+CI atual **não faz deploy automático**. Merge no `main` ≠ código rodando em prod.
+Após Marcelo mergear PR que toca `src/*.py`, Claude DEVE executar:
 
 ```powershell
+# 1. Sync local
+git checkout main && git pull --ff-only
+
+# 2. Cp dos arquivos alterados (espelhar lista do diff do PR)
 docker cp src/api.py vectraclaw-backend:/app/src/api.py
+docker cp src/models.py vectraclaw-backend:/app/src/models.py
+# (mais arquivos conforme PR)
+
+# 3. Restart
 docker compose restart backend
+
+# 4. Aguardar healthy (~15-25s)
+Start-Sleep -Seconds 15
+docker compose ps backend
+# Esperado: "Up X seconds (healthy)"
+
+# 5. Validar mudança (pra schema changes — confirma deploy pegou)
+curl -sS https://api-vectraclip.vectracargo.com.br/openapi.json `
+  | python -c "import sys,json; print(json.dumps(json.load(sys.stdin)['components']['schemas']['<ModelChanged>'], indent=2))"
+
+# 6. Só ENTÃO smoke
 ```
 
-Espere `Health.Status = healthy` antes de smoke. **Não** use `--build` pra
-mudança rápida durante dev — `cp` + restart leva ~10s, build leva ~3min.
+**Sintoma de violação:** smoke mostra schema antigo (Literal[...]) quando código
+local mostra `str + validator`. Diagnóstico: deploy não foi feito. NÃO é PR
+parcial.
 
-`compose up --build -d` só quando muda `requirements.txt`, `Dockerfile`, ou
-imagem precisa de novos pacotes do sistema.
+`compose up --build -d` (3min) só quando:
+- `requirements.txt` mudou (deps novas)
+- `Dockerfile` mudou
+- Adicionou/removeu arquivo (não só editou)
+- Cache suspeito
+
+Pra edição de Python existente, `cp` + restart é 18x mais rápido e suficiente.
+
+**Não aplicar a:** migrations SQL (`supabase db push` separado), só `docs/`,
+tests, outro repo (cargo-flow-navigator/VectraClip).
+
+Detalhe completo: memory `feedback_post_merge_live_update.md` (regra de ouro #3).
 
 ---
 
