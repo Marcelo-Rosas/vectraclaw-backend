@@ -12,10 +12,12 @@
 
 CREATE TABLE IF NOT EXISTS "vectraclip"."connector_sessions" (
       "id"              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-      "company_id"      UUID        NOT NULL REFERENCES "vectraclip"."companies"("id") ON DELETE CASCADE,
+      -- W3 fix: companies_pkey = company_id (NÃO id). FK corrigida.
+      "company_id"      UUID        NOT NULL REFERENCES "vectraclip"."companies"("company_id") ON DELETE CASCADE,
 
-    -- Canal de origem
-    "channel"         TEXT        NOT NULL CHECK (channel IN ('whatsapp', 'email', 'telegram', 'api', 'other')),
+    -- Canal de origem. W3: CHECK hardcoded removido — FK pra connector_channels catalog
+    -- (Regra Ouro #2 NO HARDCODE). Catalog criado em 20260517225900.
+    "channel"         TEXT        NOT NULL REFERENCES "vectraclip"."connector_channels"("slug") ON DELETE RESTRICT,
       "connector_id"    TEXT        NOT NULL,  -- ex: '5547933851351' (Navi), 'inbox@vectracargo.com.br' (Hermes)
 
     -- Identificação do contato externo
@@ -23,9 +25,9 @@ CREATE TABLE IF NOT EXISTS "vectraclip"."connector_sessions" (
     "external_name"   TEXT,                  -- nome resolvido do contato (opcional)
     "external_meta"   JSONB       DEFAULT '{}',  -- dados extras do canal (profile_pic, etc.)
 
-    -- Estado da sessão
+    -- Estado da sessão. W3: CHECK hardcoded removido — FK pra connector_session_statuses.
     "status"          TEXT        NOT NULL DEFAULT 'open'
-                                    CHECK (status IN ('open', 'waiting_agent', 'processing', 'closed', 'errored')),
+                                    REFERENCES "vectraclip"."connector_session_statuses"("slug") ON DELETE RESTRICT,
 
     -- Última mensagem recebida
     "last_message"    TEXT,
@@ -112,10 +114,11 @@ CREATE POLICY "connector_sessions_authenticated_select"
     ON "vectraclip"."connector_sessions"
     FOR SELECT
     TO authenticated
+    -- W3 fix: tabela real é vectraclip.app_users (id = auth.uid()), NÃO company_users.
     USING (
           company_id IN (
-              SELECT company_id FROM vectraclip.company_users
-              WHERE user_id = auth.uid()
+              SELECT company_id FROM vectraclip.app_users
+              WHERE id = auth.uid()
           )
       );
 
