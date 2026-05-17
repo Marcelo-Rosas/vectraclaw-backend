@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from .groq_agent_client import GroqAgentClient
 from .huggingface_agent_client import HuggingFaceAgentClient
 from .managed_agent_client import ManagedAgentClient
 from .ollama_agent_client import OllamaAgentClient
@@ -19,6 +20,7 @@ PROVIDER_CLIENT_MAP: Dict[str, Optional[type]] = {
     "anthropic": ManagedAgentClient,
     "ollama": OllamaAgentClient,
     "huggingface": HuggingFaceAgentClient,
+    "groq": GroqAgentClient,
     "openai": None,
     "google": None,
 }
@@ -34,6 +36,7 @@ def get_agent_client(
     - `anthropic`   → `ManagedAgentClient(model=model)`
     - `ollama`      → `OllamaAgentClient(config=config or {})`
     - `huggingface` → `HuggingFaceAgentClient(config=config or {})`
+    - `groq`        → `GroqAgentClient(config=config or {})`
     - `openai`/`google` → `NotImplementedError` (slot reservado)
     - desconhecido → `ValueError`
     """
