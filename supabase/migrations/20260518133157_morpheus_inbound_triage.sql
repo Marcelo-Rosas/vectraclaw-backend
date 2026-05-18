@@ -219,24 +219,55 @@ VALUES
 ON CONFLICT (company_id, intent_slug) DO NOTHING;
 
 -- ============================================================================
--- Verificação shadow-replay-safe
+-- Verificação shadow-replay-safe (hotfix 2026-05-18: assert condicional ao seed)
+--
+-- Versão anterior assumia presença de:
+--   (a) row connector_channels.slug='whatsapp' (seed W3)
+--   (b) companies.company_id='01b9b40e-...' (seed Vectra Cargo prod)
+-- Em shadow DB do `supabase db pull`, (a) e (b) não existem → assert quebrava.
+--
+-- Fix: separa asserts auto-contidos (op_types + specialty inseridos POR esta
+-- migration — devem sempre passar) dos asserts dependentes de seed externo
+-- (condicionais à existência prévia).
 -- ============================================================================
 DO $$
 DECLARE
     v_ops int; v_specs int; v_rules int; v_wa_default text; v_wa_fallback text;
+    v_wa_exists int; v_vectra_exists int;
 BEGIN
+    -- Asserts auto-contidos (esta migration cria → sempre devem passar)
     SELECT count(*) INTO v_ops FROM vectraclip.operation_types_catalog
         WHERE id IN ('inbound-triage','human-triage','cross-docking-quotation','gymsite-quotation');
     SELECT count(*) INTO v_specs FROM vectraclip.agent_specialties WHERE slug='inbound-triage';
+
+    -- Asserts dependentes de seed externo (condicionais)
+    SELECT count(*) INTO v_wa_exists FROM vectraclip.connector_channels WHERE slug='whatsapp';
+    SELECT count(*) INTO v_vectra_exists FROM vectraclip.companies
+        WHERE company_id='01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2';
     SELECT count(*) INTO v_rules FROM vectraclip.inbound_intent_rules
         WHERE company_id='01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2';
     SELECT default_inbound_operation_type, fallback_operation_type
         INTO v_wa_default, v_wa_fallback
         FROM vectraclip.connector_channels WHERE slug='whatsapp';
-    RAISE NOTICE 'W9: op_types novos=% (esp 4) | specialty=% (esp 1) | rules VECTRA=% (esp >=6) | wa default=% fallback=%',
-        v_ops, v_specs, v_rules, v_wa_default, v_wa_fallback;
-    IF v_ops < 4 OR v_specs < 1 OR v_rules < 6 OR v_wa_default != 'inbound-triage' OR v_wa_fallback != 'human-triage' THEN
-        RAISE EXCEPTION 'W9 verification failed';
+
+    RAISE NOTICE 'W9: op_types=% (esp 4) | specialty=% (esp 1) | wa_existed=% rules_VECTRA=% (esp >=6 se vectra_existed) | vectra_existed=% | wa default=% fallback=%',
+        v_ops, v_specs, v_wa_exists, v_rules, v_vectra_exists, v_wa_default, v_wa_fallback;
+
+    -- Asserts incondicionais (own seed)
+    IF v_ops < 4 THEN
+        RAISE EXCEPTION 'W9: op_types_catalog seed falhou (esperado >=4, got %)', v_ops;
+    END IF;
+    IF v_specs < 1 THEN
+        RAISE EXCEPTION 'W9: agent_specialties seed falhou (esperado >=1, got %)', v_specs;
+    END IF;
+
+    -- Asserts condicionais (só se seed externo existia)
+    IF v_wa_exists > 0 AND (v_wa_default != 'inbound-triage' OR v_wa_fallback != 'human-triage') THEN
+        RAISE EXCEPTION 'W9: connector_channels whatsapp UPDATE falhou (default=%, fallback=%)',
+            v_wa_default, v_wa_fallback;
+    END IF;
+    IF v_vectra_exists > 0 AND v_rules < 6 THEN
+        RAISE EXCEPTION 'W9: inbound_intent_rules seed Vectra falhou (esperado >=6, got %)', v_rules;
     END IF;
 END $$;
 
