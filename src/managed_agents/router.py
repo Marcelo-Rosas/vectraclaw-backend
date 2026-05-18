@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from .agent_client_factory import get_agent_client
 from .decision_engine import should_use_managed_agent, RoutingDecision
 from .managed_agent_client import ManagedAgentClient, ExecutionResult
+from .nous_hermes_agent_client import NousHermesAgentClient
 from .session_bridge import SessionBridge
 
 logger = logging.getLogger("ManagedAgents.Router")
@@ -43,8 +44,8 @@ async def _emit_run_heartbeat(
     o resultado da task que já foi persistida.
     """
     # W8 — `claude_cli_subscription` adicionado (auditor 2026-05-18).
-    # Tokens são 0 (CLI não expõe usage), mas heartbeat status/task_id ainda
-    # útil pro painel. groq e outros futuros: usar .get fallback no label.
+    # `nous_hermes` omitido de propósito (PRD §8.5 / R15): tokens=0 polui burn rate
+    # até trajectory ingest existir.
     if provider not in ("anthropic", "ollama", "huggingface", "groq", "claude_cli_subscription"):
         return
     if not agent_id:
@@ -195,7 +196,21 @@ async def route_task_execution(
             logger.warning(f"Router: provider lookup falhou agent_id={agent_id}: {e}")
 
     client = get_agent_client(provider, model=model, config=field_values)
-    result: ExecutionResult = await client.execute_task(prompt, max_turns=3)
+    if provider == "nous_hermes":
+        if not isinstance(client, NousHermesAgentClient):
+            raise RuntimeError(
+                f"factory retornou {type(client).__name__}, esperado NousHermesAgentClient"
+            )
+        result = await client.execute_task(
+            prompt,
+            max_turns=3,
+            system_prompt=field_values.get("system_prompt"),
+            company_id=company_id,
+            agent_id=agent_id,
+            task_id=task_id,
+        )
+    else:
+        result = await client.execute_task(prompt, max_turns=3)
 
     # Persiste turns
     for tc in result.tool_calls:

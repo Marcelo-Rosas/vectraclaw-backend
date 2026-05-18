@@ -1,4 +1,17 @@
 services:
+  nous-hermes-runtime:
+    build: ./nous-hermes-runtime
+    container_name: vectraclaw-nous-hermes
+    restart: unless-stopped
+    volumes:
+      - nous-hermes-config:/root/.hermes
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9120/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
+
   backend:
     build: .
     container_name: vectraclaw-backend
@@ -9,6 +22,10 @@ services:
       - .env
     environment:
       PORT: "3000"
+      NOUS_HERMES_RUNTIME_URL: http://nous-hermes-runtime:9120
+    depends_on:
+      nous-hermes-runtime:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
       interval: 30s
@@ -23,8 +40,12 @@ services:
     command: ["python", "-m", "src.agent_daemon"]
     env_file:
       - .env
+    environment:
+      NOUS_HERMES_RUNTIME_URL: http://nous-hermes-runtime:9120
     depends_on:
       backend:
+        condition: service_healthy
+      nous-hermes-runtime:
         condition: service_healthy
 
   cloudflared:
@@ -37,3 +58,6 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+
+volumes:
+  nous-hermes-config:
