@@ -35,15 +35,18 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response
 
-from src.agent_ids import ORACLE_AGENT_ID
-
 logger = logging.getLogger("api.connectors")
 
-# F2 PRD Fundação Orchestration: operation_type default ao criar task a partir
-# de mensagem WhatsApp inbound. Fallback simples — roteamento smarter (palavra-
-# chave / Morpheus) fica para fase posterior. PRD seção 5: "operation_type:
-# detectar por conteúdo OU usar 'oracle-research' como fallback".
-_INBOUND_DEFAULT_OPERATION_TYPE = "oracle-research"
+# W7 P0-9 (2026-05-18) — Catalog-driven routing. Sem const Python, sem
+# import de AGENT_ID. Fluxo:
+#   1) session["channel"] (já populado em get_or_open_session)
+#   2) SELECT connector_channels WHERE slug=<channel>
+#        → default_inbound_operation_type (FK pra operation_types_catalog)
+#   3) SELECT operation_types_catalog WHERE id=<op_type>
+#        → primary_agent_id (uuid)
+# Trocar canal/op/agent vira UPDATE SQL — sem deploy. Regra Ouro #2 NO HARDCODE.
+# Hardcode-auditor 2026-05-18: GO. Migration 20260518113229 setou whatsapp →
+# freight-quotation (Caminho A Miro).
 router = APIRouter(tags=["connectors"])
 
 # Slug canônico do adapter Meta WhatsApp Cloud API no adapter_catalog.
@@ -348,16 +351,72 @@ async def meta_whatsapp_webhook(
     }
 
 
+def _resolve_inbound_routing(channel: str) -> Optional[Dict[str, Any]]:
+    """W7 P0-9 — Lookup catalog-driven do roteamento default pra um canal inbound.
+
+    Retorna `{"operation_type": str, "assigned_to_agent_id": Optional[uuid]}` ou
+    None se o canal não tem default cadastrado (sinal pra caller skipar dispatch).
+
+    Fluxo:
+      1. SELECT connector_channels.default_inbound_operation_type WHERE slug=<channel>
+      2. SELECT operation_types_catalog.primary_agent_id WHERE id=<op_type>
+
+    Falhas de SELECT: log + None (best-effort, caller decide).
+    Sem cache — `_dispatch_inbound_task` é chamado por webhook (não loop quente).
+    """
+    from src.api import supabase
+    if not supabase or not channel:
+        return None
+    try:
+        ch_res = (
+            supabase.table("connector_channels")
+            .select("default_inbound_operation_type")
+            .eq("slug", channel)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        logger.error("_resolve_inbound_routing: query channel=%s falhou: %s", channel, e)
+        return None
+    if not ch_res.data:
+        logger.warning("_resolve_inbound_routing: canal %r não existe em connector_channels", channel)
+        return None
+    op_type = ch_res.data[0].get("default_inbound_operation_type")
+    if not op_type:
+        logger.info("_resolve_inbound_routing: canal %r sem default_inbound_operation_type — skip dispatch", channel)
+        return None
+    try:
+        op_res = (
+            supabase.table("operation_types_catalog")
+            .select("primary_agent_id")
+            .eq("id", op_type)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        logger.error("_resolve_inbound_routing: query op_type=%s falhou: %s", op_type, e)
+        return None
+    if not op_res.data:
+        logger.warning("_resolve_inbound_routing: op_type %r não existe em operation_types_catalog", op_type)
+        return None
+    return {
+        "operation_type": op_type,
+        "assigned_to_agent_id": op_res.data[0].get("primary_agent_id"),
+    }
+
+
 def _dispatch_inbound_task(
     *,
     company_id: str,
     session: Dict[str, Any],
     msg: Dict[str, Any],
 ) -> Optional[str]:
-    """F2 — Cria task VectraClaw + promove sessão pra processing + emite WS.
+    """F2 + W7 P0-9 — Cria task VectraClaw + promove sessão + emite WS.
 
+    Routing 100% catalog-driven (Regra Ouro #2). Vê `_resolve_inbound_routing`.
     Best-effort: falhas individuais (insert, promote, ws) logam e seguem.
-    Retorna o task_id criado, ou None se a inserção falhou."""
+    Retorna o task_id criado, ou None se rota não resolveu OU inserção falhou.
+    """
     from src.api import supabase
     from src.services import connector_bus
     from src.ws_manager import manager as ws_manager
@@ -365,6 +424,12 @@ def _dispatch_inbound_task(
     if not supabase:
         logger.error("_dispatch_inbound_task: supabase indisponível")
         return None
+
+    routing = _resolve_inbound_routing(session.get("channel") or "")
+    if not routing:
+        return None
+    op_type = routing["operation_type"]
+    assigned_agent = routing["assigned_to_agent_id"]
 
     content = msg["content"]
     external_label = (msg.get("external_name") or msg.get("external_id") or "").strip()
@@ -375,10 +440,10 @@ def _dispatch_inbound_task(
         "company_id": company_id,
         "title": title[:200],
         "description": content[:2000],
-        "operation_type": _INBOUND_DEFAULT_OPERATION_TYPE,
+        "operation_type": op_type,
         "status": "queued",
         "executor_type": "harness",
-        "assigned_to_agent_id": ORACLE_AGENT_ID,
+        "assigned_to_agent_id": assigned_agent,
         "input_json": {
             "source": "meta_whatsapp_webhook",
             "session_id": session["id"],
@@ -409,7 +474,7 @@ def _dispatch_inbound_task(
         connector_bus.promote_to_processing(
             session_id=session["id"],
             task_id=new_task_id,
-            routed_to_agent=ORACLE_AGENT_ID,
+            routed_to_agent=assigned_agent,
             routing_score=50,
         )
     except Exception as e:
@@ -428,7 +493,7 @@ def _dispatch_inbound_task(
                     "payload": {
                         "session_id": session["id"],
                         "task_id": new_task_id,
-                        "channel": "whatsapp",
+                        "channel": session.get("channel"),
                         "external_id": msg["external_id"],
                     },
                 },
@@ -437,8 +502,8 @@ def _dispatch_inbound_task(
         logger.warning("_dispatch_inbound_task: WS broadcast non-fatal: %s", e)
 
     logger.info(
-        "meta_whatsapp inbound dispatched company=%s session=%s task=%s op=%s",
-        company_id, session["id"], new_task_id, _INBOUND_DEFAULT_OPERATION_TYPE,
+        "%s inbound dispatched company=%s session=%s task=%s op=%s agent=%s",
+        session.get("channel"), company_id, session["id"], new_task_id, op_type, assigned_agent,
     )
     return new_task_id
 
