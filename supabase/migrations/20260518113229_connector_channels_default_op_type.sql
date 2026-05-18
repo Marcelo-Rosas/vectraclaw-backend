@@ -44,21 +44,28 @@ UPDATE vectraclip.connector_channels
 -- decisão de negócio cravada. Quando houver, basta UPDATE (não precisa nova
 -- migration nem deploy).
 
--- Verificação shadow-replay-safe
+-- Verificação shadow-replay-safe (hotfix 2026-05-18: assert condicional ao seed)
+--
+-- Versão anterior falhava em shadow DB do `supabase db pull` quando
+-- connector_channels não tinha row 'whatsapp' (seed de W3 não está em shadow
+-- vazio). Fix: só falha SE a row 'whatsapp' existia ANTES do UPDATE.
 DO $$
 DECLARE
+  v_whatsapp_exists int;
   v_whatsapp_op text;
   v_total_canais int;
   v_canais_com_default int;
 BEGIN
+  SELECT count(*) INTO v_whatsapp_exists FROM vectraclip.connector_channels
+    WHERE slug='whatsapp';
   SELECT default_inbound_operation_type INTO v_whatsapp_op
     FROM vectraclip.connector_channels WHERE slug='whatsapp';
   SELECT count(*) INTO v_total_canais FROM vectraclip.connector_channels;
   SELECT count(*) INTO v_canais_com_default FROM vectraclip.connector_channels
     WHERE default_inbound_operation_type IS NOT NULL;
-  RAISE NOTICE 'W7 P0-9: whatsapp default_op=% | canais total=% | com default=% (esp 1)',
-    v_whatsapp_op, v_total_canais, v_canais_com_default;
-  IF v_whatsapp_op IS NULL OR v_whatsapp_op != 'freight-quotation' THEN
+  RAISE NOTICE 'W7 P0-9: whatsapp existia=% | default_op=% | canais total=% | com default=%',
+    v_whatsapp_exists, v_whatsapp_op, v_total_canais, v_canais_com_default;
+  IF v_whatsapp_exists > 0 AND (v_whatsapp_op IS NULL OR v_whatsapp_op != 'freight-quotation') THEN
     RAISE EXCEPTION 'W7 P0-9: setup whatsapp falhou (esperado freight-quotation, got %)', v_whatsapp_op;
   END IF;
 END $$;
