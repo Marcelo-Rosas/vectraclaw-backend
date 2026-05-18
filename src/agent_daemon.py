@@ -591,6 +591,17 @@ class ResilientHarnessDaemon:
             return _json.dumps(result)
 
         # Default: forward to claude -p
+        # TODO(W8): remover este caminho após todos agentes terem adapter
+        # configurado. Caminho catalog-driven correto: task com executor_type=auto
+        # → decision_engine → router → ClaudeCodeCliAgentClient (slug=claude_code_cli,
+        # provider=claude_cli_subscription). Memory `claude-p-must-be-adapter`.
+        # Auditor 2026-05-18: este branch é gambiarra pré-MVP, log warning antes.
+        logger.warning(
+            "DEPRECATED claude -p default path | task=%s op=%s agent=%s — "
+            "agente sem adapter claude_code_cli configurado em agent_adapter_configs. "
+            "Path catalog-driven correto: provisionar via /admin/connectors > Preencher Valores.",
+            task.get("id"), op_type, task.get("assigned_to_agent_id"),
+        )
         prompt = f"[{op_type}] {task.get('title', '')}\n\n{task.get('description', '')}"
         logger.info("claude -p prompt: %s", prompt[:120])
 

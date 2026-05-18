@@ -42,7 +42,10 @@ async def _emit_run_heartbeat(
     Falha silenciosa: um problema na emissão de heartbeat não pode reverter
     o resultado da task que já foi persistida.
     """
-    if provider not in ("anthropic", "ollama", "huggingface"):
+    # W8 — `claude_cli_subscription` adicionado (auditor 2026-05-18).
+    # Tokens são 0 (CLI não expõe usage), mas heartbeat status/task_id ainda
+    # útil pro painel. groq e outros futuros: usar .get fallback no label.
+    if provider not in ("anthropic", "ollama", "huggingface", "groq", "claude_cli_subscription"):
         return
     if not agent_id:
         return
@@ -54,7 +57,9 @@ async def _emit_run_heartbeat(
             "ollama": "Ollama",
             "anthropic": "Anthropic",
             "huggingface": "HuggingFace",
-        }[provider]
+            "groq": "Groq",
+            "claude_cli_subscription": "Claude CLI",
+        }.get(provider, provider.title())
         log_excerpt = (
             f"{provider_label}: {result.tokens_output} tokens em "
             f"{result.tokens_per_second} tok/s"
