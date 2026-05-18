@@ -153,3 +153,68 @@ async def list_operation_types_catalog(
     except Exception as e:
         logger.error("list_operation_types_catalog failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/workflow-trigger-types — W15.1.5
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/api/workflow-trigger-types")
+@router.get("/workflow-trigger-types")
+async def list_workflow_trigger_types(
+    request: Request,
+    only_active: bool = Query(default=True),
+) -> List[Dict[str, Any]]:
+    """Lista workflow_trigger_types (5 slugs hoje: manual/cron/webhook/event/realtime).
+    Catalog GLOBAL. Alimenta dropdown 'Modo de disparo' do canvas (W15.2).
+    """
+    _resolve_caller(request)
+    from src.api import supabase
+    if not supabase:
+        return []
+    try:
+        q = (
+            supabase.table("workflow_trigger_types")
+            .select("slug,name,description,icon,display_order,is_active")
+            .order("display_order")
+        )
+        if only_active:
+            q = q.eq("is_active", True)
+        res = q.execute()
+        return res.data or []
+    except Exception as e:
+        logger.error("list_workflow_trigger_types failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/workflow-logic-patterns — W15.1.5
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/api/workflow-logic-patterns")
+@router.get("/workflow-logic-patterns")
+async def list_workflow_logic_patterns(
+    request: Request,
+    only_active: bool = Query(default=True),
+) -> List[Dict[str, Any]]:
+    """Lista workflow_logic_patterns (8 patterns: simple/split-if/split-switch/
+    merge-by-key/loop-batch/wait-event/subflow/error-handler). Catalog GLOBAL.
+    Alimenta dropdown 'Lógica' do canvas (W15.2) — só roteamento, não disparo.
+    """
+    _resolve_caller(request)
+    from src.api import supabase
+    if not supabase:
+        return []
+    try:
+        q = (
+            supabase.table("workflow_logic_patterns")
+            .select("id,taxonomy,category,name,description,icon,color,display_order,engine_handler,is_active")
+            .order("display_order")
+        )
+        if only_active:
+            q = q.eq("is_active", True)
+        res = q.execute()
+        return res.data or []
+    except Exception as e:
+        logger.error("list_workflow_logic_patterns failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
