@@ -4843,9 +4843,11 @@ async def list_adapter_fields(
             q = q.in_("applies_to", ["company", "both"])
         elif scope == "agent":
             q = q.in_("applies_to", ["agent", "both"])
-        elif scope and scope not in ("both", None):
+        elif scope == "both":
+            q = q.eq("applies_to", "both")
+        elif scope:
             raise HTTPException(status_code=400,
-                                detail=f"invalid_scope_{scope}_expected_company_or_agent")
+                                detail=f"invalid_scope_{scope}_expected_company_agent_or_both")
 
         res = q.order("sort_order").execute()
         return [AdapterFieldDefinition(**row).to_zod_dict() for row in (res.data or [])]
@@ -9414,6 +9416,7 @@ from src.api_routes import sipoc_diagnose as _sipoc_diagnose_routes  # noqa: E40
 from src.api_routes import connectors as _connectors_routes  # noqa: E402  # W3 PRD Fundação
 from src.api_routes import nous_hermes as _nous_hermes_routes  # noqa: E402  # PRD Nous Hermes F1
 from src.api_routes import whatsapp_templates as _whatsapp_templates_routes  # noqa: E402  # W11 PR1
+from src.api_routes import agent_skills as _agent_skills_routes  # noqa: E402  # W15.1
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -9431,4 +9434,4 @@ app.include_router(_sipoc_diagnose_routes.router)
 app.include_router(_connectors_routes.router)  # W3 PRD Fundação Orchestration
 app.include_router(_nous_hermes_routes.router)
 app.include_router(_whatsapp_templates_routes.router)  # W11 PR1 — WhatsApp Templates catalog
-
+app.include_router(_agent_skills_routes.router)  # W15.1 — Agent Skills + Operation Types catalog

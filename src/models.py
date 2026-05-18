@@ -228,6 +228,14 @@ class WorkflowStepRich(CamelModel):
     five_w2h: Optional[Dict[str, Any]] = None
     default_operation_type: Optional[str] = None
     default_assigned_specialty_slug: Optional[str] = None
+    # W15.1 (2026-05-18) — refator Step: trigger sai do AGENTE pro STEP.
+    # trigger_type FK→workflow_trigger_types (realtime/cron/webhook/manual/event).
+    # trigger_config carrega params específicos do modo (cron_expression, webhook_url, ...).
+    # agent_specialty_config_id substitui specialty_slug livre — FK explícita pra combo
+    # agente+specialty (agent_specialty_configs com values jsonb embutindo op_types[]).
+    trigger_type: Optional[str] = None
+    trigger_config: Dict[str, Any] = Field(default_factory=dict)
+    agent_specialty_config_id: Optional[str] = None
 
     class Config:
         alias_generator = to_camel
@@ -253,6 +261,29 @@ class WorkflowStepRich(CamelModel):
             return int(self.sla_horas) if self.sla_horas is not None else 0
         except (TypeError, ValueError):
             return 0
+
+
+# W15.1 (2026-05-18) — AgentSkill: combo agent_specialty_configs joined com
+# agents.name + agent_specialties.name + operation_types embutidos. Usado pelo
+# dropdown único "Agent Skill" no canvas (substitui dropdown duplo agente +
+# specialty). Auditor: id como uuid string validada — Pydantic v2 aceita str+regex
+# UUID via field_validator se necessário, mas como vem direto do DB (UUID PK)
+# o cast no caller já garante formato.
+class AgentSkill(CamelModel):
+    """Combo agent_specialty_configs denormalizado pro dropdown único de Agent Skill no canvas."""
+
+    id: str  # agent_specialty_configs.id (UUID)
+    agent_id: str
+    agent_name: str
+    specialty_slug: str
+    specialty_name: str
+    operation_types: List[str] = Field(default_factory=list)  # de values.operation_types
+    values: Optional[Dict[str, Any]] = None  # raw values jsonb (model_id, prompt, role, etc.)
+
+    class Config:
+        alias_generator = to_camel
+        validate_by_name = True
+        extra = "ignore"
 
 
 class TaskBlueprint(CamelModel):
