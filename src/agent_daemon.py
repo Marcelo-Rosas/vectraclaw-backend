@@ -429,6 +429,67 @@ class ResilientHarnessDaemon:
                 exc,
             )
 
+    def _maybe_reply_to_connector_session(self, task: dict, raw_output: str) -> None:
+        """W7 P0-11 — Se a task veio de um connector inbound (webhook Meta etc),
+        envia o output como reply pela mesma sessão.
+
+        Detecção: `task.input_json.session_id` (gravado pelo
+        `_dispatch_inbound_task` em src/api_routes/connectors.py após P0-9).
+        Tasks normais (sem session_id) são noop silencioso.
+
+        Texto da reply: `raw_output` cru (já é texto do `claude -p` default).
+        Auditor 2026-05-18: nenhum handler atual usa key estruturada como
+        `output_json.reply` — usar `raw` é o comportamento correto.
+
+        Best-effort: qualquer falha (lookup, reply HTTP) é logada como warning
+        e propaga `Exception` pro caller que silencia. Não bloqueia
+        `_complete_task` (no `finally:` do loop processor).
+        """
+        input_json = task.get("input_json") or {}  # guard contra None (Regra auditor)
+        session_id = input_json.get("session_id") if isinstance(input_json, dict) else None
+        if not session_id:
+            return  # task normal sem origem em connector — noop
+
+        client = self._get_supabase()
+        if not client:
+            logger.warning("connector reply: supabase indisponível task=%s", task.get("id"))
+            return
+
+        try:
+            res = (
+                client.table("connector_sessions")
+                .select("*")
+                .eq("id", session_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception as e:
+            logger.warning("connector reply: SELECT session falhou id=%s: %s", session_id, e)
+            return
+        if not res.data:
+            logger.warning("connector reply: session_id=%s não encontrada", session_id)
+            return
+        session = res.data[0]
+
+        reply_text = (raw_output or "").strip()
+        if not reply_text:
+            logger.info("connector reply: output vazio task=%s — skip", task.get("id"))
+            return
+
+        try:
+            from src.services import connector_bus  # lazy: evita circular
+            import asyncio as _aio
+            _aio.run(connector_bus.reply(session, reply_text))
+            logger.info(
+                "connector reply sent task=%s session=%s channel=%s len=%d",
+                task.get("id"), session_id, session.get("channel"), len(reply_text),
+            )
+        except Exception as e:
+            logger.warning(
+                "connector reply failed task=%s session=%s: %s",
+                task.get("id"), session_id, e,
+            )
+
     def execute_task(self, task: dict) -> str:
         import asyncio
         import json as _json
@@ -1088,6 +1149,14 @@ class ResilientHarnessDaemon:
                                             }
                                 except Exception:
                                     pass
+                                # W7 P0-11 — Reply pós-output pra connector_session
+                                # se a task veio de webhook inbound (Meta etc).
+                                # Auditor 2026-05-18: GO, escopo cirúrgico, best-effort.
+                                if success:
+                                    try:
+                                        self._maybe_reply_to_connector_session(task, raw)
+                                    except Exception as e:
+                                        logger.warning("connector reply hook non-fatal: %s", e)
                             finally:
                                 self._complete_task(
                                     task_id, success, cost_usd,
