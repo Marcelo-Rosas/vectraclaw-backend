@@ -4786,12 +4786,33 @@ async def update_adapter(request: Request, adapter_id: str, payload: UpdateAdapt
 
 @app.get("/api/adapters/{adapter_id}/fields")
 @app.get("/adapters/{adapter_id}/fields")
-async def list_adapter_fields(request: Request, adapter_id: str):
+async def list_adapter_fields(
+    request: Request,
+    adapter_id: str,
+    scope: Optional[str] = None,
+):
+    """W11 PR1 — `scope` query param filtra fields por applies_to:
+      - scope='company' → applies_to IN ('company','both') (pra CompanyAdapterValuesDialog)
+      - scope='agent'   → applies_to IN ('agent','both')   (pra AgentAdapterConfigDialog)
+      - scope=None      → retorna TODOS (retrocompat — clients antigos)
+    Default sem scope mantém comportamento anterior; novos clients (W11 PR pareado VectraClip) passam scope.
+    """
+    def _scope_filter(field: Dict[str, Any]) -> bool:
+        if not scope:
+            return True
+        f_applies = field.get("appliesTo") or field.get("applies_to") or "company"
+        if scope == "company":
+            return f_applies in ("company", "both")
+        if scope == "agent":
+            return f_applies in ("agent", "both")
+        return True
+
     if not supabase:
         return [
             f
             for f in MOCK_ADAPTER_FIELDS
             if f.get("adapterId") == adapter_id and f.get("isActive", True)
+            and _scope_filter(f)
         ]
 
     try:
@@ -4812,14 +4833,21 @@ async def list_adapter_fields(request: Request, adapter_id: str):
         if caller_company and adapter_company and caller_company != adapter_company:
             raise HTTPException(status_code=403, detail="cross_company_forbidden")
 
-        res = (
+        q = (
             client.table("adapter_field_definitions")
             .select("*")
             .eq("adapter_id", adapter_id)
             .eq("is_active", True)
-            .order("sort_order")
-            .execute()
         )
+        if scope == "company":
+            q = q.in_("applies_to", ["company", "both"])
+        elif scope == "agent":
+            q = q.in_("applies_to", ["agent", "both"])
+        elif scope and scope not in ("both", None):
+            raise HTTPException(status_code=400,
+                                detail=f"invalid_scope_{scope}_expected_company_or_agent")
+
+        res = q.order("sort_order").execute()
         return [AdapterFieldDefinition(**row).to_zod_dict() for row in (res.data or [])]
     except HTTPException:
         raise
@@ -9384,6 +9412,8 @@ from src.api_routes import sipoc_taxonomy as _sipoc_taxonomy_routes  # noqa: E40
 from src.api_routes import admin as _admin_routes  # noqa: E402
 from src.api_routes import sipoc_diagnose as _sipoc_diagnose_routes  # noqa: E402
 from src.api_routes import connectors as _connectors_routes  # noqa: E402  # W3 PRD Fundação
+from src.api_routes import nous_hermes as _nous_hermes_routes  # noqa: E402  # PRD Nous Hermes F1
+from src.api_routes import whatsapp_templates as _whatsapp_templates_routes  # noqa: E402  # W11 PR1
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -9399,4 +9429,6 @@ app.include_router(_sipoc_taxonomy_routes.router)
 app.include_router(_admin_routes.router)
 app.include_router(_sipoc_diagnose_routes.router)
 app.include_router(_connectors_routes.router)  # W3 PRD Fundação Orchestration
+app.include_router(_nous_hermes_routes.router)
+app.include_router(_whatsapp_templates_routes.router)  # W11 PR1 — WhatsApp Templates catalog
 

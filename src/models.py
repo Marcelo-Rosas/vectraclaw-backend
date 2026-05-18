@@ -418,6 +418,11 @@ class AdapterFieldDefinition(CamelModel):
     trigger_condition: Optional[dict] = None
     sort_order: int
     is_active: bool
+    # W11 PR1 (2026-05-18) — scope do field: company-level (secrets/global),
+    # agent-level (override por agente, ex: template_id), ou both.
+    # Frontend filtra dialogs (CompanyAdapterValuesDialog vs AgentAdapterConfigDialog)
+    # por esse campo. Default 'company' (Regra Ouro: segurança first).
+    applies_to: Literal["company", "agent", "both"] = "company"
     created_at: datetime
     updated_at: datetime
 
