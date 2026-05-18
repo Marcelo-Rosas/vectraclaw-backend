@@ -203,11 +203,20 @@ async def reply(
     *,
     template_name: Optional[str] = None,
     template_params: Optional[List[str]] = None,
+    append_role: Optional[str] = "agent",
 ) -> bool:
     """Envia `message` de volta ao contato externo da `session`.
 
     Best-effort: loga e devolve False em falha; nunca re-raise. Caller decide
     o que fazer com False (manter aberta, marcar errored, etc.).
+
+    Args:
+        append_role: role pra append_history pós-envio. Default 'agent' (contrato
+            Clip — handoff CONNECTOR-SESSIONS-AGENT-DISPATCH 2026-05-18).
+            **Passe `None` se o caller já gravou a entry no history** (evita
+            duplicação operator+assistant — Bug #2 do handoff). Caller típico
+            que passa None: POST /reply manual em api_routes/connectors.py:_do_reply
+            (já fez append role='operator' antes de chamar reply).
 
     Roteamento por session.channel:
       - 'whatsapp' → Meta Cloud API (resolve creds via adapter_catalog).
@@ -224,6 +233,7 @@ async def reply(
             session, message,
             template_name_override=template_name,
             template_params=template_params,
+            append_role=append_role,
         )
     logger.warning("connector_bus.reply: canal '%s' não suportado (W12: dispatch table)", channel)
     return False
@@ -235,6 +245,7 @@ async def _reply_whatsapp_meta(
     *,
     template_name_override: Optional[str] = None,
     template_params: Optional[List[str]] = None,
+    append_role: Optional[str] = "agent",
 ) -> bool:
     """Envia mensagem via Meta Cloud API. W11 PR1: decisão free text vs template
     baseada em janela conversacional (session_window_hours do adapter).
@@ -330,24 +341,34 @@ async def _reply_whatsapp_meta(
         logger.exception("connector_bus._reply_whatsapp_meta HTTP falhou: %s", e)
         return False
 
-    # Append da resposta no history pra trilha completa
-    try:
-        delivery_kind = "meta_template" if use_template else "meta_cloud_api"
-        history_extra: Dict[str, Any] = {
-            "channel": "whatsapp",
-            "delivery": delivery_kind,
-        }
-        if use_template:
-            # W11 fix: só template_name_override (W14 vai expandir via workflow_steps.ferramentas)
-            history_extra["template_name"] = template_name_override
-        append_history(
-            session_id=session["id"],
-            role="assistant",
-            content=message,
-            extra=history_extra,
+    # Append da resposta no history pra trilha completa.
+    # PR2 fix Bug #2 (2026-05-18): role hardcoded 'assistant' era anti-padrão
+    # — contrato Clip (VectraClip/src/types/api.ts) espera 'agent' pra resposta
+    # de executor. Quando append_role=None, caller já fez append (ex: _do_reply
+    # gravou 'operator' antes); skipar evita duplicação operator+assistant
+    # (era o eco visível no histórico antes do fix).
+    if append_role is None:
+        logger.debug(
+            "connector_bus._reply_whatsapp_meta: append_role=None — caller já gravou history, skip"
         )
-    except Exception as e:
-        logger.warning("connector_bus.reply append_history non-fatal: %s", e)
+    else:
+        try:
+            delivery_kind = "meta_template" if use_template else "meta_cloud_api"
+            history_extra: Dict[str, Any] = {
+                "channel": "whatsapp",
+                "delivery": delivery_kind,
+            }
+            if use_template:
+                # W11 fix: só template_name_override (W14 vai expandir via workflow_steps.ferramentas)
+                history_extra["template_name"] = template_name_override
+            append_history(
+                session_id=session["id"],
+                role=append_role,
+                content=message,
+                extra=history_extra,
+            )
+        except Exception as e:
+            logger.warning("connector_bus.reply append_history non-fatal: %s", e)
 
     logger.info(
         "connector_bus._reply_whatsapp_meta: sent session=%s to=%s len=%d kind=%s",

@@ -637,7 +637,10 @@ async def _do_reply(
 
     delivered = False
     try:
-        delivered = await connector_bus.reply(session_row, content)
+        # PR2 fix Bug #2: append_role=None — caller já gravou history role='operator'
+        # acima (linha ~626). Sem o None, _reply_whatsapp_meta duplicaria como
+        # 'assistant', criando os pares operator+assistant que apareciam como eco.
+        delivered = await connector_bus.reply(session_row, content, append_role=None)
     except Exception as e:
         logger.warning("_do_reply connector_bus.reply non-fatal: %s", e)
 
