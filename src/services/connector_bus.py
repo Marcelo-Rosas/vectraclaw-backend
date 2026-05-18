@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("Vectra.connector_bus")
@@ -197,25 +197,47 @@ def close_session(*, session_id: str, status: str = "closed") -> Dict[str, Any]:
 _META_GRAPH_BASE = "https://graph.facebook.com"
 
 
-async def reply(session: Dict[str, Any], message: str) -> bool:
+async def reply(
+    session: Dict[str, Any],
+    message: str,
+    *,
+    template_name: Optional[str] = None,
+    template_params: Optional[List[str]] = None,
+) -> bool:
     """Envia `message` de volta ao contato externo da `session`.
 
     Best-effort: loga e devolve False em falha; nunca re-raise. Caller decide
     o que fazer com False (manter aberta, marcar errored, etc.).
 
     Roteamento por session.channel:
-      - 'whatsapp' → Meta Cloud API (resolve creds via adapter_catalog)
-      - outros     → log + False (delega ao caller criar task pro canal certo)
+      - 'whatsapp' → Meta Cloud API (resolve creds via adapter_catalog).
+                     Se fora da janela conversacional (session_window_hours do
+                     adapter), envia TEMPLATE em vez de free text. Template
+                     resolvido em ordem: arg template_name → agent_adapter_configs.
+                     template_id → fail (W11).
+      - outros     → log + False (delega ao caller criar task pro canal certo).
+                     Dispatch table por channel virá em W12.
     """
     channel = (session.get("channel") or "").strip()
     if channel == "whatsapp":
-        return await _reply_whatsapp_meta(session, message)
-    logger.warning("connector_bus.reply: canal '%s' não suportado", channel)
+        return await _reply_whatsapp_meta(
+            session, message,
+            template_name_override=template_name,
+            template_params=template_params,
+        )
+    logger.warning("connector_bus.reply: canal '%s' não suportado (W12: dispatch table)", channel)
     return False
 
 
-async def _reply_whatsapp_meta(session: Dict[str, Any], message: str) -> bool:
-    """Envia texto via Meta Cloud API.
+async def _reply_whatsapp_meta(
+    session: Dict[str, Any],
+    message: str,
+    *,
+    template_name_override: Optional[str] = None,
+    template_params: Optional[List[str]] = None,
+) -> bool:
+    """Envia mensagem via Meta Cloud API. W11 PR1: decisão free text vs template
+    baseada em janela conversacional (session_window_hours do adapter).
 
     Resolve credenciais via _find_meta_config_by_phone_number_id (catalog-driven,
     com vault:// desreferenciado). connector_id da session deve ser o
@@ -250,14 +272,35 @@ async def _reply_whatsapp_meta(session: Dict[str, Any], message: str) -> bool:
         logger.warning("connector_bus._reply_whatsapp_meta: access_token vazio para phone=%s", phone_number_id)
         return False
 
+    # W11 PR1 — janela conversacional check (auditor P1.1 + P2.1)
+    company_id = session.get("company_id")
+    adapter_id = cfg.get("adapter_id")
+    in_window = _is_in_session_window(session, company_id, adapter_id)
+    use_template = (not in_window) or bool(template_name_override)
+
+    if use_template:
+        chosen_template = template_name_override or _resolve_default_template(
+            company_id, adapter_id,
+        )
+        if not chosen_template:
+            logger.error(
+                "connector_bus._reply_whatsapp_meta: fora janela %dh sem template "
+                "configurado (agent_adapter_configs.template_id vazio). session=%s",
+                resolve_session_window_hours_safe(company_id, adapter_id),
+                session.get("id"),
+            )
+            return False
+        payload = _build_template_payload(to_digits, chosen_template, template_params or [message])
+    else:
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to_digits,
+            "type": "text",
+            "text": {"preview_url": False, "body": message[:4096]},
+        }
+
     url = f"{_META_GRAPH_BASE}/{api_version}/{phone_number_id}/messages"
-    payload = {
-        "messaging_product": "whatsapp",
-        "recipient_type": "individual",
-        "to": to_digits,
-        "type": "text",
-        "text": {"preview_url": False, "body": message[:4096]},
-    }
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -279,17 +322,144 @@ async def _reply_whatsapp_meta(session: Dict[str, Any], message: str) -> bool:
 
     # Append da resposta no history pra trilha completa
     try:
+        delivery_kind = "meta_template" if use_template else "meta_cloud_api"
+        history_extra: Dict[str, Any] = {
+            "channel": "whatsapp",
+            "delivery": delivery_kind,
+        }
+        if use_template:
+            history_extra["template_name"] = template_name_override or _resolve_default_template(
+                company_id, adapter_id,
+            )
         append_history(
             session_id=session["id"],
             role="assistant",
             content=message,
-            extra={"channel": "whatsapp", "delivery": "meta_cloud_api"},
+            extra=history_extra,
         )
     except Exception as e:
         logger.warning("connector_bus.reply append_history non-fatal: %s", e)
 
     logger.info(
-        "connector_bus._reply_whatsapp_meta: sent session=%s to=%s len=%d",
+        "connector_bus._reply_whatsapp_meta: sent session=%s to=%s len=%d kind=%s",
         session.get("id"), to_digits, len(message),
+        ("template" if use_template else "text"),
     )
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# W11 PR1 helpers — janela conversacional Meta + template fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_in_session_window(
+    session: Dict[str, Any],
+    company_id: Optional[str],
+    adapter_id: Optional[str],
+) -> bool:
+    """True se NOW < last_inbound_at + session_window_hours do adapter.
+
+    last_inbound_at vazio (sessão sem inbound do user) ⇒ FORA da janela
+    (Meta exige template message pra iniciar conversa).
+    """
+    last_inbound_raw = session.get("last_inbound_at")
+    if not last_inbound_raw:
+        return False
+    try:
+        # tolera string ISO ou datetime
+        if isinstance(last_inbound_raw, str):
+            # remove possíveis "Z" → +00:00 pro fromisoformat
+            iso = last_inbound_raw.replace("Z", "+00:00")
+            last_inbound = datetime.fromisoformat(iso)
+        else:
+            last_inbound = last_inbound_raw
+        if last_inbound.tzinfo is None:
+            last_inbound = last_inbound.replace(tzinfo=timezone.utc)
+    except Exception:
+        logger.warning("last_inbound_at malformed (%s) — assumindo fora janela",
+                       last_inbound_raw)
+        return False
+
+    window_h = resolve_session_window_hours_safe(company_id, adapter_id)
+    return datetime.now(timezone.utc) < (last_inbound + timedelta(hours=window_h))
+
+
+def resolve_session_window_hours_safe(
+    company_id: Optional[str], adapter_id: Optional[str], default: int = 24,
+) -> int:
+    """Wrapper safe pra service.whatsapp_template_sync.resolve_session_window_hours."""
+    if not company_id or not adapter_id:
+        return default
+    try:
+        from src.services.whatsapp_template_sync import resolve_session_window_hours
+        return resolve_session_window_hours(company_id, adapter_id, default=default)
+    except Exception as e:
+        logger.warning("resolve_session_window_hours failed (using default %d): %s",
+                       default, e)
+        return default
+
+
+def _resolve_default_template(
+    company_id: Optional[str], adapter_id: Optional[str],
+) -> Optional[str]:
+    """Lê agent_adapter_configs.field_values_json.template_id (per-agent override).
+    Aceita só templates aprovados+ativos do espelho local (whatsapp_templates)."""
+    if not company_id or not adapter_id:
+        return None
+    from src.api import supabase
+    if not supabase:
+        return None
+    try:
+        cfgs = (
+            supabase.table("agent_adapter_configs")
+            .select("field_values_json")
+            .eq("company_id", company_id)
+            .eq("adapter_id", adapter_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if not cfgs.data:
+            return None
+        template_name = (cfgs.data[0].get("field_values_json") or {}).get("template_id")
+        if not template_name:
+            return None
+        # Valida que ainda existe + aprovado
+        chk = (
+            supabase.table("whatsapp_templates")
+            .select("name")
+            .eq("company_id", company_id)
+            .eq("name", template_name)
+            .eq("status", "APPROVED")
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        return template_name if chk.data else None
+    except Exception as e:
+        logger.warning("_resolve_default_template failed: %s", e)
+        return None
+
+
+def _build_template_payload(
+    to_digits: str, template_name: str, params: List[str],
+) -> Dict[str, Any]:
+    """Payload Meta API type=template. Body params como text components.
+    Header/footer custom não suportados aqui (W12 vai estender)."""
+    body_components: List[Dict[str, Any]] = []
+    if params:
+        body_components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(p)} for p in params],
+        })
+    return {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_digits,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": "pt_BR"},  # W12: resolver via whatsapp_templates.language
+            "components": body_components,
+        },
+    }
