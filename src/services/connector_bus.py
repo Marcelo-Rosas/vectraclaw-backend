@@ -273,24 +273,34 @@ async def _reply_whatsapp_meta(
         return False
 
     # W11 PR1 — janela conversacional check (auditor P1.1 + P2.1)
+    # W11 fix (2026-05-18) — análise NAVI driver-qualification revelou que
+    # templates pertencem ao workflow_step (W14), não ao agente. E templates
+    # Vectra são todos MARKETING — sem opt-in registrado, Meta penaliza/rejeita
+    # reply emergencial via template. Estratégia:
+    #   - DENTRO janela: free text (continua igual)
+    #   - FORA janela SEM override explícito: NÃO tenta auto-template; log warning
+    #     e retorna False. Caller decide (criar task humana / usar W14 cadence_dispatcher
+    #     com binding explícito em workflow_steps.ferramentas + opt-in registrado).
     company_id = session.get("company_id")
     adapter_id = cfg.get("adapter_id")
     in_window = _is_in_session_window(session, company_id, adapter_id)
-    use_template = (not in_window) or bool(template_name_override)
 
-    if use_template:
-        chosen_template = template_name_override or _resolve_default_template(
-            company_id, adapter_id,
+    if not in_window and not template_name_override:
+        window_h = resolve_session_window_hours_safe(company_id, adapter_id)
+        logger.warning(
+            "connector_bus._reply_whatsapp_meta: FORA janela %dh — reply automático "
+            "bloqueado (templates MARKETING sem opt-in seriam rejeitados pela Meta). "
+            "session=%s. Caminho correto: criar task humana OU W14 cadence_dispatcher "
+            "com event_key + binding explícito em workflow_steps.ferramentas.",
+            window_h, session.get("id"),
         )
-        if not chosen_template:
-            logger.error(
-                "connector_bus._reply_whatsapp_meta: fora janela %dh sem template "
-                "configurado (agent_adapter_configs.template_id vazio). session=%s",
-                resolve_session_window_hours_safe(company_id, adapter_id),
-                session.get("id"),
-            )
-            return False
-        payload = _build_template_payload(to_digits, chosen_template, template_params or [message])
+        return False
+
+    use_template = bool(template_name_override)
+    if use_template:
+        # Placeholders do template são dados estruturados — nunca reutilizar body free-text.
+        params = template_params if template_params is not None else []
+        payload = _build_template_payload(to_digits, template_name_override, params)
     else:
         payload = {
             "messaging_product": "whatsapp",
@@ -328,9 +338,8 @@ async def _reply_whatsapp_meta(
             "delivery": delivery_kind,
         }
         if use_template:
-            history_extra["template_name"] = template_name_override or _resolve_default_template(
-                company_id, adapter_id,
-            )
+            # W11 fix: só template_name_override (W14 vai expandir via workflow_steps.ferramentas)
+            history_extra["template_name"] = template_name_override
         append_history(
             session_id=session["id"],
             role="assistant",
@@ -397,48 +406,6 @@ def resolve_session_window_hours_safe(
         logger.warning("resolve_session_window_hours failed (using default %d): %s",
                        default, e)
         return default
-
-
-def _resolve_default_template(
-    company_id: Optional[str], adapter_id: Optional[str],
-) -> Optional[str]:
-    """Lê agent_adapter_configs.field_values_json.template_id (per-agent override).
-    Aceita só templates aprovados+ativos do espelho local (whatsapp_templates)."""
-    if not company_id or not adapter_id:
-        return None
-    from src.api import supabase
-    if not supabase:
-        return None
-    try:
-        cfgs = (
-            supabase.table("agent_adapter_configs")
-            .select("field_values_json")
-            .eq("company_id", company_id)
-            .eq("adapter_id", adapter_id)
-            .eq("is_active", True)
-            .limit(1)
-            .execute()
-        )
-        if not cfgs.data:
-            return None
-        template_name = (cfgs.data[0].get("field_values_json") or {}).get("template_id")
-        if not template_name:
-            return None
-        # Valida que ainda existe + aprovado
-        chk = (
-            supabase.table("whatsapp_templates")
-            .select("name")
-            .eq("company_id", company_id)
-            .eq("name", template_name)
-            .eq("status", "APPROVED")
-            .eq("is_active", True)
-            .limit(1)
-            .execute()
-        )
-        return template_name if chk.data else None
-    except Exception as e:
-        logger.warning("_resolve_default_template failed: %s", e)
-        return None
 
 
 def _build_template_payload(
