@@ -221,7 +221,12 @@ def _parse_meta_message(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Extrai a primeira mensagem útil do payload Meta Cloud API.
     Schema: entry[].changes[].value.messages[] + value.metadata.phone_number_id
     + value.contacts[].profile.name. Retorna None se não houver mensagem (eg
-    status/delivery updates)."""
+    status/delivery updates).
+
+    W9 (auditor 2026-05-18 ajuste P1): extrai também `interactive.button_reply.id`
+    pra `button_id_hint` — Morpheus inbound triage usa pra match exato em
+    inbound_intent_rules.button_id. Sem isso o classifier perde o sinal mais
+    forte de detecção de origem."""
     entries = payload.get("entry") or []
     if not entries:
         return None
@@ -245,6 +250,18 @@ def _parse_meta_message(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             external_name = None
             if contacts:
                 external_name = ((contacts[0].get("profile") or {}).get("name")) or None
+
+            # W9 — extração de interactive.button_reply (Meta interactive messages).
+            # NULL se mensagem é texto normal ou não-interactive.
+            interactive = msg.get("interactive") or {}
+            button_reply = interactive.get("button_reply") or {}
+            list_reply = interactive.get("list_reply") or {}
+            button_id_hint = (
+                str(button_reply.get("id") or "").strip()
+                or str(list_reply.get("id") or "").strip()
+                or None
+            )
+
             return {
                 "phone_number_id": phone_number_id,
                 "external_id": str(msg.get("from") or "").strip(),
@@ -253,6 +270,7 @@ def _parse_meta_message(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "message_id": msg.get("id"),
                 "msg_type": msg.get("type") or "text",
                 "timestamp": msg.get("timestamp"),
+                "button_id_hint": button_id_hint,  # W9 — pode ser None
             }
     return None
 
@@ -457,6 +475,10 @@ def _dispatch_inbound_task(
             "phone_number_id": msg["phone_number_id"],
             "message": content,
             "wamid": msg.get("message_id"),
+            # W9 — channel pra Morpheus consultar connector_channels.fallback_operation_type;
+            # button_id_hint pra inbound_intent_rules.button_id (match exato Meta interactive)
+            "channel": session.get("channel"),
+            "button_id_hint": msg.get("button_id_hint"),
         },
         "created_at": now_iso,
         "updated_at": now_iso,
