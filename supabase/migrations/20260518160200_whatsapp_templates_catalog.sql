@@ -12,7 +12,7 @@
 
 CREATE TABLE IF NOT EXISTS vectraclip.whatsapp_templates (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id uuid NOT NULL REFERENCES vectraclip.companies(id) ON DELETE CASCADE,
+  company_id uuid NOT NULL REFERENCES vectraclip.companies(company_id) ON DELETE CASCADE,
   waba_id text NOT NULL,
   meta_template_id text NOT NULL,         -- ID na Meta (numérico string)
   name text NOT NULL,                     -- nome do template (slug)
@@ -55,7 +55,7 @@ CREATE POLICY whatsapp_templates_read_own_company
 -- Audit log de cada sync (sucesso/falha, contagem, snapshot raw)
 CREATE TABLE IF NOT EXISTS vectraclip.whatsapp_template_sync_log (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  company_id uuid NOT NULL REFERENCES vectraclip.companies(id) ON DELETE CASCADE,
+  company_id uuid NOT NULL REFERENCES vectraclip.companies(company_id) ON DELETE CASCADE,
   adapter_id uuid REFERENCES vectraclip.adapter_catalog(id) ON DELETE SET NULL,
   triggered_by uuid REFERENCES vectraclip.app_users(id) ON DELETE SET NULL,
   status text NOT NULL CHECK (status IN ('success','error','partial')),
