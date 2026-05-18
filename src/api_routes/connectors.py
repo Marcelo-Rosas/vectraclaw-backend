@@ -442,7 +442,12 @@ def _dispatch_inbound_task(
         "description": content[:2000],
         "operation_type": op_type,
         "status": "queued",
-        "executor_type": "harness",
+        # W8 (2026-05-18) — `auto` deixa decision_engine rotear via routing_score
+        # do operation_types_catalog. freight-quotation tem score 80 → vai pra CMA
+        # → router resolve adapter via agent_adapter_configs → ClaudeCodeCliAgentClient
+        # (após Mercator config preenchido via UI W4). Substitui harness hardcoded
+        # do F2. Auditor 2026-05-18: zero hardcode novo, metadata-driven puro.
+        "executor_type": "auto",
         "assigned_to_agent_id": assigned_agent,
         "input_json": {
             "source": "meta_whatsapp_webhook",
