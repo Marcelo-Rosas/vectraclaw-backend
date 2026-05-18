@@ -437,14 +437,25 @@ class ResilientHarnessDaemon:
         `_dispatch_inbound_task` em src/api_routes/connectors.py após P0-9).
         Tasks normais (sem session_id) são noop silencioso.
 
-        Texto da reply: `raw_output` cru (já é texto do `claude -p` default).
-        Auditor 2026-05-18: nenhum handler atual usa key estruturada como
-        `output_json.reply` — usar `raw` é o comportamento correto.
+        Extração do texto da reply (PR3 fix 2026-05-18):
+        Handlers modernos (Mercator W13, Athena, Morpheus, Kronos, Mnemos,
+        Daedalus) retornam dict estruturado `{status, output_text, output_json}`
+        — `raw_output` é o JSON serializado dessa estrutura. Pra esses, extrai
+        `output_text`. Fallback graceful pra handler legacy `claude -p` que
+        retorna texto cru (DEPRECATED branch).
+
+        Handler moderno SEM `output_text` (oracle, athena de hoje) cai no
+        fallback de JSON cru — log WARNING explícito pra observabilidade
+        (auditor P1.1 2026-05-18). Se algum fluxo futuro colocar `session_id`
+        em task de oracle/athena, o WARNING vai sinalizar a falta de
+        `output_text` antes de mandar JSON pro WhatsApp.
 
         Best-effort: qualquer falha (lookup, reply HTTP) é logada como warning
         e propaga `Exception` pro caller que silencia. Não bloqueia
         `_complete_task` (no `finally:` do loop processor).
         """
+        import json as _json_local
+
         input_json = task.get("input_json") or {}  # guard contra None (Regra auditor)
         session_id = input_json.get("session_id") if isinstance(input_json, dict) else None
         if not session_id:
@@ -471,7 +482,34 @@ class ResilientHarnessDaemon:
             return
         session = res.data[0]
 
-        reply_text = (raw_output or "").strip()
+        # PR3 (2026-05-18) — extração estruturada de output_text
+        reply_text: str
+        try:
+            parsed = _json_local.loads(raw_output)
+            if isinstance(parsed, dict):
+                candidate = parsed.get("output_text")
+                if not candidate and isinstance(parsed.get("output_json"), dict):
+                    # Extensibilidade NAVI-style — não usado por handlers
+                    # atuais mas reserva pro caso de absorção do nina-orchestrator
+                    candidate = parsed["output_json"].get("message_to_client")
+                if candidate:
+                    reply_text = str(candidate).strip()
+                else:
+                    # Handler moderno sem output_text — observabilidade obrigatória
+                    # (auditor P1.1) pra detectar dict serializado vazando pro Meta
+                    logger.warning(
+                        "connector reply: handler moderno sem output_text — usando JSON cru "
+                        "como fallback (visível pro cliente!). task=%s op=%s keys=%s",
+                        task.get("id"), task.get("operation_type"), list(parsed.keys()),
+                    )
+                    reply_text = (raw_output or "").strip()
+            else:
+                # Lista/string/número solto serializado — improvável mas defensivo
+                reply_text = (raw_output or "").strip()
+        except (ValueError, TypeError):
+            # Handler legacy claude -p devolve texto cru, não JSON
+            reply_text = (raw_output or "").strip()
+
         if not reply_text:
             logger.info("connector reply: output vazio task=%s — skip", task.get("id"))
             return
