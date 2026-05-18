@@ -713,6 +713,33 @@ class LlmModel(CamelModel):
         return d
 
 
+# W13.1 — AI Gateway: row de credencial LLM por company+provider+model com
+# fallback automático por priority. Service src/services/ai_gateway.py marca
+# status=exhausted ao detectar 429/quota/billing.
+class LlmApiKey(CamelModel):
+    id: str
+    company_id: str
+    provider: Literal[
+        "anthropic", "claude_cli_subscription", "google", "groq",
+        "huggingface", "nous_hermes", "ollama", "openai",
+    ]
+    model_id: Optional[str] = None
+    vault_secret_id: Optional[str] = None  # FK vault.secrets (nullable só pra ollama)
+    priority: int = 100
+    status: Literal["active", "exhausted", "disabled"] = "active"
+    last_error: Optional[str] = None
+    exhausted_at: Optional[str] = None
+    last_used_at: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        alias_generator = to_camel
+        validate_by_name = True
+        extra = "ignore"
+
+
 class AgentSpecialty(CamelModel):
     id: str
     name: str

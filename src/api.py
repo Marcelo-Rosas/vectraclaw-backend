@@ -9417,6 +9417,7 @@ from src.api_routes import connectors as _connectors_routes  # noqa: E402  # W3 
 from src.api_routes import nous_hermes as _nous_hermes_routes  # noqa: E402  # PRD Nous Hermes F1
 from src.api_routes import whatsapp_templates as _whatsapp_templates_routes  # noqa: E402  # W11 PR1
 from src.api_routes import agent_skills as _agent_skills_routes  # noqa: E402  # W15.1
+from src.api_routes import llm_api_keys as _llm_api_keys_routes  # noqa: E402  # W13.1 AI Gateway
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -9435,3 +9436,4 @@ app.include_router(_connectors_routes.router)  # W3 PRD Fundação Orchestration
 app.include_router(_nous_hermes_routes.router)
 app.include_router(_whatsapp_templates_routes.router)  # W11 PR1 — WhatsApp Templates catalog
 app.include_router(_agent_skills_routes.router)  # W15.1 — Agent Skills + Operation Types catalog
+app.include_router(_llm_api_keys_routes.router)  # W13.1 — AI Gateway llm_api_keys CRUD
