@@ -512,6 +512,18 @@ class ResilientHarnessDaemon:
             result = triage_entry(task, self._get_supabase())
             return _json.dumps(result)
 
+        # W13 MVP (2026-05-18) — Mercator freight-quotation humano-in-loop.
+        # Handler escala pro time comercial via resposta estruturada (4 dados:
+        # origem/destino/peso/valor). NÃO calcula valor — depende de price_tables
+        # CFN não absorvidas ainda. Fix Bug #1 do handoff CONNECTOR-SESSIONS-AGENT-DISPATCH
+        # (5 tasks freight-quotation status=blocked desde 2026-05-18). Memory
+        # `project_session_2026-05-16_fase_a_5prs` afirmou W7 P0-10 criou o arquivo
+        # mercator.py, mas nunca existiu em prod — só agora.
+        if op_type == "freight-quotation":
+            from src.agents.mercator import handle_freight_quotation
+            result = handle_freight_quotation(task, self._get_supabase())
+            return _json.dumps(result)
+
         if op_type == "financial-audit":
             from src.agents.kronos import entrypoint as kronos_entry
             result = kronos_entry(task, self._get_supabase())
