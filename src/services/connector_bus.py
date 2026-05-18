@@ -188,3 +188,108 @@ def close_session(*, session_id: str, status: str = "closed") -> Dict[str, Any]:
     if not res.data:
         raise RuntimeError(f"connector_session_close_failed: {session_id}")
     return res.data[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outbound (reply) — F2 do PRD Fundação Orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+_META_GRAPH_BASE = "https://graph.facebook.com"
+
+
+async def reply(session: Dict[str, Any], message: str) -> bool:
+    """Envia `message` de volta ao contato externo da `session`.
+
+    Best-effort: loga e devolve False em falha; nunca re-raise. Caller decide
+    o que fazer com False (manter aberta, marcar errored, etc.).
+
+    Roteamento por session.channel:
+      - 'whatsapp' → Meta Cloud API (resolve creds via adapter_catalog)
+      - outros     → log + False (delega ao caller criar task pro canal certo)
+    """
+    channel = (session.get("channel") or "").strip()
+    if channel == "whatsapp":
+        return await _reply_whatsapp_meta(session, message)
+    logger.warning("connector_bus.reply: canal '%s' não suportado", channel)
+    return False
+
+
+async def _reply_whatsapp_meta(session: Dict[str, Any], message: str) -> bool:
+    """Envia texto via Meta Cloud API.
+
+    Resolve credenciais via _find_meta_config_by_phone_number_id (catalog-driven,
+    com vault:// desreferenciado). connector_id da session deve ser o
+    phone_number_id Meta (set no webhook inbound).
+    """
+    phone_number_id = (session.get("connector_id") or "").strip()
+    to_digits = (session.get("external_id") or "").strip()
+    if not phone_number_id or not to_digits or not message.strip():
+        logger.warning(
+            "connector_bus._reply_whatsapp_meta: missing fields phone=%s to=%s msg_empty=%s",
+            bool(phone_number_id), bool(to_digits), not message.strip(),
+        )
+        return False
+
+    try:
+        from src.api_routes.connectors import _find_meta_config_by_phone_number_id
+    except Exception as e:
+        logger.error("connector_bus: import resolver falhou: %s", e)
+        return False
+
+    cfg = _find_meta_config_by_phone_number_id(phone_number_id)
+    if not cfg:
+        logger.warning(
+            "connector_bus._reply_whatsapp_meta: no adapter config for phone_number_id=%s",
+            phone_number_id,
+        )
+        return False
+
+    access_token = (cfg.get("access_token") or "").strip()
+    api_version = (cfg.get("api_version") or "v25.0").strip()
+    if not access_token:
+        logger.warning("connector_bus._reply_whatsapp_meta: access_token vazio para phone=%s", phone_number_id)
+        return False
+
+    url = f"{_META_GRAPH_BASE}/{api_version}/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_digits,
+        "type": "text",
+        "text": {"preview_url": False, "body": message[:4096]},
+    }
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code >= 400:
+            logger.error(
+                "connector_bus: Meta API %s para phone=%s body=%s",
+                resp.status_code, phone_number_id, resp.text[:500],
+            )
+            return False
+    except Exception as e:
+        logger.exception("connector_bus._reply_whatsapp_meta HTTP falhou: %s", e)
+        return False
+
+    # Append da resposta no history pra trilha completa
+    try:
+        append_history(
+            session_id=session["id"],
+            role="assistant",
+            content=message,
+            extra={"channel": "whatsapp", "delivery": "meta_cloud_api"},
+        )
+    except Exception as e:
+        logger.warning("connector_bus.reply append_history non-fatal: %s", e)
+
+    logger.info(
+        "connector_bus._reply_whatsapp_meta: sent session=%s to=%s len=%d",
+        session.get("id"), to_digits, len(message),
+    )
+    return True

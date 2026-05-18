@@ -30,11 +30,20 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response
 
+from src.agent_ids import ORACLE_AGENT_ID
+
 logger = logging.getLogger("api.connectors")
+
+# F2 PRD Fundação Orchestration: operation_type default ao criar task a partir
+# de mensagem WhatsApp inbound. Fallback simples — roteamento smarter (palavra-
+# chave / Morpheus) fica para fase posterior. PRD seção 5: "operation_type:
+# detectar por conteúdo OU usar 'oracle-research' como fallback".
+_INBOUND_DEFAULT_OPERATION_TYPE = "oracle-research"
 router = APIRouter(tags=["connectors"])
 
 # Slug canônico do adapter Meta WhatsApp Cloud API no adapter_catalog.
@@ -320,12 +329,118 @@ async def meta_whatsapp_webhook(
         logger.exception("meta_whatsapp_webhook unexpected failure")
         raise HTTPException(500, str(e))
 
+    # F2 — Criar task VectraClaw para o Oracle processar a mensagem.
+    # Só dispatcha se houver conteúdo (ignora ack/delivery sem texto).
+    task_id: Optional[str] = None
+    if msg["content"]:
+        task_id = _dispatch_inbound_task(
+            company_id=company_id,
+            session=session,
+            msg=msg,
+        )
+
     return {
         "session_id": session["id"],
         "status": session.get("status"),
         "external_id": msg["external_id"],
         "had_content": bool(msg["content"]),
+        "task_id": task_id,
     }
+
+
+def _dispatch_inbound_task(
+    *,
+    company_id: str,
+    session: Dict[str, Any],
+    msg: Dict[str, Any],
+) -> Optional[str]:
+    """F2 — Cria task VectraClaw + promove sessão pra processing + emite WS.
+
+    Best-effort: falhas individuais (insert, promote, ws) logam e seguem.
+    Retorna o task_id criado, ou None se a inserção falhou."""
+    from src.api import supabase
+    from src.services import connector_bus
+    from src.ws_manager import manager as ws_manager
+
+    if not supabase:
+        logger.error("_dispatch_inbound_task: supabase indisponível")
+        return None
+
+    content = msg["content"]
+    external_label = (msg.get("external_name") or msg.get("external_id") or "").strip()
+    title = f"WhatsApp: {external_label[:30]} — {content[:60]}".strip()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    task_row = {
+        "company_id": company_id,
+        "title": title[:200],
+        "description": content[:2000],
+        "operation_type": _INBOUND_DEFAULT_OPERATION_TYPE,
+        "status": "queued",
+        "executor_type": "harness",
+        "assigned_to_agent_id": ORACLE_AGENT_ID,
+        "input_json": {
+            "source": "meta_whatsapp_webhook",
+            "session_id": session["id"],
+            "external_id": msg["external_id"],
+            "external_name": msg.get("external_name"),
+            "phone_number_id": msg["phone_number_id"],
+            "message": content,
+            "wamid": msg.get("message_id"),
+        },
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    try:
+        tres = supabase.table("tasks").insert(task_row).execute()
+    except Exception as e:
+        logger.exception("_dispatch_inbound_task: insert task falhou: %s", e)
+        return None
+
+    if not tres.data:
+        logger.error("_dispatch_inbound_task: insert task retornou vazio")
+        return None
+
+    new_task = tres.data[0]
+    new_task_id = str(new_task["id"])
+
+    try:
+        connector_bus.promote_to_processing(
+            session_id=session["id"],
+            task_id=new_task_id,
+            routed_to_agent=ORACLE_AGENT_ID,
+            routing_score=50,
+        )
+    except Exception as e:
+        logger.warning("_dispatch_inbound_task: promote_to_processing non-fatal: %s", e)
+
+    # WS broadcast: front-end recebe task_updated e (best-effort) connector evento custom
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(ws_manager.emit_task_updated(company_id, new_task))
+            loop.create_task(ws_manager.broadcast(
+                company_id,
+                {
+                    "type": "connector_session_updated",
+                    "payload": {
+                        "session_id": session["id"],
+                        "task_id": new_task_id,
+                        "channel": "whatsapp",
+                        "external_id": msg["external_id"],
+                    },
+                },
+            ))
+    except Exception as e:
+        logger.warning("_dispatch_inbound_task: WS broadcast non-fatal: %s", e)
+
+    logger.info(
+        "meta_whatsapp inbound dispatched company=%s session=%s task=%s op=%s",
+        company_id, session["id"], new_task_id, _INBOUND_DEFAULT_OPERATION_TYPE,
+    )
+    return new_task_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -380,35 +495,38 @@ async def list_connector_sessions(
         raise HTTPException(500, str(e))
 
 
-@router.post("/api/connector-sessions/{session_id}/reply")
-@router.post("/connector-sessions/{session_id}/reply")
-async def reply_connector_session(
+async def _do_reply(
     request: Request,
     session_id: str,
-    payload: Dict[str, Any] = Body(...),
-):
-    """Humano responde manualmente a uma sessão. Faz append ao history como
-    role='operator'. NÃO chama Meta outbound aqui (PRD F2 fará via meta_client).
-    Reply opaco persiste só a intenção."""
+    content: str,
+) -> Dict[str, Any]:
+    """Handler compartilhado por /api/connector-sessions/{id}/reply e
+    /api/connectors/reply. Valida JWT vs company da session, faz append role=
+    'operator', e dispara outbound real via connector_bus.reply (Meta Cloud API).
+
+    Retorna {session_id, appended, delivered, last_message_at}. delivered=False
+    significa que persistiu como histórico mas o envio externo falhou (caller
+    pode reenviar). Nunca levanta — retorna detalhes pro front decidir.
+    """
     from src.api import supabase, validate_jwt_company_id
     from src.services import connector_bus
 
     if not supabase:
         raise HTTPException(503, "supabase_required")
 
-    sess = (
+    sess_q = (
         supabase.table("connector_sessions")
-        .select("company_id,status")
+        .select("*")
         .eq("id", session_id)
         .limit(1)
         .execute()
     )
-    if not sess.data:
+    if not sess_q.data:
         raise HTTPException(404, "connector_session_not_found")
+    session_row = sess_q.data[0]
 
-    validate_jwt_company_id(request.state.token, sess.data[0]["company_id"])
+    validate_jwt_company_id(request.state.token, session_row["company_id"])
 
-    content = str(payload.get("content") or "").strip()
     if not content:
         raise HTTPException(400, "content_required")
 
@@ -422,11 +540,45 @@ async def reply_connector_session(
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     except Exception as e:
-        logger.exception("reply_connector_session failed")
+        logger.exception("_do_reply append_history failed")
         raise HTTPException(500, str(e))
+
+    delivered = False
+    try:
+        delivered = await connector_bus.reply(session_row, content)
+    except Exception as e:
+        logger.warning("_do_reply connector_bus.reply non-fatal: %s", e)
 
     return {
         "session_id": session_id,
         "appended": True,
+        "delivered": delivered,
         "last_message_at": updated.get("last_message_at"),
     }
+
+
+@router.post("/api/connector-sessions/{session_id}/reply")
+@router.post("/connector-sessions/{session_id}/reply")
+async def reply_connector_session(
+    request: Request,
+    session_id: str,
+    payload: Dict[str, Any] = Body(...),
+):
+    """Humano responde manualmente a uma sessão. Append role='operator' +
+    outbound real via Meta Cloud API (connector_bus.reply)."""
+    content = str(payload.get("content") or payload.get("message") or "").strip()
+    return await _do_reply(request, session_id, content)
+
+
+@router.post("/api/connectors/reply")
+@router.post("/connectors/reply")
+async def reply_connector_body(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+):
+    """Alias body-based (PRD seção 5). Espera {session_id, message} no body."""
+    session_id = str(payload.get("session_id") or "").strip()
+    content = str(payload.get("message") or payload.get("content") or "").strip()
+    if not session_id:
+        raise HTTPException(400, "session_id_required")
+    return await _do_reply(request, session_id, content)
