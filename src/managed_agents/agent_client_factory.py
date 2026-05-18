@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .claude_code_cli_agent_client import ClaudeCodeCliAgentClient
+from .nous_hermes_agent_client import NousHermesAgentClient
 from .groq_agent_client import GroqAgentClient
 from .huggingface_agent_client import HuggingFaceAgentClient
 from .managed_agent_client import ManagedAgentClient
@@ -28,6 +29,7 @@ PROVIDER_CLIENT_MAP: Dict[str, Optional[type]] = {
     # `claude-cli-subscription-subprocess`). Adapter slug=`claude_code_cli`
     # provisionado em vectraclip.adapter_catalog (migration 20260518124224).
     "claude_cli_subscription": ClaudeCodeCliAgentClient,
+    "nous_hermes": NousHermesAgentClient,
     "openai": None,
     "google": None,
 }
@@ -45,6 +47,7 @@ def get_agent_client(
     - `huggingface`             → `HuggingFaceAgentClient(config=config or {})`
     - `groq`                    → `GroqAgentClient(config=config or {})`
     - `claude_cli_subscription` → `ClaudeCodeCliAgentClient(config=config or {})`
+    - `nous_hermes`                 → `NousHermesAgentClient(config=config or {})`
     - `openai`/`google`         → `NotImplementedError` (slot reservado)
     - desconhecido              → `ValueError`
     """
