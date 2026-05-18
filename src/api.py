@@ -6263,32 +6263,22 @@ def resolve_secret_ref(value: Any, company_id: str) -> Optional[str]:
     if not secret_id:
         return None
     try:
-        # Confirmar ownership: company_secrets é fronteira per-tenant; mesmo que
-        # o caller já tenha company_id correto, double-check (defense in depth).
-        owner = (
-            supabase.table("company_secrets")
-            .select("vault_secret_id,company_id")
-            .eq("vault_secret_id", secret_id)
-            .eq("company_id", company_id)
-            .limit(1)
-            .execute()
-        )
-        if not owner.data:
-            logger.warning("resolve_secret_ref: vault_secret_id=%s not owned by company_id=%s",
+        # W5.1 — schema `vault` não é exposed pelo PostgREST (PGRST106).
+        # Usar RPC SECURITY DEFINER vectraclip.get_vault_secret que faz:
+        #   1. SELECT company_secrets WHERE vault_secret_id=X AND company_id=Y
+        #      (cross-company protection)
+        #   2. SELECT vault.decrypted_secrets WHERE id=X
+        #   Retorna NULL silenciosamente se ownership falha (não vaza diff).
+        res = supabase.rpc(
+            "get_vault_secret",
+            {"p_vault_secret_id": secret_id, "p_company_id": company_id},
+        ).execute()
+        decrypted = res.data
+        if decrypted is None or decrypted == "":
+            logger.warning("resolve_secret_ref: vault_secret_id=%s not owned by/missing for company_id=%s",
                            secret_id[:8], company_id)
             return None
-        # Lê valor claro do Vault (service_role tem acesso a vault.decrypted_secrets).
-        res = (
-            supabase.schema("vault")
-            .table("decrypted_secrets")
-            .select("decrypted_secret")
-            .eq("id", secret_id)
-            .limit(1)
-            .execute()
-        )
-        if not res.data:
-            return None
-        return str(res.data[0].get("decrypted_secret") or "")
+        return str(decrypted)
     except Exception as e:
         logger.error("resolve_secret_ref failed for ref=%s: %s", value[:20], e)
         return None
