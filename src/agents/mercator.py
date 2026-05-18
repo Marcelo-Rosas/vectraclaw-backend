@@ -39,11 +39,13 @@ def _greet(name: str) -> str:
 
 
 def _build_quotation_intake_message(client_name: str) -> str:
-    """Resposta padrão escalação humana. Pede os 4 dados que o time comercial
-    precisa pra fechar cotação."""
+    """Resposta padrão escalação humana. Pede os 5 dados que o time comercial
+    precisa pra fechar cotação (Marcelo 2026-05-18 adicionou CNPJ/CPF —
+    necessário pra emissão de CT-e + análise de crédito + segmentação cliente)."""
     return (
         f"{_greet(client_name)} Recebi sua solicitação de cotação. 📦\n\n"
         "Pra meu time comercial agilizar, me confirma:\n"
+        "• CNPJ ou CPF\n"
         "• Origem (cidade + UF)\n"
         "• Destino (cidade + UF)\n"
         "• Peso aproximado da carga (kg)\n"
