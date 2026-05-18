@@ -46,11 +46,10 @@ META_WHATSAPP_ADAPTER_SLUG = "meta-whatsapp"
 # Lookup adapter config (catalog-driven, sem env)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_meta_configs() -> List[Dict[str, Any]]:
-    """Lista todos os agent_adapter_configs ativos do adapter meta-whatsapp.
-    Cada row: {company_id, agent_id, field_values_json{phone_number_id,
-    webhook_verify_token, app_secret, access_token, api_version, ...}}.
-    """
+def _load_meta_adapter_targets() -> List[Dict[str, Any]]:
+    """Lista (company_id, adapter_id) de TODA company que tem adapter
+    meta-whatsapp ativo no catalog. Não carrega values ainda — quem itera
+    decide ler company_adapter_values e/ou agent_adapter_configs."""
     from src.api import supabase
     if not supabase:
         return []
@@ -62,45 +61,106 @@ def _load_meta_configs() -> List[Dict[str, Any]]:
             .eq("is_active", True)
             .execute()
         )
-        adapter_ids = [a["id"] for a in (adapters.data or [])]
-        if not adapter_ids:
-            return []
-        configs = (
+        return adapters.data or []
+    except Exception as e:
+        logger.error("_load_meta_adapter_targets failed: %s", e)
+        return []
+
+
+def _resolve_meta_config_for_company(
+    company_id: str, adapter_id: str
+) -> Optional[Dict[str, Any]]:
+    """W5 — Resolve config Meta efetiva pra (company, adapter), aplicando
+    lookup híbrido em CADA field individualmente:
+      1. agent_adapter_configs.field_values_json[field] (override de exceção)
+      2. company_adapter_values.field_values_json[field] (PRIMARY)
+    Retorna dict {company_id, agent_id_override, phone_number_id, app_secret,
+    webhook_verify_token, access_token, api_version} com valores JÁ
+    desreferenciados (vault:// resolvido). Retorna None se phone_number_id
+    não está setado (config incompleta — não dá pra rotear webhook)."""
+    from src.api import (
+        supabase,
+        get_company_adapter_values,
+        resolve_adapter_field_value,
+    )
+    if not supabase:
+        return None
+
+    company_values = get_company_adapter_values(company_id, adapter_id) or {}
+
+    # Carrega agent overrides (0..N). Usamos só o PRIMEIRO se houver — múltiplos
+    # agentes na mesma company usando mesmo Meta WhatsApp = mesma identidade.
+    agent_values: Dict[str, Any] = {}
+    agent_id_override: Optional[str] = None
+    try:
+        agent_cfgs = (
             supabase.table("agent_adapter_configs")
-            .select("company_id,agent_id,field_values_json,adapter_id")
-            .in_("adapter_id", adapter_ids)
+            .select("agent_id,field_values_json")
+            .eq("company_id", company_id)
+            .eq("adapter_id", adapter_id)
             .eq("is_active", True)
+            .limit(1)
             .execute()
         )
-        return configs.data or []
+        if agent_cfgs.data:
+            row = agent_cfgs.data[0]
+            agent_values = row.get("field_values_json") or {}
+            agent_id_override = row.get("agent_id")
     except Exception as e:
-        logger.error("_load_meta_configs failed: %s", e)
-        return []
+        logger.warning("agent_adapter_configs lookup failed for company=%s: %s",
+                       company_id, e)
+
+    def _r(field: str) -> Optional[str]:
+        return resolve_adapter_field_value(field, agent_values, company_values, company_id)
+
+    resolved = {
+        "company_id": company_id,
+        "adapter_id": adapter_id,
+        "agent_id_override": agent_id_override,
+        "phone_number_id": _r("phone_number_id"),
+        "app_secret": _r("app_secret"),
+        "webhook_verify_token": _r("webhook_verify_token"),
+        "access_token": _r("access_token"),
+        "api_version": _r("api_version"),
+    }
+    if not resolved["phone_number_id"]:
+        return None  # config incompleta — não roteia
+    return resolved
 
 
 def _find_meta_config_by_phone_number_id(phone_number_id: str) -> Optional[Dict[str, Any]]:
     """Resolve config Meta pela chave de roteamento `phone_number_id` (vem do
-    payload Meta). Retorna o primeiro match — assume 1:1 phone↔company."""
+    payload Meta). Itera companies com adapter meta-whatsapp e devolve a que
+    bate. W5 — usa resolver híbrido company→agent."""
     if not phone_number_id:
         return None
-    for cfg in _load_meta_configs():
-        fv = cfg.get("field_values_json") or {}
-        if str(fv.get("phone_number_id") or "").strip() == phone_number_id.strip():
-            return cfg
+    pid_target = phone_number_id.strip()
+    for adapter_row in _load_meta_adapter_targets():
+        resolved = _resolve_meta_config_for_company(
+            adapter_row["company_id"], adapter_row["id"]
+        )
+        if resolved and resolved["phone_number_id"].strip() == pid_target:
+            return resolved
     return None
 
 
 def _find_any_meta_config_with_verify_token(verify_token: str) -> Optional[Dict[str, Any]]:
     """Handshake GET vem ANTES do POST e Meta não envia phone_number_id no GET.
-    Aceita qualquer config Meta cujo webhook_verify_token bata. Em multi-tenant
-    com mesmo verify_token, retorna o primeiro — admin deve usar tokens distintos."""
+    Aceita qualquer config Meta cujo webhook_verify_token (resolvido via W5)
+    bata. Multi-tenant com mesmo verify_token: primeiro match — admin deve
+    usar tokens distintos."""
     if not verify_token:
         return None
-    for cfg in _load_meta_configs():
-        fv = cfg.get("field_values_json") or {}
-        cfg_token = str(fv.get("webhook_verify_token") or "").strip()
-        if cfg_token and hmac.compare_digest(cfg_token, verify_token.strip()):
-            return cfg
+    vt = verify_token.strip()
+    for adapter_row in _load_meta_adapter_targets():
+        resolved = _resolve_meta_config_for_company(
+            adapter_row["company_id"], adapter_row["id"]
+        )
+        if not resolved:
+            continue
+        cfg_token = (resolved.get("webhook_verify_token") or "").strip()
+        if cfg_token and hmac.compare_digest(cfg_token, vt):
+            return resolved
     return None
 
 
@@ -222,8 +282,10 @@ async def meta_whatsapp_webhook(
                        msg["phone_number_id"])
         raise HTTPException(404, "no_adapter_config_for_phone_number_id")
 
-    fv = cfg.get("field_values_json") or {}
-    app_secret = str(fv.get("app_secret") or "").strip()
+    # W5 — cfg vem JÁ resolvido pelo _resolve_meta_config_for_company:
+    # phone_number_id, app_secret, webhook_verify_token, etc desreferenciados
+    # via resolver híbrido (agent override → company primary → None).
+    app_secret = str(cfg.get("app_secret") or "").strip()
     if not app_secret:
         raise HTTPException(503, "app_secret_not_configured_for_company")
     if not x_hub_signature_256 or not _verify_meta_signature(

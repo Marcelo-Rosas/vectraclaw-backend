@@ -6294,6 +6294,170 @@ def resolve_secret_ref(value: Any, company_id: str) -> Optional[str]:
         return None
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# W5 — Company-Level Adapter Values + Per-Agent Override.
+# Marcelo 2026-05-17: secrets de API (Meta access_token, anthropic_key, etc)
+# devem ser preenchidos UMA VEZ por company em /admin/connectors. Agent
+# adapter config vira override de EXCEÇÃO (debug/recovery), não default.
+#
+# Resolver order: agent_adapter_configs.field_values_json → company_adapter_values
+# → None. Helper resolve_adapter_field_value abstrai ordem pra callers.
+# ──────────────────────────────────────────────────────────────────────────
+
+def resolve_adapter_field_value(
+    field_key: str,
+    agent_field_values: Optional[Dict[str, Any]],
+    company_field_values: Optional[Dict[str, Any]],
+    company_id: str,
+) -> Optional[str]:
+    """W5 — Resolve valor de field pelo lookup order híbrido:
+    1. agent_adapter_configs.field_values_json[field_key] (override de exceção)
+    2. company_adapter_values.field_values_json[field_key] (PRIMARY)
+    3. None
+
+    Aplica resolve_secret_ref no resultado pra desreferenciar `vault://`.
+    Callers nunca precisam saber se valor veio de override ou primary —
+    semântica única: "qual é o valor efetivo deste field pra este agente?"
+    """
+    agent_v = (agent_field_values or {}).get(field_key)
+    if agent_v is not None and agent_v != "":
+        return resolve_secret_ref(agent_v, company_id)
+    company_v = (company_field_values or {}).get(field_key)
+    if company_v is not None and company_v != "":
+        return resolve_secret_ref(company_v, company_id)
+    return None
+
+
+def get_company_adapter_values(company_id: str, adapter_id: str) -> Optional[Dict[str, Any]]:
+    """Lê row de vectraclip.company_adapter_values pra (company, adapter).
+    Retorna None se row inexistente. Sem cache (lookup é raro: 1x por sessão Meta)."""
+    if not supabase:
+        return None
+    try:
+        res = (
+            supabase.table("company_adapter_values")
+            .select("field_values_json,is_active")
+            .eq("company_id", company_id)
+            .eq("adapter_id", adapter_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if not res.data:
+            return None
+        return res.data[0].get("field_values_json") or {}
+    except Exception as e:
+        logger.error("get_company_adapter_values failed: %s", e)
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# W5 — endpoints GET/PUT /api/companies/{id}/adapter-values/{adapter_id}
+# Frontend AdminConnectors.tsx + CompanyAdapterValuesDialog consomem.
+# ──────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/companies/{company_id}/adapter-values/{adapter_id}")
+@app.get("/companies/{company_id}/adapter-values/{adapter_id}")
+async def get_company_adapter_values_route(request: Request, company_id: str, adapter_id: str):
+    """Retorna field_values_json salvos pra company+adapter. Vazio se nunca
+    foi configurado (cliente deve renderizar form com defaults)."""
+    if not supabase:
+        return {"companyId": company_id, "adapterId": adapter_id, "fieldValuesJson": {}}
+    try:
+        caller_company = _resolve_company_id(request)
+        if caller_company and caller_company != company_id:
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+        values = get_company_adapter_values(company_id, adapter_id) or {}
+        return {
+            "companyId": company_id,
+            "adapterId": adapter_id,
+            "fieldValuesJson": values,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("get_company_adapter_values_route failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CompanyAdapterValuesInput(BaseModel):
+    fieldValuesJson: Dict[str, Any]
+
+    class Config:
+        extra = "ignore"
+        populate_by_name = True
+
+
+@app.put("/api/companies/{company_id}/adapter-values/{adapter_id}")
+@app.put("/companies/{company_id}/adapter-values/{adapter_id}")
+async def put_company_adapter_values(
+    request: Request,
+    company_id: str,
+    adapter_id: str,
+    payload: CompanyAdapterValuesInput,
+):
+    """Upsert dos valores company-level pra um adapter. Frontend já fez split
+    (secrets viraram vault:// refs via /secrets antes de chamar este endpoint).
+    Backend só persiste o JSONB no nível company."""
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+    try:
+        caller_company = _resolve_company_id(request)
+        if caller_company and caller_company != company_id:
+            raise HTTPException(status_code=403, detail="cross_company_forbidden")
+        # Confirma que adapter pertence à company (FK garante mas double-check
+        # evita escrita silenciosa de adapter cross-company se RLS mal config).
+        adapter = (
+            supabase.table("adapter_catalog")
+            .select("id,company_id")
+            .eq("id", adapter_id)
+            .eq("company_id", company_id)
+            .limit(1)
+            .execute()
+        )
+        if not adapter.data:
+            raise HTTPException(404, "adapter_not_found_in_company")
+        row = {
+            "company_id": company_id,
+            "adapter_id": adapter_id,
+            "field_values_json": payload.fieldValuesJson,
+            "is_active": True,
+        }
+        # Upsert manual: SELECT pra ver se existe, depois INSERT ou UPDATE.
+        # Postgrest upsert via on_conflict precisa do nome do constraint;
+        # mais simples assim e evita race em sessão única.
+        existing = (
+            supabase.table("company_adapter_values")
+            .select("id")
+            .eq("company_id", company_id)
+            .eq("adapter_id", adapter_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            res = (
+                supabase.table("company_adapter_values")
+                .update({"field_values_json": payload.fieldValuesJson, "is_active": True})
+                .eq("id", existing.data[0]["id"])
+                .execute()
+            )
+        else:
+            res = supabase.table("company_adapter_values").insert(row).execute()
+        if not res.data:
+            raise HTTPException(500, "upsert_returned_empty")
+        return {
+            "companyId": company_id,
+            "adapterId": adapter_id,
+            "fieldValuesJson": res.data[0].get("field_values_json") or {},
+            "updatedAt": res.data[0].get("updated_at"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("put_company_adapter_values failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Cache TTL curto pra evitar round-trip por PUT mas refletir mudanças
 # no catalog em <60s sem restart. Idempotente — ignorado se supabase=None.
 _EXECUTION_MODE_CACHE: Dict[str, Any] = {"ids": None, "default": None, "fetched_at": 0.0}
