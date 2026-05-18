@@ -504,6 +504,14 @@ class ResilientHarnessDaemon:
         self._populate_resolved_specialty(task)
 
         # Deterministic branches for native Python agents
+        # W9 (2026-05-18) — Morpheus inbound triage. Sem LLM, puro matching
+        # data-driven via vectraclip.inbound_intent_rules. Cria task filha
+        # com op_type + agent corretos (catalog-driven via ADR-VEC-INBOUND-INTENT-CLASSIFIER).
+        if op_type == "inbound-triage":
+            from src.agents.morpheus_inbound_triage import entrypoint as triage_entry
+            result = triage_entry(task, self._get_supabase())
+            return _json.dumps(result)
+
         if op_type == "financial-audit":
             from src.agents.kronos import entrypoint as kronos_entry
             result = kronos_entry(task, self._get_supabase())
