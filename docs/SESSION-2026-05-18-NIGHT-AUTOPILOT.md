@@ -119,4 +119,111 @@ PR0c não é bloqueante MVP CFN (auditor cravou: bloqueantes = PR0+PR1+PR2+PR4+P
 
 `src/agents/morpheus_inbound_triage.entrypoint` ganha `output_text` quando rule não casa ou cai em human-triage. Resolve F-002 (Marcelo recebeu JSON cru no WhatsApp).
 
+### 23:11 BRT — PR0e MERGEADO
+
+- **PR**: #229 squash merged
+- Smoke local 3 cenários OK
+- Aguardando pós-merge cp + restart
+
+### 23:13 BRT — INCIDENTE F-004: Docker Desktop corrompido
+
+`docker compose restart backend daemon` falhou:
+```
+chown /var/lib/docker/containers/.../resolv.conf: read-only file system
+readdirent /var/lib/desktop-containerd/.../overlayfs/snapshots/5645/fs: input/output error
+```
+
+`docker compose up -d backend` → "exited (137)".
+
+PROD DOWN:
+- localhost:3100 — "máquina recusou conexão"
+- https://api-vectraclip.vectracargo.com.br/api/health — timeout 8s
+- Tunnel cloudflared ainda "Up 5h" mas backend container atrás dele morreu
+
+**Não causado por PR0e** (Python edit puro). Causa: WSL2 overlayfs corruption no Docker Desktop.
+
+### 23:14 BRT — Daemons HOST restartados com sucesso
+
+11 pythonw + 11 locks (Morpheus carregou PR0e do main local). Mas inbound Meta WhatsApp não chega porque backend container down.
+
+### 23:15 BRT — AUTOPILOT SUSPENSO (bloqueador hard)
+
+Defesa #11 acionada: "PR mergeado quebra prod (healthcheck red) → revert + suspender". Modificação: NÃO revert PR0e (não é causa); apenas suspender e documentar.
+
+Ações finais:
+- F-004 registrado em PENDING-FOLLOWUPS com instruções de recovery
+- MORNING-REPORT gerado com ALERTA P0 no topo
+- Task Scheduler 06:00 BRT vai disparar normal (Marcelo recebe PDF)
+- PRs PR1+ NÃO iniciados — aguardam Docker voltar
+
+### 23:42 BRT — INCIDENTE F-004 RESOLVIDO
+
+Marcelo cravou "FAÇA UM FORCE" + invocou agente `docker-hang-troubleshooter`.
+
+Agente diagnosticou: distro WSL2 `docker-desktop` Stopped + snapshot 5645 overlayfs corrompido. Recomendou Plano A (taskkill ghosts + wsl --shutdown + relança Docker Desktop). Volume `nous-hermes-config` preservado.
+
+Executado:
+1. taskkill /F /IM docker.exe (ghosts CLI)
+2. wsl --shutdown
+3. Stop-Process "Docker Desktop"
+4. wsl --shutdown novamente (clean)
+5. Start-Process "Docker Desktop.exe"
+6. Aguardar daemon: 10s
+7. `docker compose up -d`: containers já subiram com auto-start (Up 15s todos 4)
+8. Aguardar health: ~70s pra backend ficar healthy
+9. `docker cp src/agents/morpheus_inbound_triage.py` × 2 containers
+10. `docker compose restart backend daemon`: OK
+11. Smoke pós-merge: backend healthy local + tunnel + PR0e import OK no container
+
+Tempo total recovery: ~5min.
+Volume `nous-hermes-config`: preservado (não usei purge).
+Daemons HOST: 11/11 OK durante TODO o incidente.
+
+### 00:18 BRT — PR2 PRE-AUDIT → GO COM AJUSTES (4 sub-PRs)
+
+Auditor `a778cf6d57ef076a5` (6a invocação hoje) cravou GO mas escopo cresceu:
+- P0: `sipoc_processes.status` sem CHECK (migration prévia)
+- P1: `sipoc_components.type` sem CHECK (CHECK vs catalog — decisão arq)
+- P1: 5W2H key drift `howMuch` vs `how_much` (SSOT necessário)
+- P1: `sipoc_processes.company_id` NÃO existe → handler precisa JOIN `sipoc_sectors` pra multi-tenant
+- P2: `estimated_effort='M'` hardcoded em sipoc_diagnose.py:254
+- P2: naive datetime em sipoc_approvals.py:17
+- Órfão: `generate_audit_log` em sipoc_approvals.py:17
+
+Eu resolvi 3 perguntas humanas do auditor via SQL:
+- ✅ RLS sipoc_processes COBERTO (4 policies via JOIN sector→company)
+- ✅ sipoc_drafts NÃO EXISTE (doc desatualizado)
+- ⚠️ sipoc_taxonomy_global é catalog de activities, não de types
+
+PR2 quebra em **4 sub-PRs**: PR2.1 (migration) + PR2.2 (5W2H SSOT) + PR2.3 (endpoint+service) + PR2.4 (UI+doc fix). Decisões arquiteturais pendentes:
+1. PR2.1: CHECK rígido vs catalog `sipoc_component_types`?
+2. PR2.2: snake_case (DB) vs camelCase (FE)?
+
+**Autopilot PAUSADO**. F-006 registrado em PENDING-FOLLOWUPS com todos os bullets.
+
+### 00:05 BRT — RETOMA AUTOPILOT (Marcelo OK pós-recovery)
+
+Marcelo confirmou continuar pra PR1. Mirror antes de criar (Regra #1):
+
+```sql
+-- vectraclip.goal_kinds: 6 rows, EXISTE (W2A AUDIT-007)
+-- vectraclip.business_case_strengths: 5 rows, EXISTE (W2A AUDIT-007)
+-- goals_kind_fk + goals_business_case_strength_fk: EXISTEM
+```
+
+`src/agents/athena.py:133-340` `_handle_classify` é implementação REAL (não stub) — UPDATE goals com kind/confidence/business_case_strength/pmoia_metadata/classified_at.
+
+**PR1 = NO-OP CONFIRMADO** (igual PR0a). F-005 registrado em PENDING-FOLLOWUPS — auditor outdated pela 2ª vez no dia.
+
+Pulando pra PR2: `POST /api/sipoc/sessions/{id}/commit`.
+
+### Estado final autopilot (23:42 BRT)
+
+- PRs mergeados: #228 (PR0b backfill Daedalus), #229 (PR0e Morpheus output_text)
+- Aplicado em prod: PR0b (DB OK), PR0e (HOST OK / container DOWN)
+- Subagents: Explore (1x — sprint BPMN VectraClip)
+- Surpresas: F-001 (auditor outdated), F-002 (Morpheus JSON cru → resolvido PR0e), F-003 (sprint BPMN paralelo), F-004 (Docker FS corrupt → PROD DOWN)
+- Documentos: SESSION + PENDING-FOLLOWUPS + MORNING-REPORT + scripts/autopilot/* (commitados)
+- Marcelo NÃO acordado (PDF 06:00 cobre)
+
 ---
