@@ -252,7 +252,7 @@ INSERT INTO vectraclip.mcp_server_catalog (id, name, description, transport, end
     'Camunda Orchestration Cluster',
     'Referência BPMN canônica pra Daedalus modelagem (não execução). HTTP streamable Camunda 8.9+.',
     'http',
-    'https://{cluster}.camunda.io/mcp/cluster',
+    '{cluster_url}/mcp/cluster',
     'oauth2_client_credentials',
     '[
       {"key":"cluster_url","label":"Cluster URL","type":"text","required":true,"placeholder":"https://abc123.cl.camunda.io"},
