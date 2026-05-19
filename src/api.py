@@ -8553,14 +8553,58 @@ async def api_system_prompt(format: Optional[str] = Query(default="json")):
 
 
 @app.get("/api/agent/workflow")
-async def api_workflow():
+async def api_workflow(
+    request: Request,
+    slug: Optional[str] = Query(default=None, description="slug do workflow_definitions"),
+    workflow_id: Optional[str] = Query(default=None, description="UUID alternativo a slug"),
+    detail: bool = Query(default=False, description="Se true, enriquece ferramentas com tools_catalog"),
+):
     """
-    Retorna o Workflow Aduaneiro Padrão da Vectra Cargo (W1–W7) em JSON estruturado.
-    Inclui etapas, ferramentas, regras de negócio, tolerâncias e canais SISCOMEX.
-    """
-    from src.services.brain.workflow_aduaneiro import workflow_to_dict
+    Retorna workflow_definitions + workflow_steps da company (M3 autopilot 2026-05-19).
 
-    return workflow_to_dict()
+    Substituiu `src/services/brain/workflow_aduaneiro.workflow_to_dict()` (estático,
+    hardcoded importação marítima). Agora lê DB — workflow ativo seed é
+    "Conciliação Bancária Mensal" (Kronos pipeline).
+
+    Query params:
+      - slug=conciliacao-bancaria-mensal  → workflow específico
+      - workflow_id=<uuid>                → workflow por UUID
+      - (sem params)                      → primeiro is_active=true mais recente
+      - detail=true                       → enriquece ferramentas[] com rows de tools_catalog
+
+    Fallback (deprecated): se DB vazio, retorna brain/workflow_aduaneiro.py
+    com header X-Deprecated-Brain-Fallback=true. Esse fallback some em M5.
+    """
+    from src.services.workflow_serializer import fetch_workflow_dict
+
+    company_id = _resolve_company_id(request)
+    if not company_id:
+        # Modo dev / endpoint público — usa Vectra (fallback) só pra UX local.
+        # Em prod, middleware setta company_id via JWT.
+        company_id = "01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2"
+
+    if supabase:
+        wf = fetch_workflow_dict(
+            supabase,
+            company_id=str(company_id),
+            slug=slug,
+            workflow_id=workflow_id,
+            include_tool_details=detail,
+        )
+        if wf:
+            return wf
+
+    # DB sem workflow ativo pra company → fallback Brain (deprecated)
+    logger.warning(
+        "api_workflow: company=%s sem workflow ativo no DB. Fallback brain.workflow_aduaneiro (deprecated em M5).",
+        company_id,
+    )
+    from src.services.brain.workflow_aduaneiro import workflow_to_dict
+    from fastapi.responses import JSONResponse  # pyright: ignore[reportMissingImports]
+    return JSONResponse(
+        content=workflow_to_dict(),
+        headers={"X-Deprecated-Brain-Fallback": "true"},
+    )
 
 
 # ---------------------------------------------------------------------------
