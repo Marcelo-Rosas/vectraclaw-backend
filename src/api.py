@@ -9572,6 +9572,7 @@ from src.api_routes import agent_skills as _agent_skills_routes  # noqa: E402  #
 from src.api_routes import llm_api_keys as _llm_api_keys_routes  # noqa: E402  # W13.1 AI Gateway
 from src.api_routes import sipoc_commit as _sipoc_commit_routes  # noqa: E402  # PR2.3 autopilot SIPOC commit
 from src.api_routes import bpmn_materialize as _bpmn_materialize_routes  # noqa: E402  # Phase 3 BPMN bridge
+from src.api_routes import agent_mcp_bindings as _agent_mcp_bindings_routes  # noqa: E402  # N6 MCP bindings
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -9593,3 +9594,4 @@ app.include_router(_agent_skills_routes.router)  # W15.1 — Agent Skills + Oper
 app.include_router(_llm_api_keys_routes.router)  # W13.1 — AI Gateway llm_api_keys CRUD
 app.include_router(_sipoc_commit_routes.router)  # PR2.3 autopilot — SIPOC commit endpoint
 app.include_router(_bpmn_materialize_routes.router)  # Phase 3 autopilot — BPMN materialize bridge
+app.include_router(_agent_mcp_bindings_routes.router)  # N6 — MCP server catalog + agent MCP bindings
