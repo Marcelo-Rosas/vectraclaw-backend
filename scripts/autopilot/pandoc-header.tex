@@ -1,0 +1,29 @@
+% Header LaTeX customizado pro autopilot — versão minimal compatível
+% com a imagem `pandoc/latex` (que tem texlive-latex-recommended apenas).
+% Não usa ragged2e nem booktabs (não vêm no minimal).
+
+\usepackage{tabularx}
+\usepackage{array}
+
+% Espaçamento + padding célula (reduzido de 6pt pra 4pt — feedback Marcelo
+% 2026-05-18: coluna 1 muito espaçada da 2)
+\renewcommand{\arraystretch}{1.25}
+\setlength{\tabcolsep}{4pt}
+
+% longtable: zera margens esquerda/direita e força usar \linewidth completo
+% (default = tabela centrada com margens automáticas → coluna 1 curta vira gap)
+\setlength{\LTleft}{0pt}
+\setlength{\LTright}{0pt}
+\setlength{\LTpre}{4pt}
+\setlength{\LTpost}{4pt}
+
+% Tabelas longas usam fonte ligeiramente menor pra caber mais conteúdo
+\AtBeginEnvironment{longtable}{\small}
+\AtBeginEnvironment{tabular}{\small}
+
+% Força wrap em colunas largas (raggedright built-in, sem ragged2e)
+\renewcommand\tabularxcolumn[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% Previne overflow horizontal em texto longo (urls, hashes)
+\setlength{\emergencystretch}{3em}
+\sloppy
