@@ -179,6 +179,37 @@ Tempo total recovery: ~5min.
 Volume `nous-hermes-config`: preservado (não usei purge).
 Daemons HOST: 11/11 OK durante TODO o incidente.
 
+### 08:50 BRT (2026-05-19) — PR2.3 ENTREGUE (Opção B)
+
+Marcelo acordou + decidiu Opção B do F-008. Implementação completa:
+
+- `src/services/sipoc_commit_service.py` (359 linhas)
+  - `commit_sipoc()` pipeline 5 steps
+  - `SipocCommitError` pra erros fatais
+  - Defense-in-depth: `company_id` resolvido via JOIN sector → sipoc_sectors
+  - Best-effort em FKs opcionais (SET NULL + warning)
+  - 5W2H normalizado via SSOT PR2.2
+
+- `src/api_routes/sipoc_commit.py` (157 linhas)
+  - Pydantic CamelModel pra parear frontend
+  - POST `/api/sipoc/sessions/{session_id}/commit`
+
+- `src/api.py` registra router
+
+**Incidente F-004B**: `docker cp` falhou com pipe close (mesma assinatura F-004). Recovery via Plano A em ~2min. Padrão preocupante — Docker crashou 2 das últimas 3 sessões. F-004B registrado em PENDING-FOLLOWUPS com hipóteses pra Marcelo investigar.
+
+**Smokes pós-merge** (todos verde):
+- Backend healthy 30s
+- Health endpoint 200
+- Route registrada em OpenAPI
+- POST sem auth = 401 (middleware bloqueia)
+- Import PR2.3 no container OK
+
+**Estado autopilot bloco 3 (08:50 BRT)**:
+- ✅ PR2.3 #233 MERGED + ativo em prod
+- ⏸️ PR2.4 (UI mínima VectraClip + doc fix) — bloqueado F-003 (sprint BPMN paralelo)
+- ⏸️ PR3+ — não iniciados
+
 ### 01:15 BRT — PR2.3 BLOQUEADO — Oracle chat não estrutura SIPOC
 
 Após PR2.1 (#230) + PR2.2 (#231) mergeados com sucesso, fui ler shape do
