@@ -3800,7 +3800,7 @@ async def create_task(request: Request, company_id: str, payload: NewTaskInput):
             raise
         except Exception as e:
             # VEC-188 — self-healing: devolve contexto estruturado para o agente
-            from src.services.brain.db_failover import build_failover_result
+            from src.services.db_failover import build_failover_result
             fr = build_failover_result(
                 exc=e,
                 operation="insert:tasks",
@@ -7858,7 +7858,7 @@ async def patch_task(request: Request, task_id: str, patch: UpdateTaskInput):
         raise
     except Exception as e:
         # VEC-188 — self-healing
-        from src.services.brain.db_failover import build_failover_result
+        from src.services.db_failover import build_failover_result
         fr = build_failover_result(
             exc=e,
             operation="update:tasks",
@@ -8453,7 +8453,7 @@ async def api_audit_parity(request: Request):
 
     # DB Failover classifier
     try:
-        from src.services.brain.db_failover import _CATEGORIES
+        from src.services.db_failover import _CATEGORIES
         report["checks"]["db_failover"] = {
             "status": "ok",
             "categories": len(_CATEGORIES),
@@ -8598,7 +8598,7 @@ async def api_db_retry(request: Request, body: DbRetryInput):
       - insert:agents
       - update:agents
     """
-    from src.services.brain.db_failover import build_failover_result
+    from src.services.db_failover import build_failover_result
 
     if not supabase:
         raise HTTPException(status_code=503, detail="supabase_unavailable")
