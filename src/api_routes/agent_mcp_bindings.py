@@ -300,36 +300,20 @@ async def delete_mcp_binding(request: Request, binding_id: str = Path(...)) -> D
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _do_handshake(binding_row: Dict[str, Any], server_row: Dict[str, Any], company_id: str) -> List[Dict[str, Any]]:
-    """Conecta no MCP server + lista tools. Suporta http + api_key/bearer/none.
-    oauth2/stdio levantam 502 (N7 auth resolver pendente)."""
+    """Conecta no MCP server + lista tools. N7: auth resolver completo
+    (oauth2_client_credentials/bearer/api_key/none) via McpClient.from_binding.
+    stdio levanta 502 (sem consumidor runtime hoje)."""
     from src.api import resolve_secret_ref
-    from src.services.mcp_client import McpClient
-
-    transport = server_row.get("transport")
-    auth_type = server_row.get("auth_type")
-    if transport != "http":
-        raise HTTPException(status_code=502, detail=f"handshake_transport_unsupported:{transport}_needs_N7")
-    if auth_type in ("oauth2_client_credentials",):
-        raise HTTPException(status_code=502, detail="handshake_oauth2_needs_N7_auth_resolver")
+    from src.services.mcp_client import McpClient, McpAuthError
 
     field_values = binding_row.get("field_values_json") or {}
-    # Resolve endpoint a partir do template + field_values
-    endpoint = server_row.get("endpoint_url_template") or ""
-    for k, v in field_values.items():
-        endpoint = endpoint.replace("{" + k + "}", str(v))
-    if "{" in endpoint:
-        raise HTTPException(status_code=422, detail=f"endpoint_template_unresolved:{endpoint}")
-
-    # Resolve token/key (pode ser vault:// ref)
-    api_key: Optional[str] = None
-    for cand in ("access_token", "api_key", "token", "password"):
-        if cand in field_values:
-            api_key = resolve_secret_ref(field_values[cand], company_id)
-            break
-
-    client = McpClient(endpoint, api_key=api_key)
-    tools = client.list_tools()
-    return tools
+    # secret_resolver desreferencia vault:// usando o company_id do binding
+    resolver = lambda v: resolve_secret_ref(v, company_id)
+    try:
+        client = McpClient.from_binding(server_row, field_values, secret_resolver=resolver)
+    except McpAuthError as e:
+        raise HTTPException(status_code=502, detail=f"handshake_auth_failed:{e}")
+    return client.list_tools()
 
 
 @router.post("/api/mcp-bindings/{binding_id}/handshake")
