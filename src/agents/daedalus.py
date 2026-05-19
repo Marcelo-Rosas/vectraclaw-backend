@@ -656,18 +656,56 @@ def _handle_compile_prompt(task: dict, supabase: Any) -> Dict[str, Any]:
 
     # Lookup agent + tools
     agent_prompt = ""
+    delegated_agent_id = None
     spec_cfg_id = step.get("agent_specialty_config_id")
     if spec_cfg_id:
         try:
             cfg = supabase.table("agent_specialty_configs").select("agent_id").eq("id", spec_cfg_id).limit(1).execute()
-            agent_id = cfg.data[0].get("agent_id") if cfg.data else None
-            if agent_id:
-                ag = supabase.table("agents").select("name, role, system_prompt").eq("id", agent_id).limit(1).execute()
+            delegated_agent_id = cfg.data[0].get("agent_id") if cfg.data else None
+            if delegated_agent_id:
+                ag = supabase.table("agents").select("name, role, system_prompt").eq("id", delegated_agent_id).limit(1).execute()
                 if ag.data:
                     a = ag.data[0]
                     agent_prompt = f"# Agente delegado\nNome: {a.get('name')}\nRole: {a.get('role')}\n\n{a.get('system_prompt') or '(sem system_prompt definido)'}\n"
         except Exception as exc:
             logger.warning("compile-prompt agent lookup falhou: %s", exc)
+
+    # N7.5 — MCP tools do agente delegado (agent_mcp_bindings ativos).
+    # Injeta tools no formato prefixed mcp__<server>__<tool> (convenção Claude CLI;
+    # hífens do server_id viram underscore). Whitelist allowed_tools respeitada.
+    mcp_section = ""
+    mcp_tools_count = 0
+    if delegated_agent_id:
+        try:
+            binds = (
+                supabase.table("agent_mcp_bindings")
+                .select("mcp_server_id, allowed_tools, tools_cache")
+                .eq("agent_id", delegated_agent_id)
+                .eq("is_active", True)
+                .execute()
+            )
+            lines = ["# MCP servers conectados (tools externas)"]
+            for b in (binds.data or []):
+                server_id = b.get("mcp_server_id") or ""
+                prefix = "mcp__" + server_id.replace("-", "_") + "__"
+                allowed = b.get("allowed_tools")  # None = todos
+                cache = b.get("tools_cache") or []
+                lines.append(f"\n## {server_id}")
+                if not cache:
+                    lines.append("- (sem tools em cache — rodar handshake)")
+                for t in cache:
+                    tname = t.get("name") if isinstance(t, dict) else None
+                    if not tname:
+                        continue
+                    if allowed is not None and tname not in allowed:
+                        continue
+                    desc = t.get("description") if isinstance(t, dict) else ""
+                    lines.append(f"- **`{prefix}{tname}`**: {desc or ''}")
+                    mcp_tools_count += 1
+            if mcp_tools_count > 0 or len(binds.data or []) > 0:
+                mcp_section = "\n".join(lines) + "\n"
+        except Exception as exc:
+            logger.warning("compile-prompt mcp bindings lookup falhou: %s", exc)
 
     tools_section = ""
     fer = step.get("ferramentas") or []
@@ -705,6 +743,7 @@ def _handle_compile_prompt(task: dict, supabase: Any) -> Dict[str, Any]:
         workflow_section,
         step_section,
         tools_section or "# (Nenhuma ferramenta vinculada ao step)",
+        mcp_section or "# (Nenhum MCP server conectado ao agente)",
     ])
 
     return _ok_envelope("daedalus-compile-prompt", task_id, started_at, {
@@ -713,6 +752,7 @@ def _handle_compile_prompt(task: dict, supabase: Any) -> Dict[str, Any]:
         "compiled_prompt": compiled,
         "char_count": len(compiled),
         "tools_bound_count": len(fer) if isinstance(fer, list) else 0,
+        "mcp_tools_count": mcp_tools_count,
     })
 
 
