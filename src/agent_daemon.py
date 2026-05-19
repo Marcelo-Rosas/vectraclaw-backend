@@ -625,8 +625,11 @@ class ResilientHarnessDaemon:
             result = asyncio.run(athena_execute(task, self._get_supabase()))
             return _json.dumps(result)
 
-        # Daedalus (PR G+H — modelador BPMN, fallback estatístico sem LLM)
-        if op_type.startswith("bpmn-"):
+        # Daedalus — modelador BPMN (bpmn-*) + orchestration loop (daedalus-*).
+        # M4 (2026-05-19): _SPECIALTY_DISPATCH em src/agents/daedalus.py cobre
+        # bpmn-generate + 4 op_types daedalus-* (orchestrate-step, route-task,
+        # replan, compile-prompt).
+        if op_type.startswith("bpmn-") or op_type.startswith("daedalus-"):
             from src.agents.daedalus import execute_specialty as daedalus_execute
             result = asyncio.run(daedalus_execute(task, self._get_supabase()))
             return _json.dumps(result)
