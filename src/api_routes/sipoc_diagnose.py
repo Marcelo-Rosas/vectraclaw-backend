@@ -28,20 +28,22 @@ router = APIRouter(tags=["sipoc-diagnose"])
 # Roles que NÃO podem disparar diagnóstico (ação consultiva).
 _DIAGNOSE_BLOCKED_ROLES = ["sector_responsible", "viewer"]
 
-# Chaves 5W2H consideradas pra cálculo de cobertura.
-_5W2H_KEYS = ("what", "who", "when", "where", "why", "how", "how_much")
+# PR2.2 autopilot 2026-05-19: chaves + coverage agora vêm do SSOT
+# (`src.services.sipoc_5w2h_keys`). A ordem aqui mantida via re-export pra
+# compat com qualquer call-site que importe _5W2H_KEYS deste módulo.
+from src.services.sipoc_5w2h_keys import CANONICAL_KEYS as _5W2H_KEYS, coverage_5w2h
 
 
 def _activity_5w2h_coverage(content: Optional[Dict[str, Any]]) -> float:
-    """Retorna 0.0–1.0 de cobertura 5W2H da activity."""
+    """Retorna 0.0–1.0 de cobertura 5W2H da activity.
+
+    Delega ao SSOT `coverage_5w2h` que aceita `howMuch` legado mapeado pra
+    `how_much` automaticamente — então documents jsonb antigos não zeram
+    silenciosamente a coluna how_much.
+    """
     if not isinstance(content, dict):
         return 0.0
-    filled = 0
-    for k in _5W2H_KEYS:
-        v = content.get(k)
-        if isinstance(v, str) and v.strip():
-            filled += 1
-    return filled / len(_5W2H_KEYS)
+    return coverage_5w2h(content)
 
 
 def _activity_summary(row: Dict[str, Any]) -> Dict[str, Any]:

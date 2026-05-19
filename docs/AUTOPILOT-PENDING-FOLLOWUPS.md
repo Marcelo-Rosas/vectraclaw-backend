@@ -8,6 +8,26 @@
 
 ## Itens descobertos
 
+### F-007 — `_normalize_5w2h_payload` em src/api.py:5629-5793 (deferred deprecation)
+
+**Descoberto em**: PR2.2 setup (2026-05-19 00:55 BRT)
+**Severidade**: P2 (não bloqueia — endpoint atual tem compat dual)
+**Detalhe**: PR2.2 escolheu snake_case canonical (decisão Marcelo "snack"). SSOT criado em `src/services/sipoc_5w2h_keys.py` mas o helper `_normalize_5w2h_payload` em `src/api.py:5629-5793` (165 linhas) **continua persistindo `howMuch` camelCase** em `sipoc_components.content.fiveW2H.howMuch`. 
+
+**Por que não migrei agora**:
+- 165 linhas de normalizer dual-path com lógica complexa de fallback
+- Refactor cross-module passa do raio seguro pra autopilot noturno
+- Endpoint atual funciona — compat dual já aceita `how_much` flat → `howMuch` interno
+
+**Caminho proposto** (quando PR2.3 commit endpoint estabilizar):
+1. Trocar persistência em `_normalize_5w2h_payload` pra `how_much` (snake_case)
+2. Backfill em `sipoc_components.content`: `UPDATE ... SET content = jsonb_set(content, '{fiveW2H,how_much}', content->'fiveW2H'->'howMuch') WHERE content->'fiveW2H'->>'howMuch' IS NOT NULL` — depois `content #- '{fiveW2H,howMuch}'`
+3. Aplicar SSOT em `src/agents/sipoc_researcher.py:58` (template default ainda usa `howMuch`)
+
+**Hoje 0 rows em prod** — backfill seria no-op. Pode antecipar quando PR2.3 entrar.
+
+---
+
 ### F-006 — PR2 expandiu pra 4 sub-PRs (auditor GO COM AJUSTES)
 
 **Descoberto em**: PR2 pre-audit (00:18 BRT 2026-05-19, agente `a778cf6d57ef076a5`)
