@@ -54,15 +54,11 @@ _SIPOC_TYPE_LABELS = {
     "customer": "cliente/destinatário",
 }
 
-_W2H_LABELS = {
-    "what": "O Quê? (What)",
-    "why": "Por Quê? (Why)",
-    "who": "Quem? (Who)",
-    "where": "Onde? (Where)",
-    "when": "Quando? (When)",
-    "how": "Como? (How)",
-    "howMuch": "Quanto Custa? (How Much)",
-}
+# PR2.2 autopilot 2026-05-19: labels 5W2H movidos pra SSOT.
+# Antes esta dict tinha 'howMuch' (camelCase) — único call-site do codebase
+# em camelCase pros labels. Agora importa snake_case via SSOT pra alinhar
+# com sipoc_diagnose._5W2H_KEYS + sipoc_taxonomy_global.default_5w2h.
+from src.services.sipoc_5w2h_keys import W2H_LABELS as _W2H_LABELS  # noqa: E402
 
 
 def _build_system_prompt(domain: str, user_profile: str) -> str:
