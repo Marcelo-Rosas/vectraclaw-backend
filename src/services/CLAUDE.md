@@ -63,7 +63,7 @@ Sistema autônomo que roda em loop separado e supervisiona os daemons.
 - `current_stage: str` — estágio atual da entrevista
 - `last_active: float` — timestamp para GC
 
-⚠️ **Tudo in-memory.** Restart do `start_server.py` perde TODAS as sessões ativas. Para persistência, copiar o snapshot para `vectraclip.sipoc_drafts` antes de fechar.
+⚠️ **Tudo in-memory.** Restart do `start_server.py` perde TODAS as sessões ativas. Atualmente o Oracle chat **não** popula esses dicts — apenas guarda mensagens (F-008 do autopilot night 2026-05-19). Para materializar SIPOC no DB, use o endpoint `POST /api/sipoc/sessions/{id}/commit` (PR2.3 #233) que aceita estado completo no body — frontend monta a partir do histórico do chat. Tabela `sipoc_drafts` mencionada em iteração anterior **não existe** e foi descartada (Opção B do F-008).
 
 `gc_inactive_sessions(max_age_hours=2.0)` remove sessões ociosas. Chamada em endpoint dedicado ou em background task.
 
