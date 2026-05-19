@@ -8,6 +8,43 @@
 
 ## Itens descobertos
 
+### F-004B — Docker Desktop crashou 2ª vez em 12h (padrão preocupante)
+
+**Descoberto em**: PR2.3 docker cp (2026-05-19 ~08:47 BRT)
+**Severidade**: P1 (não destrutivo se Plano A aplicado; padrão sugere problema persistente)
+**Detalhe**: Tentei `docker cp` dos 3 arquivos PR2.3 e bateu:
+```
+failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine
+//./pipe/dockerDesktopLinuxEngine: O sistema não pode encontrar o arquivo especificado
+```
+
+Mesmo erro F-004 (2026-05-18 23:15 BRT). Distro WSL2 `docker-desktop` em STOPPED, pipe ausente, todos processos `docker` ghosts mortos.
+
+**Recovery** (Plano A repetido):
+1. Get-Process docker → Stop-Process Force (zero processos vivos — já tinham morrido)
+2. wsl --shutdown
+3. Start-Process "Docker Desktop.exe"
+4. Aguardar daemon ~5s
+5. Containers auto-start ~30s
+6. Reaplicar docker cp + restart backend daemon
+7. Smoke pós-recovery TODOS verde
+
+Tempo recovery: ~2min (mais rápido que F-004 ontem porque já sabia o plano).
+
+**Padrão emergente**: Docker Desktop crashou em 2 dos últimos 3 docker cp (12h). Não é mais coincidência F-004.
+
+**Hipóteses pra Marcelo investigar manhã** (em ordem):
+1. **Versão Docker Desktop**: rodar `docker version` + comparar com latest stable; bug conhecido em recent versions pode causar pipe close em copy de arquivos grandes
+2. **WSL2 memory**: `wsl --status` + ver se memory_limit em `.wslconfig` está apertado; crashes de OOM matam o pipe silenciosamente
+3. **Windows defender real-time scan**: pode estar mexendo nos overlayfs do WSL2 e travando I/O em momentos críticos
+4. **Apenas docker cp problemático**: rodando `compose up --force-recreate` reaplicaria mas com downtime maior; vale investigar se `docker exec ... cat > ...` em vez de `docker cp` evita o crash
+
+**Workaround temporário**: monitor `docker info` durante operações de cp pra detectar pipe close antes do erro propagar. Ou abandonar `docker cp` em favor de rebuild da imagem (mais lento mas estável).
+
+**Estado pós-recovery**: tudo healthy. PR2.3 ativo. Autopilot continuou.
+
+---
+
 ### F-008 — Oracle chat NÃO popula `session.sipoc_snapshot`/`collected_5w2h` (gap fundamental)
 
 **Descoberto em**: PR2.3 escopo (2026-05-19 01:15 BRT)
