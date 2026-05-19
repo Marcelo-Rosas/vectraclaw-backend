@@ -8,6 +8,52 @@
 
 ## Itens descobertos
 
+### F-008 — Oracle chat NÃO popula `session.sipoc_snapshot`/`collected_5w2h` (gap fundamental)
+
+**Descoberto em**: PR2.3 escopo (2026-05-19 01:15 BRT)
+**Severidade**: P0 (bloqueia PR2.3 + MVP CFN)
+**Detalhe**: `_OracleSession.sipoc_snapshot: Dict[str, Any]` e `.collected_5w2h: Dict[str, Dict[str, str]]` definidos em `src/services/oracle_session.py:13-14`, mas **zero call-sites populam estes dicts** no codebase:
+
+```bash
+$ grep -rn "session.sipoc_snapshot\s*=\|session.collected_5w2h\s*=" src/
+# zero matches
+```
+
+`oracle_runner.py:45-46` passa os dicts como referência pro `FlowState`, mas:
+- `oracle_maker.py`: zero ocorrência de `sipoc_snapshot` ou `collected_5w2h`
+- `oracle_checker.py`: zero ocorrência
+- `flow_orchestrator.py`: apenas type annotation
+
+Resultado: Oracle chat hoje só persiste mensagens (`oracle_runner.py:81-83`). SIPOC + 5W2H **NUNCA são estruturados** no DB/RAM.
+
+**Implicação pra PR2.3 (commit endpoint)**: ler in-memory state = sempre dict vazio = endpoint fantasma. Testes passariam, smoke passaria, prod entregaria "0 components materialized".
+
+**3 opções pra desbloquear** (Marcelo decide):
+
+**Opção A — Implementar populador no Oracle chat**
+- Adicionar lógica em `oracle_maker._update_session_state` que parsea `maker_structured` e popula `state["sipoc_snapshot"]` + `state["collected_5w2h"]`
+- Esforço: ALTO (entender langgraph + parser estruturado + manter compat com `meta_input`)
+- Risco: requer rodada de smoke real com chat completo
+
+**Opção B — Endpoint aceita estado no body** (RECOMENDADO)
+- Frontend monta SIPOC structure a partir do histórico de chat (já tem)
+- POST `/api/sipoc/sessions/{session_id}/commit` recebe `{sector_id, sipoc: {...}, components: [...]}` no body
+- Backend valida + insere — sem dependência de in-memory state
+- Mais simples + mais estável + alinha com pattern do `_normalize_5w2h_payload` em api.py:5629
+- Esforço: BAIXO-MÉDIO
+
+**Opção C — Híbrido**
+- Endpoint aceita body (override) E lê session in-memory (fallback se body vazio)
+- Best of both mas dobra superfície de teste
+
+**Estado autopilot**: PAUSADO até decisão. Roadmap PR2.3+PR2.4 fica bloqueado. Sub-PRs já entregues:
+- ✅ PR2.1 #230 (catalog sipoc_component_types + status CHECK)
+- ✅ PR2.2 #231 (SSOT 5W2H snake_case)
+- ⏸️ PR2.3 (endpoint commit) — aguarda Opção A/B/C
+- ⏸️ PR2.4 (UI mínima) — depende PR2.3 + decisão sprint BPMN paralelo (F-003)
+
+---
+
 ### F-007 — `_normalize_5w2h_payload` em src/api.py:5629-5793 (deferred deprecation)
 
 **Descoberto em**: PR2.2 setup (2026-05-19 00:55 BRT)

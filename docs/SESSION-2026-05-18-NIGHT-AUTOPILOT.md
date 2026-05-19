@@ -179,6 +179,30 @@ Tempo total recovery: ~5min.
 Volume `nous-hermes-config`: preservado (não usei purge).
 Daemons HOST: 11/11 OK durante TODO o incidente.
 
+### 01:15 BRT — PR2.3 BLOQUEADO — Oracle chat não estrutura SIPOC
+
+Após PR2.1 (#230) + PR2.2 (#231) mergeados com sucesso, fui ler shape do
+`_OracleSession.sipoc_snapshot` pra desenhar o handler. Surpresa P0:
+
+```bash
+$ grep -rn "session.sipoc_snapshot\s*=\|session.collected_5w2h\s*=" src/
+# zero matches
+```
+
+Oracle chat (oracle_runner + maker + checker) **não popula esses dicts**.
+Eles existem como type signature em `oracle_session.py:13-14` mas nada
+escreve neles. Resultado: endpoint commit como projetado leria vazio.
+
+F-008 registrado em PENDING-FOLLOWUPS com 3 opções (A populador, B body,
+C híbrido). Marcelo decide manhã.
+
+**Estado final segundo bloco de autopilot (01:15 BRT)**:
+- ✅ PR2.1 #230 MERGED + verificado (catalog + FKs + CHECK)
+- ✅ PR2.2 #231 MERGED + docker cp + restart + smoke OK
+- ⏸️ PR2.3 PAUSADO (gap arquitetural)
+- ⏸️ PR2.4 PAUSADO (depende PR2.3)
+- 6ª invocação auditor (a778cf6d57ef076a5)
+
 ### 00:18 BRT — PR2 PRE-AUDIT → GO COM AJUSTES (4 sub-PRs)
 
 Auditor `a778cf6d57ef076a5` (6a invocação hoje) cravou GO mas escopo cresceu:
