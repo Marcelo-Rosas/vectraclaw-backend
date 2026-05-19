@@ -8433,23 +8433,34 @@ async def api_audit_parity(request: Request):
     except Exception as e:
         report["checks"]["m3_tools"] = {"status": "error", "detail": str(e)}
 
-    # Brain – System Prompt
+    # Daedalus (substitui Brain após M5 — autopilot 2026-05-19)
     try:
-        from src.services.brain.system_prompt import system_prompt_meta
-        report["checks"]["system_prompt"] = {"status": "ok", **system_prompt_meta()}
+        ag = supabase.table("agents").select("id, name, role, system_prompt").eq(
+            "id", "d4ed4145-0000-4000-8000-000000000005"
+        ).limit(1).execute()
+        if ag.data:
+            a = ag.data[0]
+            report["checks"]["daedalus"] = {
+                "status": "ok",
+                "name": a.get("name"),
+                "role": a.get("role"),
+                "system_prompt_set": bool(a.get("system_prompt")),
+            }
+        else:
+            report["checks"]["daedalus"] = {"status": "error", "detail": "daedalus row not found"}
     except Exception as e:
-        report["checks"]["system_prompt"] = {"status": "error", "detail": str(e)}
+        report["checks"]["daedalus"] = {"status": "error", "detail": str(e)}
 
-    # Brain – Workflow
+    # Workflow definitions (substitui workflow_aduaneiro hardcoded do Brain)
     try:
-        from src.services.brain.workflow_aduaneiro import WORKFLOW_STEPS
-        report["checks"]["workflow_aduaneiro"] = {
+        wfs = supabase.table("workflow_definitions").select("slug").eq("company_id", company_id).eq("is_active", True).execute()
+        report["checks"]["workflow_definitions"] = {
             "status": "ok",
-            "steps": len(WORKFLOW_STEPS),
-            "ids": [s.id for s in WORKFLOW_STEPS],
+            "count": len(wfs.data or []),
+            "slugs": [w["slug"] for w in (wfs.data or [])],
         }
     except Exception as e:
-        report["checks"]["workflow_aduaneiro"] = {"status": "error", "detail": str(e)}
+        report["checks"]["workflow_definitions"] = {"status": "error", "detail": str(e)}
 
     # DB Failover classifier
     try:
@@ -8531,24 +8542,56 @@ async def api_audit_parity(request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/agent/system-prompt")
-async def api_system_prompt(format: Optional[str] = Query(default="json")):
+async def api_system_prompt(
+    request: Request,
+    workflow_step_id: Optional[str] = Query(default=None, description="Step pra compilar prompt dinamicamente"),
+    format: Optional[str] = Query(default="json"),
+):
     """
-    Retorna o Master System Prompt do Orquestrador VectraClaw.
+    Compila system prompt dinâmico do orchestrator (M5 autopilot 2026-05-19).
+
+    Substituiu `src/services/brain/system_prompt.py` (estático single-tenant
+    importação marítima). Agora delega ao handler Daedalus
+    `daedalus-compile-prompt` que lê `agent_specialty_configs` + `tools_catalog`
+    + `workflow_definitions` dinamicamente.
 
     Query params:
-      - format=json  (default) → { meta: {...}, prompt: "..." }
-      - format=text            → texto plano do prompt (para uso direto na API do LLM)
+      - workflow_step_id=<uuid> obrigatório
+      - format=json (default) | text
     """
-    from src.services.brain.system_prompt import build_system_prompt, system_prompt_meta
+    if not workflow_step_id:
+        raise HTTPException(
+            400,
+            "workflow_step_id obrigatorio. Endpoint refatorado em M5 — sem fallback Brain estatico. "
+            "Use GET /api/agent/workflow pra listar workflow_definitions e seus steps."
+        )
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
 
-    prompt = build_system_prompt()
+    from src.agents.daedalus import _handle_compile_prompt
+    import uuid as _uuid
+
+    mock_task = {
+        "id": str(_uuid.uuid4()),
+        "operation_type": "daedalus-compile-prompt",
+        "input_json": {"workflow_step_id": workflow_step_id},
+    }
+    result = _handle_compile_prompt(mock_task, supabase)
+    outputs = result.get("output_json", {}).get("outputs") or {}
+    compiled = outputs.get("compiled_prompt") or ""
+
     if format == "text":
         from fastapi.responses import PlainTextResponse  # pyright: ignore[reportMissingImports]
-        return PlainTextResponse(content=prompt, media_type="text/plain; charset=utf-8")
+        return PlainTextResponse(content=compiled, media_type="text/plain; charset=utf-8")
 
     return {
-        "meta": system_prompt_meta(),
-        "prompt": prompt,
+        "meta": {
+            "source": "daedalus.compile_prompt",
+            "char_count": outputs.get("char_count"),
+            "tools_bound_count": outputs.get("tools_bound_count"),
+            "workflow_step_id": workflow_step_id,
+        },
+        "prompt": compiled,
     }
 
 
@@ -8594,16 +8637,11 @@ async def api_workflow(
         if wf:
             return wf
 
-    # DB sem workflow ativo pra company → fallback Brain (deprecated)
-    logger.warning(
-        "api_workflow: company=%s sem workflow ativo no DB. Fallback brain.workflow_aduaneiro (deprecated em M5).",
-        company_id,
-    )
-    from src.services.brain.workflow_aduaneiro import workflow_to_dict
-    from fastapi.responses import JSONResponse  # pyright: ignore[reportMissingImports]
-    return JSONResponse(
-        content=workflow_to_dict(),
-        headers={"X-Deprecated-Brain-Fallback": "true"},
+    # M5: Brain fallback removido. Sem workflow ativo → 404.
+    raise HTTPException(
+        404,
+        f"Nenhum workflow_definition ativo encontrado pra company {company_id}. "
+        "Crie via POST /api/bpmn/diagrams/{id}/materialize ou seed em supabase/migrations/."
     )
 
 
