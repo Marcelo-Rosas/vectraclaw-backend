@@ -34,8 +34,11 @@
 | **PR0d** | NÃO INICIADO — refactor dispatch catalog-driven (aguarda PR0e estável) | Aguarda |
 | **PR0e** | MERGEADO #229 + Python edit aplicado em main local + reaplicado em container pós-recovery | **SIM** — daemons HOST OK + backend container OK + verificado import |
 | **PR1** | NO-OP confirmado 00:05 BRT — tudo já existe (catalogs + FKs + handler real) — F-005 registrado | N/A |
-| **PR2** | PRE-AUDIT cravou GO COM AJUSTES — escopo cresceu pra 4 sub-PRs com 2 decisões arq pendentes (CHECK vs catalog; snake_case vs camelCase) — F-006 registrado | Aguarda 2 decisões suas |
-| **PR3+** | NÃO INICIADOS — autopilot pausado após PR2 expandir | Aguarda PR2 fechar |
+| **PR2.1** | ✅ MERGED #230 — catalog `sipoc_component_types` + FK + `sipoc_processes.status` CHECK | SIM (DB) |
+| **PR2.2** | ✅ MERGED #231 — SSOT 5W2H snake_case + docker cp + restart + smoke OK | SIM (container + DB) |
+| **PR2.3** | ⏸️ PAUSADO — Oracle chat não popula `session.sipoc_snapshot`/`collected_5w2h` (gap fundamental F-008). 3 opções de desbloqueio | Aguarda decisão A/B/C |
+| **PR2.4** | ⏸️ PAUSADO — UI mínima depende PR2.3 + F-003 (sprint BPMN paralelo) | Bloqueado |
+| **PR3+** | NÃO INICIADOS — autopilot pausado | Bloqueado |
 
 ## Tabelas alteradas em prod
 
