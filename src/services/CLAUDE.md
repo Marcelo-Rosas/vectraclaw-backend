@@ -26,7 +26,7 @@ Contém wrappers e calculadoras que **não tocam Supabase diretamente** (com pou
 | **Brain — DB Failover** | `brain/db_failover.py` | Wrapper resiliente em volta do client Supabase (retry, circuit breaker) | Nenhum |
 | **Brain — System Prompt** | `brain/system_prompt.py` | Prompt fixo base do "Brain" coordenador | Nenhum |
 | **Brain — Workflow Aduaneiro** | `brain/workflow_aduaneiro.py` | Lógica de fluxo específica para despacho aduaneiro | Variado |
-| **MCP Client** | `mcp_client.py` | Wrapper para chamar tools de MCP servers externos | Externo |
+| **MCP Client** | `mcp_client.py` | Wrapper MCP + **auth resolver** `resolve_mcp_auth` (oauth2_client_credentials/bearer/api_key/none) + `McpClient.from_binding()` + `health_check()` + JSON-RPC 2.0 (tools/list,tools/call) c/ fallback legacy. Consumido por `api_routes/agent_mcp_bindings.py` (handshake). stdio = NotImplemented (sem consumidor). Ver `docs/ADR-VEC-MCP-SEPARATION.md` | Externo |
 | **Morpheus Dispatcher** | `morpheus_dispatcher.py` | Despachador de tasks para Morpheus (orquestrador) | DB write |
 | **Research Events** | `research_events.py` | Pub/sub de eventos de pesquisa (Oracle research) | DB write |
 | **Research Template Renderer** | `research_template_renderer.py` | Aplica template de output em research result | Nenhum |
