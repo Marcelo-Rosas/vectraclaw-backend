@@ -3576,6 +3576,16 @@ class NewAgentInput(BaseModel):
     systemPrompt: Optional[str] = None
     requiresApproval: bool = False
     platformUrl: Optional[str] = None
+    reportsToId: Optional[str] = None
+    # Cascade opcional — P0-A: o frontend (CreateAgentAtomicInput) sempre manda
+    # estes campos e já espera 422 partial-success ({agent, errors}). Antes do
+    # P0-A o backend descartava silenciosamente (extra="ignore"), criando
+    # agentes "pelados" sem skill/adapter/model.
+    adapterId: Optional[str] = None
+    modelId: Optional[str] = None
+    adapterFieldValues: Optional[Dict[str, Any]] = None
+    specialtyId: Optional[str] = None
+    specialtyConfigValues: Optional[Dict[str, Any]] = None
 
     class Config:
         extra = "ignore"
@@ -3587,12 +3597,13 @@ async def create_agent(company_id: str, payload: NewAgentInput):
     # Map frontend enum values to DB-accepted values.
     _to_db = {"claude_code": "claude_code", "codex": "cursor", "shell": "bot", "webhook": "bot"}
     adapter_type = _to_db.get(payload.adapterType, "claude_code")
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     row: Dict[str, Any] = {
         "company_id": company_id,
         "name": payload.name,
         "role": payload.role,
-        "reports_to_id": None,
+        "reports_to_id": payload.reportsToId or None,
         "status": AgentStatus.IDLE,
         "token_budget": payload.tokenBudget,
         "current_burn_rate": 0,
@@ -3600,8 +3611,8 @@ async def create_agent(company_id: str, payload: NewAgentInput):
         "system_prompt": payload.systemPrompt,
         "requires_approval": payload.requiresApproval,
         "platform_url": payload.platformUrl or None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": now_iso,
+        "updated_at": now_iso,
     }
 
     if not supabase:
@@ -3610,13 +3621,13 @@ async def create_agent(company_id: str, payload: NewAgentInput):
         new_agent["companyId"] = company_id
         new_agent["name"] = payload.name
         new_agent["role"] = payload.role
-        new_agent["reportsToId"] = None
+        new_agent["reportsToId"] = payload.reportsToId or None
         new_agent["status"] = "idle"
         new_agent["tokenBudget"] = payload.tokenBudget
         new_agent["currentBurnRate"] = 0
         new_agent["adapterType"] = adapter_type
-        new_agent["specialtyId"] = None
-        new_agent["createdAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        new_agent["specialtyId"] = payload.specialtyId
+        new_agent["createdAt"] = now_iso.replace("+00:00", "Z")
         MOCK_AGENTS.append(new_agent)
         return new_agent
 
@@ -3625,12 +3636,71 @@ async def create_agent(company_id: str, payload: NewAgentInput):
         res = supabase.table("agents").insert(row).execute()
         if not res.data:
             raise HTTPException(status_code=500, detail="insert_returned_empty")
-        return Agent(**res.data[0]).to_zod_dict()
+        agent_zod = Agent(**res.data[0]).to_zod_dict()
+        agent_id = res.data[0]["id"]
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"create_agent failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+    # ── Cascade best-effort (P0-A) ──────────────────────────────────────────
+    # Cada etapa secundária é isolada: falha registra erro mas NÃO derruba a
+    # criação do agente. Se alguma falhar, devolvemos 422 com {agent, errors}
+    # (semântica partial-success que o frontend já trata em createAgentAtomic).
+    cascade_errors: Dict[str, str] = {}
+
+    if payload.adapterId:
+        try:
+            adapter_row = (
+                supabase.table("adapter_catalog")
+                .select("id,company_id")
+                .eq("id", payload.adapterId)
+                .limit(1)
+                .execute()
+            )
+            if not adapter_row.data:
+                cascade_errors["adapter"] = "adapter_not_found"
+            elif str(adapter_row.data[0].get("company_id")) != str(company_id):
+                cascade_errors["adapter"] = "adapter_company_mismatch"
+            else:
+                field_values = dict(payload.adapterFieldValues or {})
+                # modelId é convenience; a SSOT é field_values_json. Só injeta
+                # como fallback quando o front não mandou o model no field map.
+                if payload.modelId and "model_id" not in field_values:
+                    field_values["model_id"] = payload.modelId
+                supabase.table("agent_adapter_configs").insert({
+                    "company_id": company_id,
+                    "agent_id": agent_id,
+                    "adapter_id": payload.adapterId,
+                    "field_values_json": field_values,
+                    "is_active": True,
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                }).execute()
+        except Exception as e:
+            logger.error(f"create_agent cascade adapter failed (agent={agent_id}): {e}")
+            cascade_errors["adapter"] = str(e)
+
+    if payload.specialtyId:
+        try:
+            supabase.table("agent_specialty_configs").upsert({
+                "company_id": company_id,
+                "agent_id": agent_id,
+                "specialty_id": payload.specialtyId,
+                "values": payload.specialtyConfigValues or {},
+                "updated_at": now_iso,
+            }, on_conflict="agent_id,specialty_id").execute()
+        except Exception as e:
+            logger.error(f"create_agent cascade specialty failed (agent={agent_id}): {e}")
+            cascade_errors["specialty"] = str(e)
+
+    if cascade_errors:
+        # Agente existe; etapas secundárias parciais. 422 + payload que o
+        # frontend desempacota (err.data.agent + err.data.errors).
+        return JSONResponse(status_code=422, content={"agent": agent_zod, "errors": cascade_errors})
+
+    return agent_zod
 
 @app.get("/api/companies/{company_id}/tasks")
 @app.get("/companies/{company_id}/tasks")
