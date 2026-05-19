@@ -18,6 +18,25 @@
 
 **Ação**: nenhuma — apenas registro pra futura invocação do auditor não repetir o falso positivo.
 
+### F-003 — Sprint BPMN VectraClip ~95% pronto MAS dono em sessão ativa
+
+**Descoberto em**: PR0c investigação (Explore agent)
+**Severidade**: P1 (não bloqueia MVP CFN)
+**Detalhe**: VectraClip tem 16 arquivos untracked + 6 modified que formam o sprint BPMN completo (PR-1 + PR-2 do `docs/PLANO-BPMN-MODELER-CLIP.md`). **mtime de BpmnCanvas.tsx é ~10min atrás** — sugere dono em sessão ativa. Build quebra se commit parcial (App.tsx já referencia páginas untracked).
+
+**Mapeamento**:
+- 16 arquivos BPMN: pages/Bpmn.tsx + pages/BpmnEditor.tsx + components/bpmn/* + lib/api/endpoints/bpmnDiagrams.ts + lib/queries/bpmnDiagrams.ts + types/bpmn.ts
+- 6 wire files: App.tsx + Sidebar + MainLayout + queries/keys + package.json + mocks/handlers
+- 1 arquivo obsoleto: pages/BpmnEditorPlaceholder.tsx
+- 0 TODO/FIXME (código production-ready)
+- 0 testes unitários
+
+**Ação autopilot**: **NÃO commitar** durante autopilot — memory `multi-session-coordination` cravou que paralelismo exige pausar. Aguardar dono terminar sprint. PR0c (wire `/bpmn/new`) fica resolvido AUTOMATICAMENTE quando dono commitar o sprint inteiro.
+
+**PR0c removido do bloqueio MVP CFN** (auditor já cravou que bloqueantes são PR0+PR1+PR2+PR4+PR5, sem PR0c).
+
+---
+
 ### F-002 — Morpheus inbound_triage envia JSON cru pro WhatsApp (PR0e do roadmap)
 
 **Descoberto em**: teste autopilot PDF (Marcelo recebeu JSON serializado após mandar feedback do PDF)
