@@ -311,7 +311,7 @@ def _build_step_row(
         "specialty_slug": None,  # legado — agent_specialty_config_id substituiu
         "requires_approval": False,
         "on_success_step_id": None,  # populado em 2ª pass
-        "on_failure_action": "errored",  # FK opcional do workflow_step_failure_actions
+        "on_failure_action": "block",  # FailureAction enum (block|skip|retry|escalate); engine workflow_engine.py:191 coage p/ enum — "errored" causava ValueError latente
         "active": True,
         "contract_version": "v1",
         "validation_status": "pending",
