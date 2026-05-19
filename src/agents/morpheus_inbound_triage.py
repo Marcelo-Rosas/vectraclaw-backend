@@ -176,11 +176,55 @@ def _create_child_task(
         return None
 
 
+def _build_user_facing_text(
+    matched_rule: Optional[Dict[str, Any]],
+    fallback_used: bool,
+    target_op_type: Optional[str],
+) -> str:
+    """PR0e autopilot 2026-05-18: gera output_text amigável pra ir pro
+    WhatsApp via _reply_to_connector_session (hook agent_daemon:432).
+
+    Sem isso, o fallback do PR #225 envia JSON cru pro cliente.
+    Marcelo recebeu JSON cru 3x na sessão 2bb7223b (pos 22, 25, 26)
+    durante teste autopilot.
+
+    Mensagem varia por contexto: rule matched (skill conhecida) vs
+    fallback humano (escalação).
+    """
+    if matched_rule:
+        intent_label = matched_rule.get("intent_slug") or "sua solicitação"
+        intent_human = {
+            "web-freight": "cotação de frete",
+            "text-freight": "cotação de frete",
+            "web-cross-docking": "cross-docking",
+            "text-cross-docking": "cross-docking",
+            "web-gymsite": "análise de academia",
+            "text-gymsite": "análise de academia",
+        }.get(intent_label, intent_label.replace("-", " "))
+        return (
+            f"Recebi sua solicitação de {intent_human}. "
+            "Já encaminhei pro especialista responsável e em breve te respondemos. 🚀"
+        )
+
+    if fallback_used:
+        # human-triage ou outro fallback configurado em connector_channels
+        return (
+            "Recebi sua mensagem! 👋 Vou direcionar pro time humano analisar "
+            "e respondemos em breve. Se for urgente, me confirma o assunto pra agilizar."
+        )
+
+    return "Mensagem recebida. Em breve retornamos."
+
+
 def entrypoint(task: Dict[str, Any], supabase_client) -> Dict[str, Any]:
     """Handler de inbound-triage. Chamado pelo agent_daemon.execute_task.
 
     Retorna dict serializable com status/output_json — agent_daemon parsea
     e marca task done OU blocked.
+
+    PR0e (2026-05-18): inclui `output_text` amigável em todos os returns
+    de SUCESSO (não erros internos). Hook _reply_to_connector_session
+    extrai esse texto e envia pro WhatsApp. Sem isso, JSON cru vazaria.
     """
     task_id = task.get("id", "?")
     company_id = task.get("company_id")
@@ -252,8 +296,10 @@ def entrypoint(task: Dict[str, Any], supabase_client) -> Dict[str, Any]:
             },
         }
 
+    fallback_used = matched_rule is None
     return {
         "status": "done",
+        "output_text": _build_user_facing_text(matched_rule, fallback_used, target_op_type),
         "output_json": {
             "child_task_id": child_id,
             "target_operation_type": target_op_type,
@@ -261,6 +307,6 @@ def entrypoint(task: Dict[str, Any], supabase_client) -> Dict[str, Any]:
             "matched_rule_slug": matched_rule.get("intent_slug") if matched_rule else None,
             "matched_rule_id": matched_rule.get("id") if matched_rule else None,
             "match_type": matched_type,
-            "fallback_used": matched_rule is None,
+            "fallback_used": fallback_used,
         },
     }
