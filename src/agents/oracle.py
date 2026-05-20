@@ -217,12 +217,15 @@ async def stream_oracle_chat(payload: dict) -> AsyncIterator[str]:
 # do `model="gemini-2.5-pro"` real → cost ~16x sub-estimado) resolvido por
 # catalog-driven via `src/services/llm_cost.py:calc_llm_cost`.
 
-_VECTRA_CONTEXT = (
-    "Contexto da empresa: Vectra Cargo é uma transportadora brasileira de modal EXCLUSIVAMENTE RODOVIÁRIO. "
-    "Não opera aéreo, marítimo, ferroviário ou intermodal. "
-    "Atua com frota própria e terceirizada no transporte de cargas em território nacional. "
-    "Ao analisar processos da Vectra, considere apenas o modal rodoviário e desconsidere "
-    "referências a outros modais."
+# Regra de Ouro #2: o contexto da empresa NÃO é tenant-locked. O contexto real
+# vem de companies.context_json (via _get_company_context / _company_context no
+# payload). Este é só o FALLBACK neutro quando a company ainda não tem perfil —
+# não assume setor/modal específico (antes cravava "Vectra Cargo rodoviário"
+# pra TODO tenant).
+_GENERIC_COMPANY_CONTEXT = (
+    "Contexto da empresa ainda não cadastrado. Faça uma análise genérica, "
+    "sem assumir setor, modal de transporte ou modelo de operação específicos. "
+    "Baseie-se apenas nas informações fornecidas no enunciado da tarefa."
 )
 
 
@@ -261,7 +264,7 @@ def _resolve_model(input_data: Dict[str, Any]) -> str:
 
 
 async def _handle_extract(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    ctx = input_data.get("_company_context") or _VECTRA_CONTEXT
+    ctx = input_data.get("_company_context") or _GENERIC_COMPANY_CONTEXT
     system = (
         f"{ctx}\n\n"
         "Você é um extrator de dados estruturados. "
@@ -288,7 +291,7 @@ async def _handle_extract(prompt: str, input_data: Dict[str, Any]) -> Dict[str, 
 
 
 async def _handle_summarize(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    ctx = input_data.get("_company_context") or _VECTRA_CONTEXT
+    ctx = input_data.get("_company_context") or _GENERIC_COMPANY_CONTEXT
     system = (
         f"{ctx}\n\n"
         "Você é um especialista em síntese. "
@@ -302,7 +305,7 @@ async def _handle_rag(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]
     docs = input_data.get("documents") or []
     context = "\n\n---\n\n".join(d.get("content", "") for d in docs if d.get("content"))
     full_prompt = f"Contexto:\n{context}\n\nPergunta:\n{prompt}" if context else prompt
-    ctx = input_data.get("_company_context") or _VECTRA_CONTEXT
+    ctx = input_data.get("_company_context") or _GENERIC_COMPANY_CONTEXT
     system = (
         f"{ctx}\n\n"
         "Você é um assistente RAG. Responda com base no contexto fornecido. "
@@ -410,7 +413,7 @@ async def _handle_vision(prompt: str, input_data: Dict[str, Any]) -> Dict[str, A
             )
     contents.append(prompt)
 
-    ctx = input_data.get("_company_context") or _VECTRA_CONTEXT
+    ctx = input_data.get("_company_context") or _GENERIC_COMPANY_CONTEXT
     t0 = time.monotonic()
     response = await client.aio.models.generate_content(
         model=_resolve_model(input_data),
@@ -734,7 +737,7 @@ async def _handle_research_sync(prompt: str, input_data: Dict[str, Any]) -> Dict
     from google.genai import types as _gt
 
     client = get_client()
-    ctx = input_data.get("_company_context") or _VECTRA_CONTEXT
+    ctx = input_data.get("_company_context") or _GENERIC_COMPANY_CONTEXT
     supabase = input_data.get("_supabase")
     task_id = input_data.get("_task_id")
     company_id = input_data.get("_company_id")
@@ -789,6 +792,20 @@ async def _handle_research_sync(prompt: str, input_data: Dict[str, Any]) -> Dict
 
     # F2 GSD: model vem do catalog (specialty_config.model_id) — antes era literal "gemini-2.5-pro".
     resolved_model = _resolve_model(input_data)
+    # Regra #2: thinking_budget também catalog-driven (era literal 4096).
+    from src.services.specialty_resolver import resolve_value as _resolve_value
+    _spec = input_data.get("_resolved_specialty")
+    _tb_raw = _resolve_value(
+        "thinking_budget",
+        payload=input_data,
+        config_values=input_data.get("_resolved_config") or {},
+        shared_values=input_data.get("_resolved_shared") or {},
+        specialty_defaults=(_spec.defaults if _spec else {}),
+    )
+    try:
+        thinking_budget = int(_tb_raw) if _tb_raw not in (None, "") else 4096
+    except (ValueError, TypeError):
+        thinking_budget = 4096
     t0 = time.monotonic()
     response = await client.aio.models.generate_content(
         model=resolved_model,
@@ -805,7 +822,7 @@ async def _handle_research_sync(prompt: str, input_data: Dict[str, Any]) -> Dict
                 _gt.Tool(google_search=_gt.GoogleSearch()),
                 _gt.Tool(url_context=_gt.UrlContext()),
             ],
-            thinking_config=_gt.ThinkingConfig(thinking_budget=4096),
+            thinking_config=_gt.ThinkingConfig(thinking_budget=thinking_budget),
         ),
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
@@ -890,9 +907,9 @@ _SPECIALTY_DISPATCH = {
 
 
 async def _get_company_context(supabase: Any, company_id: str) -> str:
-    """Busca context_json da empresa. Fallback para _VECTRA_CONTEXT se não houver."""
+    """Busca context_json da empresa. Fallback para _GENERIC_COMPANY_CONTEXT se não houver."""
     if not supabase or not company_id:
-        return _VECTRA_CONTEXT
+        return _GENERIC_COMPANY_CONTEXT
     try:
         res = (
             supabase.table("companies")
@@ -909,7 +926,7 @@ async def _get_company_context(supabase: Any, company_id: str) -> str:
                 return f"Empresa: {name}\nPerfil operacional (pesquisa automática):\n{summary}"
     except Exception as e:
         logger.warning("_get_company_context failed: %s", e)
-    return _VECTRA_CONTEXT
+    return _GENERIC_COMPANY_CONTEXT
 
 
 async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, Any]:
