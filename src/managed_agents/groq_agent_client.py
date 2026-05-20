@@ -97,10 +97,40 @@ class GroqAgentClient:
         prompt: str,
         max_turns: int = 3,
         system_prompt: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        company_id: Optional[str] = None,
     ) -> ExecutionResult:
         import openai
 
         start = time.monotonic()
+
+        # Parte 2.x MCP (Groq/aberto): tools MCP dos bindings no formato OpenAI +
+        # roteia tool_call mcp__ pro runner. Sem agent_id → legado.
+        _mcp_openai: List[Dict[str, Any]] = []
+        _supabase_mcp = None
+        if agent_id and company_id:
+            try:
+                from src.api import supabase as _supabase_mcp
+                from src.services.mcp_tool_runner import list_agent_mcp_tools
+                if _supabase_mcp:
+                    for t in list_agent_mcp_tools(_supabase_mcp, agent_id):
+                        _mcp_openai.append({
+                            "type": "function",
+                            "function": {
+                                "name": t["name"],
+                                "description": t.get("description") or "",
+                                "parameters": t.get("input_schema") or {"type": "object"},
+                            },
+                        })
+            except Exception as e:
+                logger.warning("MCP tools lookup falhou (segue sem MCP): %s", e)
+
+        def _dispatch_mcp(name: str, tool_input: Dict[str, Any]) -> Optional[str]:
+            if name.startswith("mcp__") and _supabase_mcp and agent_id and company_id:
+                from src.services.mcp_tool_runner import execute_mcp_tool
+                out = execute_mcp_tool(_supabase_mcp, company_id, agent_id, name, tool_input)
+                return json.dumps(out, ensure_ascii=False)
+            return None
 
         if not self._has_key:
             return ExecutionResult(
@@ -142,7 +172,7 @@ class GroqAgentClient:
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     messages=messages,
-                    tools=OPENAI_TOOLS,
+                    tools=OPENAI_TOOLS + _mcp_openai,
                 )
                 total_eval_seconds += time.monotonic() - eval_start
 
@@ -192,7 +222,9 @@ class GroqAgentClient:
                         args = json.loads(raw_args)
                     except json.JSONDecodeError:
                         args = {"_raw": raw_args}
-                    tool_result = dispatch_tool_call(name, args)
+                    tool_result = _dispatch_mcp(name, args)
+                    if tool_result is None:
+                        tool_result = dispatch_tool_call(name, args)
                     tool_calls_log.append({"name": name, "args": args, "result": tool_result})
                     messages.append({
                         "role": "tool",
