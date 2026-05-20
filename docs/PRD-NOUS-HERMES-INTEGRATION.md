@@ -1,9 +1,12 @@
 # PRD — Nous Hermes Integration (Runtime Interno + MCP + Adapter)
 
+> **Contrato técnico (endpoints, DB, adapter):** [`CONTRACTS-NOUS-HERMES.md`](./CONTRACTS-NOUS-HERMES.md)  
+> **Contrato “Alma do Agente” (bundle + apply):** [`CONTRACTS-AGENT-CAPABILITIES.md`](./CONTRACTS-AGENT-CAPABILITIES.md)
+
 > **Status:** Draft — aprovação pendente
 > **Owner:** Marcelo Rosas
 > **Criado:** 2026-05-17
-> **Escopo:** Fases 1-3 (runtime interno + MCP server + adapter). Canal cliente (Fase 4) e expansão multi-provider de trajectory (Fase 5.2) **fora deste PRD**.
+> **Escopo:** Fases 1–3 (runtime + MCP + adapter) + Fase 4 (**gateway Hermes**, exceto WABA). **WhatsApp = NAVI + `meta-whatsapp`** — ver [`PLAN-CANAL-MENSAGERIA-NAVI-HERMES.md`](./PLAN-CANAL-MENSAGERIA-NAVI-HERMES.md). OpenClaw descartado. Trajectory (Fase 5.2) em PRD separado.
 > **PRDs relacionados:** [`PRD-ATHENA-HR-TRAJECTORY-INGEST.md`](./PRD-ATHENA-HR-TRAJECTORY-INGEST.md) (depende da Fase 3 deste)
 
 ---
@@ -13,12 +16,12 @@
 Hermes-Nous (Nous Research) é um agente autônomo CLI com 70+ tools built-in, MCP bi-direcional, gateway multi-canal (~20+ plataformas), backends de execução isolados (Docker/SSH/Modal/Daytona), aprovação smart e skill creation autônoma. Documentação: https://hermes-agent.nousresearch.com/docs
 
 O usuário identificou 4 casos de uso simultâneos no VectraClaw:
-1. Canal cliente (gateway multi-canal pra cotação/status sem dashboard) — **deferido**, ver §10
-2. Provider/runtime alternativo (modelos Nous via OpenRouter ou Nous Portal)
-3. Skill creation + trajectory pra fine-tune Athena-Vectra — **PRD separado**
-4. Substituir/encolher daemons (Kronos cron, runtime hardened pra Playwright)
+1. **Canal cliente** (gateway multi-canal WhatsApp/Telegram/… pra cotação/status sem dashboard) — **INCLUÍDO** (Fase 4). Decisão: Hermes Gateway, não OpenClaw.
+2. Provider/runtime alternativo (modelos Nous via OpenRouter ou Nous Portal) — Fases 1 + 3
+3. Skill creation + trajectory pra fine-tune Athena-Vectra — **PRD separado** (complementa Fase 4)
+4. Substituir/encolher daemons (Kronos cron, runtime hardened Playwright) — uso interno / cascata scraping
 
-Este PRD trata de #2 e #4 (uso interno). Direção: **bidirecional** — VectraClaw expõe MCP server e também invoca Hermes como provider.
+Este PRD trata de **#1, #2 e #4** (canal + runtime + fallback). Direção: **bidirecional** — VectraClaw expõe MCP server e invoca Hermes como provider **e** como gateway de canal.
 
 ### Naming e colisão
 
@@ -36,14 +39,15 @@ O nome **Hermes** já ocupa 2 papéis no VectraClaw:
 - **G2.** Expor entidades VectraClaw (tasks, quotes, clients, RAG) como tools MCP consumíveis por qualquer agente externo (Fase 2)
 - **G3.** Habilitar despacho de tasks aos modelos Nous (Hermes-4, Nomos, Psyche) via OpenRouter no mesmo pipeline dos providers atuais (Anthropic/Gemini/Ollama/HF) (Fase 3)
 - **G4.** Zero impacto operacional nos 11 daemons existentes (Morpheus, Oracle, Mnemos, Hermes, Mercator, Plutus, Hodos, HermesReporter, Kronos, Athena, Daedalus — verificado em `start_all_daemons.py:37-47`). Nota: CLAUDE.md raiz lista só 10 — desatualizado. Daedalus está em produção mas em retrofit (memory `agent-hiring-ritual`).
+- **G5.** Entregar canal cliente conversacional via Hermes Gateway (Fase 4) após MCP server (Fase 2) — substitui roadmap OpenClaw (ADR canal, 2026-05-19).
 
 ## 3. Non-goals (out of scope)
 
-- ❌ Canal cliente (WhatsApp/Telegram/Discord) — conflita com visão OpenClaw já mapeada (`vectra-mcp-builder/references/openclaw-integration.md`, `commercial_followup_rules.channel = openclaw | email | meta`). Ver §10 e ADR futura
-- ❌ Substituição do daemon Kronos por `hermes cron` — backlog pós-F3
-- ❌ Adapter Hermes como backend Playwright hardened — backlog pós-F3
+- ❌ **OpenClaw** (gateway TypeScript / Cloudflare Workers) — **descartado** 2026-05-19
+- ❌ Substituição do daemon Kronos por `hermes cron` — backlog pós-F4
+- ❌ Adapter Hermes como backend Playwright hardened — backlog pós-F3 (non-goal mantido)
 - ❌ Fine-tune de modelo Nous custom — depende de trajectory (PRD separado) + dataset substancial
-- ❌ Multi-tenant gateway com isolamento per-company — bloqueia canal cliente, não bloqueia uso interno
+- ⚠️ Multi-tenant gateway em escala (50+ companies) — Fase 4 aceita container-per-company no MVP; arquitetura de roteamento único é evolução, não bloqueio de POC
 
 ---
 
@@ -69,8 +73,9 @@ O nome **Hermes** já ocupa 2 papéis no VectraClaw:
 | **1** | **Foundation** | Container `nous-hermes-runtime` + HTTP thin wrapper + endpoint `/api/nous-hermes/exec` atrás de feature flag | 1 |
 | **2** | **MCP Server VectraClaw** | `src/mcp_server/` expondo `list_tasks`, `get_quote`, `query_rag`, `enqueue_task` com filtro implícito por `company_id` | 2 |
 | **3** | **Adapter inverso** | `nous_hermes_agent_client.py` em `managed_agents/`, seed em `adapter_catalog`, 1ª specialty cobaia em `document_generation` ou `code_review` (já rotam via CMA — ver §8.4) | 1-2 |
+| **4** | **Canal cliente (Gateway)** | `hermes gateway run` + SOUL.md Vectra + pairing/allowlist em catálogo + `channel=nous_hermes` em follow-up comercial; consome MCP Fase 2 | 2-3 |
 
-Fase 2 e 3 podem rodar em paralelo. Fase 3 entrega valor end-to-end (task com `provider=nous_hermes` executando via Hermes).
+Fases 2 e 3 podem rodar em paralelo. **Fase 4 depende de F2** (MCP). Fase 3 entrega tasks internas via CMA; Fase 4 entrega WhatsApp/Telegram ao cliente final.
 
 ---
 
@@ -298,23 +303,21 @@ Cascata padrão de scraping:
 
 ---
 
-## 10. OpenClaw × Hermes-Nous (referência, sem decisão neste PRD)
+## 10. Canal cliente — decisão Hermes (OpenClaw descartado)
 
-O usuário tem visão de **OpenClaw** documentada (skill `vectra-mcp-builder/references/openclaw-integration.md` + `commercial_followup_rules.channel = openclaw | email | meta` reservado no schema) — gateway TypeScript próprio com 14 agentes nomeados (main, brain, cotacao, financeiro, motorista, inbox, …), deploy Cloudflare Workers, branding 100% Vectra.
+**Decisão 2026-05-19:** canal cliente = **Hermes Gateway** (Opção B). OpenClaw não será implementado.
 
-**Hermes-Nous Gateway** (~20 canais nativos, pairing DM, skill creation autônoma) é alternativa terceira. Comparação resumida:
+ADR fechado: [`ADR-VEC-CANAL-CLIENTE-OPENCLAW-VS-HERMES.md`](./ADR-VEC-CANAL-CLIENTE-OPENCLAW-VS-HERMES.md).
 
-| Dimensão | OpenClaw (build próprio) | Hermes Gateway (third-party) |
-|---|---|---|
-| Multi-tenant | Desenho próprio (1 worker por company ou tenant resolution) | Sem RBAC nativo → 1 container por company → escala mal em 50+ |
-| Branding | 100% Vectra | "Powered by Nous" visível |
-| Time-to-value | 2-3 sprints | 1 sprint |
-| Skill creation | Manual | Autônoma |
-| Trajectory export | Você implementa | Nativo |
+| Tema | Implicação |
+|------|------------|
+| Schema `commercial_followup_*.channel` | Migration: adicionar `nous_hermes`; novas regras usam esse valor (`openclaw` legado) |
+| Branding | SOUL.md + nome exibido “Vectra” — mitigar “powered by Nous” (gate G4) |
+| Escala | MVP: 1 container gateway / company; revisar antes de 30+ tenants |
+| LGPD | Gate G5 — DPA OpenRouter/Nous; considerar Ollama no adapter para PII |
+| MCP | Fase 2 obrigatória — gateway só orquestra; negócio fica em `src/mcp_server/` |
 
-**Decisão deste PRD:** não escolher canal cliente agora. Este PRD entrega valor interno (runtime + MCP + adapter) que serve **qualquer** consumidor futuro (OpenClaw OU Hermes Gateway). A escolha do canal cliente vira ADR posterior:
-
-> `docs/ADR-VEC-CANAL-CLIENTE-OPENCLAW-VS-HERMES.md` (criar depois da Fase 3)
+**Fase 4 (esboço de entrega):** serviço `nous-hermes-gateway` (ou perfil compose separado do runtime F1), `gateway run`, allowlist em `companies.context_json.gateway_users` ou tabela `gateway_allowlist`, integração com adapter `meta-whatsapp` existente onde aplicável.
 
 ---
 
