@@ -1056,11 +1056,13 @@ class ResilientHarnessDaemon:
             subject = f"Oracle Research — {company_name or title}"
 
             from src.agents.hermes_reporter import render_html, send_smtp
+            # Catalog-driven (Regra #2): header deriva de company_name + report_type,
+            # não literal "Vectra Cargo" cravado.
             html_body = render_html(
                 report_md,
                 subject,
-                header_title="Vectra Cargo — Oracle Research",
-                footer_text="Relatório gerado automaticamente pelo Oracle • Vectra Claw",
+                company_name=company_name or None,
+                report_type="Oracle Research",
             )
             msg_id = send_smtp(subject, html_body, [recipient])
             logger.info(
