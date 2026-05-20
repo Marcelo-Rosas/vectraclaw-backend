@@ -1012,6 +1012,11 @@ async def create_sipoc_sector(request: Request, payload: Dict[str, Any]):
     # Auto-gera slug se não fornecido (coluna NOT NULL no DB)
     if not payload.get("slug"):
         payload["slug"] = _slugify_sipoc(payload["name"])
+    # RLS sipoc_sectors_tenant_insert exige with_check company_id = sipoc_company_id().
+    # Sem injetar company_id o row vai NULL → 42501. Pega do JWT (request.state).
+    _caller_company = getattr(request.state, "company_id", None)
+    if _caller_company and not payload.get("company_id"):
+        payload["company_id"] = str(_caller_company)
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_sectors").insert(payload).execute()
@@ -9221,7 +9226,10 @@ async def list_agent_specialties(request: Request):
     try:
         res = (
             supabase.table("agent_specialties")
-            .select("id,name,slug,domain,description,compatible_roles,system_prompt_template,config_schema,is_active")
+            .select(
+                "id,name,slug,domain,description,compatible_roles,system_prompt_template,"
+                "config_schema,is_active,status,source"
+            )
             .eq("is_active", True)
             .order("name")
             .execute()
@@ -9303,6 +9311,8 @@ async def patch_agent_specialty(request: Request, specialty_id: str, payload: Di
         if "systemPromptTemplate" in payload: update_data["system_prompt_template"] = payload["systemPromptTemplate"]
         if "configSchema" in payload: update_data["config_schema"] = payload["configSchema"]
         if "isActive" in payload: update_data["is_active"] = payload["isActive"]
+        if "status" in payload: update_data["status"] = payload["status"]
+        if "source" in payload: update_data["source"] = payload["source"]
         if not update_data:
             raise HTTPException(status_code=400, detail="no_fields_to_update")
         res = supabase.table("agent_specialties").update(update_data).eq("id", specialty_id).execute()
