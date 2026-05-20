@@ -263,16 +263,22 @@ async def route_task_execution(
         # ollama — assinatura legada (sem MCP ainda; parte 2.x futura)
         result = await client.execute_task(prompt, max_turns=3)
 
-    # Persiste turns
-    for tc in result.tool_calls:
+    # Persiste turns. Shape do tool_calls_log varia por client:
+    # anthropic/HF → {tool_name, tool_input, tool_output, turn}; groq → {name, args, result}.
+    # Lê tolerante aos dois (fix E2E groq KeyError 'turn').
+    for idx, tc in enumerate(result.tool_calls, start=1):
+        _turn = tc.get("turn", idx)
+        _tname = tc.get("tool_name") or tc.get("name") or "unknown"
+        _tinput = tc.get("tool_input", tc.get("args"))
+        _toutput = tc.get("tool_output", tc.get("result")) or ""
         bridge.save_turn(
             session_id=session_id,
-            turn_number=tc["turn"],
-            input_text=str(tc.get("tool_input", "")),
-            output_text=tc.get("tool_output", ""),
+            turn_number=_turn,
+            input_text=str(_tinput or ""),
+            output_text=_toutput,
             stop_reason="tool_use",
-            tool_used=tc["tool_name"],
-            tool_input=tc.get("tool_input"),
+            tool_used=_tname,
+            tool_input=_tinput,
         )
 
         if ws_manager and company_id:
@@ -283,9 +289,9 @@ async def route_task_execution(
                     payload={
                         "session_id": session_id,
                         "task_id": task_id,
-                        "turn_number": tc["turn"],
-                        "tool_used": tc["tool_name"],
-                        "output_preview": tc.get("tool_output", "")[:200],
+                        "turn_number": _turn,
+                        "tool_used": _tname,
+                        "output_preview": (_toutput or "")[:200],
                         "stop_reason": "tool_use",
                     },
                 )
