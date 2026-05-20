@@ -24,8 +24,12 @@ services:
       PORT: "3000"
       NOUS_HERMES_RUNTIME_URL: http://nous-hermes-runtime:9120
     depends_on:
+      # service_started (NÃO _healthy): backend não bloqueia esperando o
+      # nous-hermes ficar healthy. O healthcheck dele tem start_period 180s +
+      # boot lento do runtime → recreate do backend levava 10min-1h. Nous-hermes
+      # é provider fallback; backend tolera ele aquecendo e sobe em segundos.
       nous-hermes-runtime:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
       interval: 30s
@@ -46,7 +50,7 @@ services:
       backend:
         condition: service_healthy
       nous-hermes-runtime:
-        condition: service_healthy
+        condition: service_started
 
   cloudflared:
     image: cloudflare/cloudflared:latest
