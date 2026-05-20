@@ -209,7 +209,17 @@ async def route_task_execution(
             agent_id=agent_id,
             task_id=task_id,
         )
+    elif provider == "anthropic":
+        # Parte 2 MCP: ManagedAgentClient aceita agent_id/company_id → injeta tools MCP
+        # dos bindings ativos + roteia tool_use prefixado mcp__ pro runner.
+        result = await client.execute_task(
+            prompt,
+            max_turns=3,
+            agent_id=agent_id,
+            company_id=company_id,
+        )
     else:
+        # ollama/huggingface/groq — assinatura legada (sem MCP ainda; parte 2.x)
         result = await client.execute_task(prompt, max_turns=3)
 
     # Persiste turns

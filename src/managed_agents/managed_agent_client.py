@@ -60,11 +60,38 @@ class ManagedAgentClient:
         prompt: str,
         max_turns: int = 3,
         system_prompt: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        company_id: Optional[str] = None,
     ) -> ExecutionResult:
         from .tool_translator import ANTHROPIC_TOOLS, dispatch_tool_call
 
         start = time.monotonic()
         client = self._get_client()
+
+        # Parte 2 MCP: se agent_id+company_id vierem, injeta tools MCP dos bindings
+        # ativos (prefixadas mcp__<server>__<tool>) + roteia tool_use prefixado
+        # pro mcp_tool_runner. Sem agent_id → comportamento legado (só ANTHROPIC_TOOLS).
+        mcp_tools: List[Dict[str, Any]] = []
+        _supabase = None
+        if agent_id and company_id:
+            try:
+                from src.api import supabase as _supabase
+                from src.services.mcp_tool_runner import list_agent_mcp_tools
+                if _supabase:
+                    mcp_tools = list_agent_mcp_tools(_supabase, agent_id)
+            except Exception as e:
+                logger.warning("MCP tools lookup falhou (segue sem MCP): %s", e)
+
+        tools = ANTHROPIC_TOOLS + mcp_tools
+
+        def _dispatch(name: str, tool_input: Dict[str, Any]) -> str:
+            """Roteia: mcp__ → mcp_tool_runner; senão → tool_translator legado."""
+            if name.startswith("mcp__") and _supabase and agent_id and company_id:
+                from src.services.mcp_tool_runner import execute_mcp_tool
+                import json as _json
+                out = execute_mcp_tool(_supabase, company_id, agent_id, name, tool_input)
+                return _json.dumps(out, ensure_ascii=False)
+            return dispatch_tool_call(name, tool_input)
 
         system = system_prompt or (
             "Você é um agente logístico da Vectra Cargo. "
@@ -95,7 +122,7 @@ class ManagedAgentClient:
                     model=self.model,
                     max_tokens=1024,
                     system=system,
-                    tools=ANTHROPIC_TOOLS,
+                    tools=tools,
                     messages=messages,
                 )
                 total_eval_seconds += time.monotonic() - eval_start
@@ -115,7 +142,7 @@ class ManagedAgentClient:
                 tool_uses = [b for b in response.content if b.type == "tool_use"]
                 tool_results = []
                 for tu in tool_uses:
-                    tool_output = dispatch_tool_call(tu.name, tu.input)
+                    tool_output = _dispatch(tu.name, tu.input)
                     tool_calls_log.append({
                         "tool_name": tu.name,
                         "tool_input": tu.input,
