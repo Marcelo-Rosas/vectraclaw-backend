@@ -33,7 +33,7 @@
 
 ---
 
-## 🟠 PR4 — oracle.py `_VECTRA_CONTEXT` → `companies.context_json`
+## ✅ PR4 — oracle.py `_VECTRA_CONTEXT` → `companies.context_json` `[FEITO #288]`
 - **Arquivo:linha:** `oracle.py:220-226` — descrição da Vectra cravada, usada pra TODO tenant.
 - **Tabela espelho:** `companies.context_json` (Athena já lê via `_get_company_context(supabase, company_id)`).
 - **Fix:** trocar `_VECTRA_CONTEXT` por chamada a `_get_company_context(company_id)`; popular `context_json` no `athena-onboarding`. Padrão já existe — copiar do Athena.
@@ -55,7 +55,7 @@
 
 ---
 
-## 🟡 PR6 — oracle.py `thinking_budget=4096` fixo
+## ✅ PR6 — oracle.py `thinking_budget=4096` fixo `[FEITO #288]`
 - **Arquivo:linha:** `oracle.py:808` — `ThinkingConfig(thinking_budget=4096)` no research handler.
 - **Tabela espelho:** `agent_specialty_configs.values["thinking_budget"]` (Athena já resolve via `resolve_value`).
 - **Fix:** `resolve_value("thinking_budget", ..., default=4096)`.
