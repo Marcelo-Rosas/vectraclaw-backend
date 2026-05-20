@@ -318,18 +318,55 @@ async def delete_mcp_binding(request: Request, binding_id: str = Path(...)) -> D
 # Handshake + tools refresh
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _do_handshake(binding_row: Dict[str, Any], server_row: Dict[str, Any], company_id: str) -> List[Dict[str, Any]]:
+def _company_mcp_value_to_camel(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "companyId": row.get("company_id"),
+        "mcpServerId": row.get("mcp_server_id"),
+        "fieldValuesJson": row.get("field_values_json") or {},
+        "allowedTools": row.get("allowed_tools"),
+        "isActive": row.get("is_active"),
+        "createdAt": row.get("created_at"),
+        "updatedAt": row.get("updated_at"),
+    }
+
+
+def _resolve_effective_field_values(
+    supabase: Any, company_id: str, server_id: str, override: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """N11: credenciais MCP são PRIMARY no company_mcp_values (config em /admin/mcp).
+    agent_mcp_bindings.field_values_json é override de exceção (W5 pattern).
+    Resolve = company values + override por cima."""
+    effective: Dict[str, Any] = {}
+    try:
+        cv = (
+            supabase.table("company_mcp_values")
+            .select("field_values_json")
+            .eq("company_id", company_id)
+            .eq("mcp_server_id", server_id)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if cv.data:
+            effective.update(cv.data[0].get("field_values_json") or {})
+    except Exception as e:
+        logger.warning(f"_resolve_effective_field_values company lookup falhou: {e}")
+    if override:
+        effective.update({k: v for k, v in override.items() if v not in (None, "")})
+    return effective
+
+
+def _do_handshake(field_values: Dict[str, Any], server_row: Dict[str, Any], company_id: str) -> List[Dict[str, Any]]:
     """Conecta no MCP server + lista tools. N7: auth resolver completo
     (oauth2_client_credentials/bearer/api_key/none) via McpClient.from_binding.
-    stdio levanta 502 (sem consumidor runtime hoje)."""
+    field_values já resolvido (company PRIMARY + agent override). stdio levanta 502."""
     from src.api import resolve_secret_ref
     from src.services.mcp_client import McpClient, McpAuthError
 
-    field_values = binding_row.get("field_values_json") or {}
-    # secret_resolver desreferencia vault:// usando o company_id do binding
     resolver = lambda v: resolve_secret_ref(v, company_id)
     try:
-        client = McpClient.from_binding(server_row, field_values, secret_resolver=resolver)
+        client = McpClient.from_binding(server_row, field_values or {}, secret_resolver=resolver)
     except McpAuthError as e:
         raise HTTPException(status_code=502, detail=f"handshake_auth_failed:{e}")
     return client.list_tools()
@@ -360,7 +397,11 @@ async def handshake_mcp_binding(request: Request, binding_id: str = Path(...)) -
 
         now = _now_iso()
         try:
-            tools = _do_handshake(b, server.data[0], company_id)
+            # N11: creds PRIMARY de company_mcp_values + override do binding
+            effective = _resolve_effective_field_values(
+                supabase, company_id, b.get("mcp_server_id"), b.get("field_values_json")
+            )
+            tools = _do_handshake(effective, server.data[0], company_id)
             supabase.table("agent_mcp_bindings").update({
                 "tools_cache": tools,
                 "last_health_at": now,
@@ -387,3 +428,120 @@ async def refresh_mcp_binding_tools(request: Request, binding_id: str = Path(...
     """Alias de handshake focado em refrescar tools_cache."""
     result = await handshake_mcp_binding(request, binding_id)
     return {"tools": result.get("tools", [])}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# N11 — Company MCP credentials (PRIMARY; config em /admin/mcp)
+# Secrets vão pro vault no frontend (useUpsertCompanySecret) ANTES do PUT;
+# backend só persiste field_values_json com vault:// refs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/api/companies/{company_id}/mcp-values")
+@router.get("/companies/{company_id}/mcp-values")
+async def list_company_mcp_values(request: Request, company_id: str = Path(...)) -> List[Dict[str, Any]]:
+    caller = _resolve_company(request)
+    if str(caller) != str(company_id):
+        raise HTTPException(status_code=403, detail="cross_company_forbidden")
+    from src.api import supabase
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("company_mcp_values")
+            .select("*")
+            .eq("company_id", company_id)
+            .execute()
+        )
+        return [_company_mcp_value_to_camel(r) for r in (res.data or [])]
+    except Exception as e:
+        logger.error(f"list_company_mcp_values failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/companies/{company_id}/mcp-values/{server_id}")
+@router.put("/companies/{company_id}/mcp-values/{server_id}")
+async def upsert_company_mcp_value(
+    request: Request,
+    company_id: str = Path(...),
+    server_id: str = Path(...),
+    payload: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    """Upsert credenciais MCP da company. Body: {fieldValuesJson, allowedTools?, isActive?}.
+    Secrets já devem vir como vault:// refs (frontend vaultou antes)."""
+    caller = _resolve_company(request)
+    if str(caller) != str(company_id):
+        raise HTTPException(status_code=403, detail="cross_company_forbidden")
+    from src.api import supabase
+    if not supabase:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    try:
+        server = supabase.table("mcp_server_catalog").select("id").eq("id", server_id).limit(1).execute()
+        if not server.data:
+            raise HTTPException(status_code=404, detail="mcp_server_not_found")
+        now = _now_iso()
+        row = {
+            "company_id": company_id,
+            "mcp_server_id": server_id,
+            "field_values_json": payload.get("fieldValuesJson") or payload.get("field_values_json") or {},
+            "allowed_tools": payload.get("allowedTools") or payload.get("allowed_tools"),
+            "is_active": payload.get("isActive", True),
+            "updated_at": now,
+        }
+        res = (
+            supabase.table("company_mcp_values")
+            .upsert(row, on_conflict="company_id,mcp_server_id")
+            .execute()
+        )
+        if not res.data:
+            raise HTTPException(status_code=500, detail="upsert_returned_empty")
+        return _company_mcp_value_to_camel(res.data[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"upsert_company_mcp_value failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/companies/{company_id}/mcp-values/{server_id}")
+@router.delete("/companies/{company_id}/mcp-values/{server_id}")
+async def delete_company_mcp_value(
+    request: Request, company_id: str = Path(...), server_id: str = Path(...)
+) -> Dict[str, Any]:
+    caller = _resolve_company(request)
+    if str(caller) != str(company_id):
+        raise HTTPException(status_code=403, detail="cross_company_forbidden")
+    from src.api import supabase
+    if not supabase:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    try:
+        supabase.table("company_mcp_values").delete().eq("company_id", company_id).eq("mcp_server_id", server_id).execute()
+        return {"deleted": True, "mcpServerId": server_id}
+    except Exception as e:
+        logger.error(f"delete_company_mcp_value failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/companies/{company_id}/mcp-values/{server_id}/handshake")
+@router.post("/companies/{company_id}/mcp-values/{server_id}/handshake")
+async def handshake_company_mcp_value(
+    request: Request, company_id: str = Path(...), server_id: str = Path(...)
+) -> Dict[str, Any]:
+    """Testa as credenciais company-level direto (sem precisar de binding)."""
+    caller = _resolve_company(request)
+    if str(caller) != str(company_id):
+        raise HTTPException(status_code=403, detail="cross_company_forbidden")
+    from src.api import supabase
+    if not supabase:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    try:
+        server = supabase.table("mcp_server_catalog").select("*").eq("id", server_id).limit(1).execute()
+        if not server.data:
+            raise HTTPException(status_code=404, detail="mcp_server_not_found")
+        effective = _resolve_effective_field_values(supabase, company_id, server_id, None)
+        tools = _do_handshake(effective, server.data[0], company_id)
+        return {"tools": tools, "healthAt": _now_iso()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"handshake_company_mcp_value failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
