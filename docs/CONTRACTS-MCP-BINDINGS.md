@@ -1,5 +1,6 @@
 # Contratos MCP Bindings — Backend × Frontend
 
+> **Contrato pai (Athena bundle + apply + Skills):** [`CONTRACTS-AGENT-CAPABILITIES.md`](./CONTRACTS-AGENT-CAPABILITIES.md)  
 > Espelho de tipos pra Backend (Pydantic) e Frontend (TypeScript) trabalharem em paralelo.
 > Plan ref: `~/.claude/plans/twinkly-cuddling-hartmanis.md` §13.4.
 > Path arquitetural escolhido: **tri-tabela** (`adapter_catalog` + `mcp_server_catalog` + `connector_channels`).

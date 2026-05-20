@@ -1,6 +1,7 @@
 # Athena Recommendations — Catalog Canônico
 
-> **Última atualização:** 2026-05-16 (resolve drift PR9/#139)
+> **Contrato E2E (bundle + apply + catálogos):** [`CONTRACTS-AGENT-CAPABILITIES.md`](./CONTRACTS-AGENT-CAPABILITIES.md) — fonte para “Alma do Agente” e apply 100%.  
+> **Última atualização:** 2026-05-19 (drift auto-apply corrigido; ver contrato pai)
 > **Migration:** `supabase/migrations/20260516150000_athena_kind_catalog_canonical.sql`
 > **Backend:** `src/api_routes/athena.py` (`_REC_VALID_KINDS`)
 > **Frontend Zod:** `src/types/api.ts` (atualizar quando consumir esse doc)
@@ -11,8 +12,8 @@
 
 `vectraclip.athena_recommendations.kind` aceita **8 valores canônicos**, divididos em 2 categorias funcionais:
 
-- **5 EXECUTÁVEIS** — Athena PMO aplica via auto-action (mutação no DB) após aprovação humana
-- **3 INFORMATIVOS** — Athena apenas reporta; humano lê e decide o que fazer (sem auto-execução)
+- **5 EXECUTÁVEIS** — mutação no DB **após** `POST .../apply` (TO-BE) ou manual hoje; ver [`CONTRACTS-AGENT-CAPABILITIES.md`](./CONTRACTS-AGENT-CAPABILITIES.md) §7
+- **3 INFORMATIVOS** — Athena apenas reporta; humano lê e decide o que fazer (sem apply)
 
 ---
 
@@ -20,11 +21,11 @@
 
 | kind | Categoria | Quem gera | Quem executa | Mutação |
 |---|---|---|---|---|
-| `hire_new_agent` | Executável | Athena (handler `athena-recommend` analisa gaps) | Athena auto-aplica | INSERT em `agents` + provisioning P2 |
-| `add_specialty` | Executável | Athena (detecta agent precisando de skill) | Athena auto-aplica | INSERT em `agent_specialty_configs` |
-| `rewrite_system_prompt` | Executável | Athena (handler `athena-prompt-review`) | Athena auto-aplica | UPDATE em `agents.system_prompt` + snapshot em `agent_prompt_history` |
-| `create_specialty` | Executável | Athena (detecta necessidade nova) | Athena auto-aplica | INSERT em `agent_specialties` |
-| `consolidate_agents` | Executável | Athena (detecta agents redundantes) | Athena auto-aplica | Merge + redirect tasks |
+| `hire_new_agent` | Executável | Athena (`athena-recommend`) | Humano + **`POST .../apply`** (TO-BE) | INSERT `agents` + bindings via bundle |
+| `add_specialty` | Executável | Athena | Humano + apply (TO-BE) ou AgentDetail manual | INSERT `agent_specialty_configs` |
+| `rewrite_system_prompt` | Executável | Athena | Humano + apply ou edit manual + `mark-applied` | UPDATE `agents.system_prompt` + history |
+| `create_specialty` | Executável | Athena | Humano + apply (TO-BE) | INSERT `agent_specialties` |
+| `consolidate_agents` | Executável | Athena | Humano + apply (TO-BE) | Merge + redirect tasks |
 | `diagnose_gap` | Informativo | Endpoint `POST /api/sipoc/diagnose/{sector_id}` (PR9 #139) | **Ninguém — só relatório** | Nenhuma; humano lê |
 | `suggest_automation` | Informativo | Derivado do diagnose (activities com 5W2H≥70%) | Humano marca `automation_status` no SIPOC | Humano via UI |
 | `suggest_hire_agent` | Informativo | Derivado do diagnose (operation_types sem agent) | Humano aprova → vira `hire_new_agent` | Conversão manual |
@@ -179,7 +180,7 @@
 
 **Pra kinds informativos** (`diagnose_gap`, `suggest_*`): aprovar não dispara mutação no DB — é apenas tracking de "leu, considerou". Pode ir direto pra `applied` ou `rejected` sem precisar de ação manual.
 
-**Pra kinds executáveis**: aprovar é precondição; a ação real é executada pela Athena (futuro) ou manualmente pelo admin (P1), e o status vira `applied` após confirmação.
+**Pra kinds executáveis**: aprovar é precondição; a ação real é `POST /api/athena/recommendations/{id}/apply` (contrato AC-2) ou manual; `mark-applied` só confirma status sem executar mutações.
 
 ---
 

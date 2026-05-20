@@ -1,9 +1,9 @@
-# ADR — Canal Cliente: OpenClaw (build próprio) vs Hermes Gateway (Nous Research)
+# ADR — Canal Cliente: Hermes Gateway (Nous Research) — decisão fechada
 
-> **Status:** Proposed — **aguardando dados de decisão (gates §8)**. Não decidir agora; gates só fecham após Fase 3 do `PRD-NOUS-HERMES-INTEGRATION.md` estar em produção.
-> **Owner:** Marcelo (decisão de produto). Claude (registrador).
-> **Data:** 2026-05-17 (re-auditado contra schema + regras de ouro 2026-05-17 — ver §13)
-> **Origem:** discussão durante planejamento da integração Nous-Hermes (sessão 2026-05-17). Marcelo escolheu o caminho "Todos os 4 casos de uso" — mas canal cliente conflita com a visão **OpenClaw** já mapeada (`vectra-mcp-builder/references/openclaw-integration.md` + `commercial_followup_rules.channel` com CHECK `('openclaw','email','meta')` em 3 tabelas — verificado 2026-05-17). Este ADR documenta as opções, critérios objetivos e gates pra fechar a decisão depois com base em dados reais — não em opinião.
+> **Status:** **Accepted — stack híbrida revisada 2026-05-19.**  
+> **Decisão:** OpenClaw **rejeitado**. **WhatsApp Business = NAVI (conversa) + VectraClaw `meta-whatsapp` (Graph API, webhook, templates).** Hermes-Nous = runtime/skills/MCP/Telegram interno — **não** receptor do webhook WABA.  
+> **Plano de execução:** [`PLAN-CANAL-MENSAGERIA-NAVI-HERMES.md`](./PLAN-CANAL-MENSAGERIA-NAVI-HERMES.md)  
+> **Owner:** Marcelo (produto). **Data original:** 2026-05-17. **Revisão:** 2026-05-19 (NAVI + templates Meta).
 > **PRDs relacionados:** [`PRD-NOUS-HERMES-INTEGRATION.md`](./PRD-NOUS-HERMES-INTEGRATION.md), [`PRD-ATHENA-HR-TRAJECTORY-INGEST.md`](./PRD-ATHENA-HR-TRAJECTORY-INGEST.md)
 > **ADR pai:** [`ADR-VEC-MAPEAR-ANALISAR-AUTOMATIZAR.md`](./ADR-VEC-MAPEAR-ANALISAR-AUTOMATIZAR.md) — depende de **P3** (agent_skills × agent_specialties), **P6** (multi-tenant primeira venda externa), **P12** (UI Mapeamento/Orquestração), **D13** (UI é fonte de dados). Acoplamento detalhado em §13.
 > **Regras de ouro aplicadas:** [[mirror-before-create]] (#1) — todos os fatos sobre schema re-verificados via SQL em 2026-05-17. [[metadata-driven-no-hardcode]] (#2) — violações pontuais listadas em §13.2.
@@ -14,11 +14,15 @@
 
 VectraClaw precisa de **canal cliente conversacional** (WhatsApp Business como principal, Telegram secundário) pra cliente final da Vectra Cargo interagir com agentes — cotação de frete, status de CT-e, onboarding self-service, follow-up comercial. Sem isso, todo cliente precisa abrir o dashboard VectraClip, o que limita adoção.
 
-Duas abordagens concorrentes apareceram:
+Três abordagens foram avaliadas (2026-05-17). **Decisão revisada 2026-05-19:**
 
-- **Opção A: OpenClaw** — build próprio em TypeScript, 14 agentes nomeados, deploy Cloudflare Workers, MCP servers customizados. Já está na visão de produto do Marcelo (skill `vectra-mcp-builder` documentada + schema reservado `commercial_followup_rules.channel='openclaw'`)
-- **Opção B: Hermes Gateway (Nous Research)** — usar Hermes-Nous como gateway pronto multi-canal (~20+ plataformas), skill creation autônoma, MCP bi-direcional. Decisão adjacente à integração runtime do `PRD-NOUS-HERMES-INTEGRATION.md`
-- **Opção C: Híbrido** — Hermes Gateway pra **uso interno** (equipe Vectra falando com próprios agentes via Telegram), OpenClaw pra **cliente final**
+| Camada | Escolha |
+|--------|---------|
+| **WhatsApp WABA** | **NAVI** (mensageria/intent/Flow no `cargo-flow-navigator`) + **transporte Meta** no VectraClaw (`meta-whatsapp`, webhook, `whatsapp_templates`) |
+| **MVP enquanto NAVI não sobe** | Caminho A Miro: Meta → webhook **VectraClaw** + Morpheus `inbound-triage` (W9) |
+| **Hermes-Nous** | Runtime F1–F3 + MCP F2 + gateway **Telegram interno** (F4) — **não** substitui NAVI no WhatsApp |
+| ~~OpenClaw~~ | **REJEITADO** |
+| ~~Hermes como único canal WhatsApp~~ | **REJEITADO** (correção pós-decisão inicial B) |
 
 ### 1.1 Estado atual (verdade-base)
 
@@ -26,12 +30,12 @@ Schema VectraClaw já registra a intenção de canal:
 
 | Tabela | Coluna | Valores aceitos | Significado |
 |---|---|---|---|
-| `commercial_followup_rules` | `channel` | `openclaw`, `email`, `meta` | Canal de follow-up comercial — OpenClaw é cidadão de primeira classe |
+| `commercial_followup_rules` | `channel` | `openclaw`, `email`, `meta` | Legado: `openclaw` era reserva do gateway descartado — **migration TO-BE:** acrescentar `nous_hermes` (ou alias `hermes`) e migrar regras novas |
 | `commercial_followup_runs` | `channel` | mesmo CHECK | Histórico de envio |
 | `commercial_message_events` | `channel` | mesmo CHECK | Log de eventos |
 | `adapter_catalog` | `slug` | inclui `meta-whatsapp`, `mcp-slack`, `mcp-gmail`, `mcp-imap`, `mcp-github` | **Infraestrutura de conector já existe** |
 
-**Implicação:** o conector Meta-WhatsApp já está abstraído. Tanto OpenClaw quanto Hermes Gateway **consomem** esse adapter — nenhum dos dois reinventa integração com WhatsApp Business API.
+**Implicação:** o conector **`meta-whatsapp`** é a SSOT de transporte WABA no VectraClaw. **NAVI** orquestra conversa e chama APIs de intake no Claw; **Hermes** não registra o webhook Meta. Templates aprovados: tabela `whatsapp_templates` + sync Graph API (ver plano §5).
 
 ### 1.2 O que NÃO está em jogo
 
@@ -225,16 +229,16 @@ Sucesso rápido do Hermes interno cria gravidade que atrasa investimento em Open
 
 ---
 
-## 7. Recomendação preliminar (não vinculante)
+## 7. Decisão adotada (2026-05-19)
 
-**Caminho C (Híbrido) como hipótese inicial**, com a seguinte sequência:
+**Opção B — Hermes Gateway** para canal cliente (interno **e** cliente final na mesma stack).
 
-1. **Já em curso:** `PRD-NOUS-HERMES-INTEGRATION.md` (runtime interno + MCP server + adapter)
-2. **Pós-F3 do PRD principal:** subir 1 instance de `hermes gateway run` apontando pra Telegram, allowlist = só Marcelo + 2 colegas internos. SOUL.md = "assistente Vectra interno". Validar valor + observar trajectory + alimentar Athena HR
-3. **Após 30 dias de uso interno:** se trajectory mostrar uso recorrente em casos de uso cliente-replicáveis (cotação, status), iniciar POC OpenClaw em 1 company piloto com `cotacao-agent` apenas
-4. **Após POC OpenClaw funcional:** reavaliar este ADR com dados reais — pode confirmar híbrido ou consolidar em uma das opções
+Sequência de entrega (atualizada):
 
-Esta recomendação **não é decisão**. É hipótese a ser testada pelos gates §8.
+1. **Fases 1–3** do [`PRD-NOUS-HERMES-INTEGRATION.md`](./PRD-NOUS-HERMES-INTEGRATION.md) — runtime, MCP server Vectra, adapter CMA (pré-requisito).
+2. **Fase 4 (canal)** — `hermes gateway run` por company (ou estratégia multi-tenant em `companies.context_json` quando escala exigir); SOUL.md / branding Vectra; pairing + allowlist em catálogo (não hardcode).
+3. **Gates §8** — permanecem como **validação operacional** (custo, LGPD, branding), não como critério para escolher OpenClaw de novo.
+4. **Schema** — migration `channel` CHECK: incluir `nous_hermes`; novas regras comerciais usam esse valor; `openclaw` legado até backfill (opcional rename de rows históricas).
 
 ---
 
@@ -249,15 +253,11 @@ Decisão final só após **todos os gates respondidos com dado**, não com opini
 | G3 | Volume real esperado de tenants em 12 meses? | Forecast de vendas Vectra Cargo. <10 = container-per-tenant viável; ≥50 = obrigatório multi-tenant nativo | Marcelo |
 | G4 | Branding "Hermes" é aceitável pro cliente B2B fitness/logística? | Teste qualitativo com 3 clientes piloto: "qual sua reação ao mensageiro ser Hermes (Nous Research)?" | Marcelo / Hermes interno como POC |
 | G5 | LGPD: trafegar PII de cliente por OpenRouter+Nous é aceitável? | Consulta jurídica + DPA da OpenRouter + DPA da Nous (se aplicável). Threshold: ambos com cláusulas EU/BR-compatíveis | Marcelo + jurídico Vectra |
-| G6 | Cloudflare Worker + Supabase Auth aguenta multi-tenant 100+ companies? | Load test do POC OpenClaw. Threshold: 1000 req/s estáveis | POC OpenClaw |
+| G6 | Arquitetura gateway aguenta N companies? | Load test Hermes gateway + roteamento (container-per-tenant vs roteador único). Threshold definido em Fase 4 | Engenharia pós-F3 |
 | G7 | Skill creation autônoma do Hermes converge ou diverge? | Após 30d: contagem de skills geradas. Análise qualitativa: quantas são úteis vs ruído? | Athena HR via trajectory |
-| G8 | Time disponível pra manter 2 stacks (Híbrido)? | Inventário de carga atual + capacidade contratada | Marcelo |
+| G8 | ~~Time para 2 stacks~~ | **N/A** — decisão única stack Hermes | — |
 
-**Critério de fechamento:**
-- A maioria dos gates favorecendo A → fechar como **Opção A**
-- A maioria favorecendo B → fechar como **Opção B**
-- Resultado misto + G3/G4/G5/G6 todos positivos pra ambos → fechar como **Opção C**
-- Algum gate vermelho (G5 LGPD especialmente) → reabrir opções, possivelmente investigar Opção D (build próprio sem OpenClaw branding ou usar adapter LangChain)
+**Critério de fechamento (pós-decisão):** gates medem **viabilidade da Opção B**, não reabrem OpenClaw. Gate vermelho em G5 (LGPD) → mitigação (DPA, anonimização, modelo on-prem/Ollama no adapter) — **não** retorno a OpenClaw.
 
 ---
 
@@ -291,14 +291,14 @@ Decisão final só após **todos os gates respondidos com dado**, não com opini
 
 ---
 
-## 10. Próximas ações
+## 10. Próximas ações (pós-decisão B)
 
-1. **Não decidir agora.** Marcar este ADR como "Proposed, awaiting data"
-2. **Executar `PRD-NOUS-HERMES-INTEGRATION.md` (Fases 1-3)** — pré-requisito pra ter Hermes runtime utilizável
-3. **Executar `PRD-ATHENA-HR-TRAJECTORY-INGEST.md` (Fase 5.1)** — pré-requisito pra G1, G2, G7
-4. **Pós-F3:** subir Hermes Gateway interno na única company existente — `vectraclip.companies.name='VECTRA IA SERVICES'` (`company_id='01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2'`, tier=`enterprise`). **Nota:** `companies` NÃO tem coluna `slug` (verificado 2026-05-17 — só `company_id, name, tier, owner_user_id, context_json, mission`). Allowlist deve viver em catálogo (`gateway_allowlist` nova ou `companies.context_json.gateway_users`), **não hardcoded** — ver §13.2 (regra de ouro #2). Período: 30 dias
-5. **Coletar dados pros gates §8** durante esses 30 dias
-6. **Reabrir este ADR** com gates respondidos → mudar status pra `Accepted: Opção X`
+1. ~~Decidir OpenClaw vs Hermes~~ — **feito (Hermes).**
+2. **Executar PRD Fases 1–3** — runtime + MCP + adapter.
+3. **Especificar Fase 4 (canal)** no PRD — gateway, pairing, SOUL.md, integração `meta-whatsapp` / drivers Hermes.
+4. **Migration canal:** `ALTER CHECK` em `commercial_followup_*` para incluir `nous_hermes`.
+5. **Arquivar referências OpenClaw** — skill `openclaw-integration.md` = legado; não usar em novos PRs.
+6. **Coletar gates §8** durante dogfood (custo, LGPD, branding) — mitigar riscos da Opção B, não reverter stack.
 
 ---
 
@@ -315,7 +315,7 @@ Decisão final só após **todos os gates respondidos com dado**, não com opini
 ## 12. Anexos
 
 - Plano de execução interno: `~/.claude/plans/graceful-sparking-flamingo.md`
-- Skill OpenClaw documentada: `~/.claude/skills/vectra-mcp-builder/references/openclaw-integration.md`
+- ~~Skill OpenClaw~~ (legado, não usar): `~/.claude/skills/vectra-mcp-builder/references/openclaw-integration.md`
 - Documentação Hermes-Nous: https://hermes-agent.nousresearch.com/docs
 - ADR irmão: `docs/ADR-VEC-MAPEAR-ANALISAR-AUTOMATIZAR.md`
 - Schema `commercial_followup_rules.channel`: `supabase/migrations/20260506025418_remote_schema.sql:3718`

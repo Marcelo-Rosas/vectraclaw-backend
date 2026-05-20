@@ -1,6 +1,8 @@
 # ADR-VEC-INBOUND-INTENT-CLASSIFIER
 
-> **Status:** OPEN — aguarda decisão Marcelo antes de qualquer correção adicional no fluxo inbound
+> **Status:** **Accepted — Opção A (Morpheus `inbound-triage`)** — implementado W9 (2026-05-18). Migration `20260518133157_morpheus_inbound_triage.sql`.  
+> **Plano canal:** [`PLAN-CANAL-MENSAGERIA-NAVI-HERMES.md`](./PLAN-CANAL-MENSAGERIA-NAVI-HERMES.md)  
+> **Nota:** Opção C (NAVI classifica) continua válida como evolução; não invalida W9 no MVP.
 >
 > **Data:** 2026-05-18
 >
@@ -129,13 +131,12 @@ VectraClaw apenas recebe payloads JÁ ESTRUTURADOS via endpoints específicos po
 
 A se justifica se houver decisão de "Morpheus é o classifier universal mesmo a longo prazo". Caso contrário, B é mais barato e converte naturalmente em C.
 
-## Decisões pendentes (Marcelo)
+## Decisões fechadas
 
-1. **Qual opção (A/B/C)?**
-2. Se B: subopção B1/B2/B3?
-3. Se A ou B com tabela: nome da tabela e schema?
-4. Catálogo inicial de intents: quais slugs já criar? (freight-quotation existe; hr-intake novo? order-status?)
-5. O que Mercator faz se receber task com dados incompletos? **erro útil + sugestão** ou marca blocked? (independente da opção escolhida)
+1. **Opção A (Morpheus)** — ✅ W9. `whatsapp` → `default_inbound_operation_type = inbound-triage`; `fallback_operation_type = human-triage`.
+2. Tabela: **`inbound_intent_rules`** (company-scoped, priority, keywords/regex/button_id).
+3. **NAVI (Opção C)** — roadmap CFN; webhook permanece no Claw até NAVI N1.
+4. Mercator com dados incompletos — **Fase 1 do plano canal:** `output_text` com perguntas + `human-triage` quando sem match.
 
 ## Não fazer enquanto a decisão não fechar
 
