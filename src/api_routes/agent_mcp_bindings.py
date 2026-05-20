@@ -521,6 +521,37 @@ async def delete_company_mcp_value(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/agents/{agent_id}/mcp-tools")
+@router.get("/agents/{agent_id}/mcp-tools")
+async def list_agent_mcp_tools_route(request: Request, agent_id: str = Path(...)) -> List[Dict[str, Any]]:
+    """Tools MCP disponíveis pro agente (prefixadas + whitelist), prontas pra
+    injetar no loop do provider. Frente b."""
+    _resolve_company(request)
+    from src.api import supabase
+    from src.services.mcp_tool_runner import list_agent_mcp_tools
+    if not supabase:
+        return []
+    return list_agent_mcp_tools(supabase, agent_id)
+
+
+@router.post("/api/agents/{agent_id}/mcp-tools/call")
+@router.post("/agents/{agent_id}/mcp-tools/call")
+async def call_agent_mcp_tool_route(
+    request: Request, agent_id: str = Path(...), payload: Dict[str, Any] = Body(...)
+) -> Dict[str, Any]:
+    """Executa UMA tool MCP (o "dedo"). Body: {name: mcp__server__tool, arguments: {}}.
+    Resolve binding + creds company + whitelist + call_tool."""
+    company_id = _resolve_company(request)
+    from src.api import supabase
+    from src.services.mcp_tool_runner import execute_mcp_tool
+    if not supabase:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    name = payload.get("name")
+    if not name:
+        raise HTTPException(status_code=422, detail="name_required")
+    return execute_mcp_tool(supabase, company_id, agent_id, name, payload.get("arguments") or {})
+
+
 @router.post("/api/companies/{company_id}/mcp-values/{server_id}/handshake")
 @router.post("/companies/{company_id}/mcp-values/{server_id}/handshake")
 async def handshake_company_mcp_value(
