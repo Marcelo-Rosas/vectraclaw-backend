@@ -62,7 +62,14 @@
 
 ---
 
-## 🟣 PR7 — agent_daemon.py dispatch por op_type literal → `operation_types_catalog` `[ESTRUTURAL — separado]`
+## 🟡 PR7 Fase 1 — dispatch catalog-driven (fast-path + fallback) `[FEITO #289]`
+- **Decisão Marcelo:** Full catalog-driven (faseado). Fase 1 = 11 exact-match sem side-effect.
+- migration `20260520170000`: cols handler_module/function/is_async/pass_supabase + backfill 11 (oracle-report pass_supabase=false).
+- `_try_catalog_dispatch` no topo de execute_task (cache TTL 120s); falha/ausência → if-chain legada intacta.
+- Removido rag-ingest duplicado (dead code).
+- **Fase 2 (futuro):** prefixos athena-*/bpmn-*/oracle-* + side-effect oracle-research + audit-review/dispatch-research.
+
+## 🟣 PR7 Fase 2 — dispatch por prefixo + side-effects `[ESTRUTURAL — futuro]`
 - **Arquivo:linha:** `agent_daemon.py:548-661` — dispatch roteia por string literal de operation_type.
 - **Tabela espelho:** `operation_types_catalog` (55+ rows JÁ existe) + as 3 listas sincronizadas (Pydantic em `models.py` + CHECK no DB + dispatch).
 - **Risco:** estrutural — impede roteamento dinâmico; é a raiz do caso `oracle-report` (op_type content-specific cravado).
