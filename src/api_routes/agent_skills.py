@@ -74,7 +74,10 @@ async def list_agent_skills(
         # Filtro company_id obrigatório (Regra Ouro auditor P1.3).
         q = (
             supabase.table("agent_specialty_configs")
-            .select("id,agent_id,specialty_id,values,agents(name),agent_specialties(name)")
+            .select(
+                "id,agent_id,specialty_id,values,"
+                "agents(name),agent_specialties(slug,name)"
+            )
             .eq("company_id", company_id)
         )
         if agent_id:
@@ -96,11 +99,18 @@ async def list_agent_skills(
             agents_join = r.get("agents") or {}
             specialties_join = r.get("agent_specialties") or {}
 
+            # specialty_id é FK → agent_specialties.id (UUID). O canvas precisa do slug legível.
+            specialty_slug = (
+                specialties_join.get("slug")
+                if isinstance(specialties_join, dict)
+                else None
+            )
+
             skills.append({
                 "id": r.get("id"),
                 "agentId": r.get("agent_id"),
                 "agentName": agents_join.get("name") if isinstance(agents_join, dict) else None,
-                "specialtySlug": r.get("specialty_id"),
+                "specialtySlug": specialty_slug or r.get("specialty_id"),
                 "specialtyName": specialties_join.get("name") if isinstance(specialties_join, dict) else None,
                 "operationTypes": op_types,
                 "values": values,
