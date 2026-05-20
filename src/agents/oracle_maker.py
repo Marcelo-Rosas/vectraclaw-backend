@@ -3,7 +3,7 @@ import re
 from typing import Any, Dict
 
 from src.agents.oracle import build_oracle_prompt
-from src.services.gemini_client import DEFAULT_MODEL, stream_generate
+from src.services.oracle_llm_stream import stream_oracle_response
 from src.services.oracle_session import get_stream_queue
 
 logger = logging.getLogger("OracleMaker")
@@ -102,7 +102,7 @@ async def run_maker(state: Dict[str, Any]) -> Dict[str, Any]:
 
     full_text = ""
     try:
-        async for chunk in stream_generate(DEFAULT_MODEL, user_prompt, system_instruction=system):
+        async for chunk in stream_oracle_response(user_prompt, system_instruction=system):
             if q is not None:
                 await q.put({"type": "delta", "content": chunk})
             full_text += chunk
