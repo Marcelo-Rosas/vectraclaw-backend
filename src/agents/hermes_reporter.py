@@ -114,13 +114,25 @@ def render_html(
     markdown_report: str,
     subject: str,
     *,
-    header_title: str = "Vectra Cargo — Auditoria Financeira",
-    footer_text: str = "Relatório gerado automaticamente pelo Kronos • Vectra Claw",
+    company_name: str | None = None,
+    report_type: str | None = None,
+    header_title: str | None = None,
+    footer_text: str | None = None,
 ) -> str:
     """
-    Converte relatório markdown em HTML com template fixo e consistente.
+    Converte relatório markdown em HTML com template consistente.
     Mesmo input → mesmo output sempre.
+
+    Regra de Ouro #2: header/footer NÃO são tenant-locked. Derivam de
+    `company_name` (de companies.name) + `report_type` (genérico, do payload).
+    `header_title`/`footer_text` explícitos têm precedência (override).
     """
+    company = (company_name or "VectraClaw").strip()
+    rtype = (report_type or "").strip()
+    if header_title is None:
+        header_title = f"{company} — {rtype}" if rtype else company
+    if footer_text is None:
+        footer_text = f"Relatório gerado automaticamente • {company} • VectraClaw"
     sections = _parse_markdown_sections(markdown_report)
 
     body_html = ""
@@ -305,6 +317,29 @@ def _build_workflow_report_markdown(parent_task_id: str) -> str:
     return "\n".join(lines)
 
 
+def _resolve_company_name(company_id: str | None) -> str:
+    """Lê companies.name (catalog-driven). Fallback genérico 'VectraClaw' —
+    nunca 'Vectra Cargo' cravado (Regra #2: header do e-mail não é tenant-lock)."""
+    if not company_id:
+        return "VectraClaw"
+    try:
+        from src.api import supabase
+        if supabase:
+            r = (
+                supabase.table("companies")
+                .select("name")
+                .eq("company_id", company_id)
+                .limit(1)
+                .execute()
+            )
+            name = ((r.data[0].get("name") if r.data else None) or "").strip()
+            if name:
+                return name
+    except Exception as exc:
+        logger.warning("HermesReporter: falha ao ler companies.name (%s)", exc)
+    return "VectraClaw"
+
+
 def entrypoint(task: dict) -> dict:
     """Ponto de entrada chamado pelo agent_daemon para operation_type='oracle-report'."""
     desc = task.get("description", "")
@@ -380,11 +415,24 @@ def entrypoint(task: dict) -> dict:
         logger.error("HermesReporter: relatório vazio na task %s", task.get("id"))
         return {"status": "errored", "error": "empty markdown body"}
 
-    subject = subject_hint or "Auditoria Financeira — Kronos"
-    logger.info("HermesReporter: renderizando HTML fixo para '%s' → %s", subject, recipients)
+    # Catalog-driven: company de companies.name; report_type do payload
+    # (input_json.report_type ou REPORT_TYPE na desc), genérico — não "Kronos".
+    company_name = _resolve_company_name(task.get("company_id"))
+    rt_match = re.search(r"^REPORT_TYPE:\s*(.+)$", desc, re.M)
+    report_type = (
+        str(input_json.get("report_type") or "").strip()
+        or (rt_match.group(1).strip() if rt_match else "")
+        or None
+    )
+    subject = subject_hint or (
+        f"{report_type} — {company_name}" if report_type else f"Relatório — {company_name}"
+    )
+    logger.info("HermesReporter: renderizando HTML para '%s' → %s", subject, recipients)
 
     try:
-        html_body = render_html(markdown, subject)
+        html_body = render_html(
+            markdown, subject, company_name=company_name, report_type=report_type
+        )
     except Exception as e:
         logger.error("HermesReporter: render_html falhou — %s", e)
         return {"status": "errored", "error": f"render_html failed: {e}"}

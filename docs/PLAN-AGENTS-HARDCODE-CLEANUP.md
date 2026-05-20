@@ -41,11 +41,17 @@
 
 ---
 
-## 🟡 PR5 — hermes_reporter.py header/subject tenant-locked
-- **Arquivo:linha:** `hermes_reporter.py:117-118` (`render_html` defaults) + `:383` (subject fallback `"Auditoria Financeira — Kronos"`).
-- **Tabela espelho:** `companies.name` + `operation_types_catalog` (tipo do relatório).
-- **Fix:** `render_html()` recebe `company_name` + `report_type` obrigatórios; subject derivado deles.
-- **Conecta com a provocação cotação:** este PR prepara o Hermes Reporter pra ser genérico (header/assunto por payload, não cravado em "Auditoria Kronos") — pré-requisito do fluxo de resposta de cotação.
+## ✅ PR5 — hermes_reporter.py header/subject tenant-locked `[FEITO #287]`
+- **Arquivo:linha:** `hermes_reporter.py:117-118` (`render_html` defaults) + `:383` (subject fallback).
+- **Tabela espelho:** `companies.name`.
+- **Fix:** `render_html(..., company_name=None, report_type=None)` deriva header/footer de `companies.name` + report_type do payload; `_resolve_company_name(company_id)` lê DB; subject fallback genérico. Também corrigido o caller gêmeo em `agent_daemon.py:1059` ("Vectra Cargo — Oracle Research" → params genéricos).
+- **Conecta com cotação:** Hermes Reporter agora genérico (header/assunto por payload) — pré-requisito do fluxo de resposta de cotação.
+
+## 🔴 PR8 — agent_daemon.py:1052 recipient literal (NOVO — achado no PR5)
+- **Arquivo:linha:** `agent_daemon.py:1052` — `os.getenv("ORACLE_REPORT_EMAIL", "marcelo.rosas@vectracargo.com.br")` no envio do oracle-research report.
+- **Risco P1:** mesma classe do kronos DEFAULT_RECIPIENT — multi-tenant vaza relatório Oracle pro e-mail pessoal do Marcelo.
+- **Tabela espelho:** `companies.notification_email` (já criada no #286).
+- **Fix:** resolver de `companies.notification_email` pelo company_id da task; fail-loud se ausente.
 
 ---
 
