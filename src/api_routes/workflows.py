@@ -33,9 +33,9 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from postgrest.exceptions import APIError as PostgrestAPIError
 
 from src.models import TaskBlueprint, WorkflowStepRich
+from src.postgrest_errors import PostgrestAPIError
 
 logger = logging.getLogger("api.workflows")
 router = APIRouter(tags=["workflows"])
@@ -207,8 +207,13 @@ def _persist_workflow_steps(
             "proximo_step_codes": prox,
             "default_operation_type": s.default_operation_type,
             "specialty_slug": s.default_assigned_specialty_slug,
+            "trigger_type": (s.trigger_type or "realtime").strip() or "realtime",
+            "trigger_config": dict(s.trigger_config or {}),
+            "agent_specialty_config_id": s.agent_specialty_config_id,
             "active": True,
         }
+        if s.sipoc_meta is not None:
+            row["sipoc_meta"] = dict(s.sipoc_meta)
         opt_json = {
             "suppliers": s.suppliers,
             "inputs": s.inputs,

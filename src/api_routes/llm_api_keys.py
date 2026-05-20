@@ -26,7 +26,9 @@ _ADMIN_ROLES = {"admin", "owner", "root"}
 def _resolve_caller(request: Request) -> tuple[str, str, Optional[str]]:
     company_id = getattr(request.state, "company_id", None)
     user_id = getattr(request.state, "user_id", None)
-    role = getattr(request.state, "user_role", None)
+    role = getattr(request.state, "role", None) or getattr(
+        request.state, "user_role", None
+    )
     if not company_id or not user_id:
         raise HTTPException(status_code=401, detail="unauthenticated")
     return str(company_id), str(user_id), (str(role) if role else None)

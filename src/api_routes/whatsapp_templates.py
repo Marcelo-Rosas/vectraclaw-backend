@@ -20,12 +20,19 @@ logger = logging.getLogger("api.whatsapp_templates")
 
 router = APIRouter(tags=["whatsapp-templates"])
 
+# JWT vectraclip.role → admin | member (_zod_user_role em api.py). owner/founder
+# ficam reservados se o claim evoluir; hoje só admin passa o gate de sync.
+_SYNC_ADMIN_ROLES = frozenset({"admin", "owner", "founder"})
+
 
 def _resolve_caller(request: Request) -> tuple[str, str, Optional[str]]:
     """Devolve (company_id, user_id, role). Levanta 401 se faltam."""
     company_id = getattr(request.state, "company_id", None)
     user_id = getattr(request.state, "user_id", None)
-    role = getattr(request.state, "user_role", None)
+    # Middleware grava request.state.role (não user_role).
+    role = getattr(request.state, "role", None) or getattr(
+        request.state, "user_role", None
+    )
     if not company_id or not user_id:
         raise HTTPException(status_code=401, detail="unauthenticated")
     return str(company_id), str(user_id), (str(role) if role else None)
@@ -99,16 +106,16 @@ async def sync_whatsapp_templates(
     """
     company_id, user_id, role = _resolve_caller(request)
 
-    if role and role.lower() not in ("admin", "owner", "founder"):
+    if (role or "").lower() not in _SYNC_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="admin_only")
 
     from src.api import supabase
     if not supabase:
         raise HTTPException(status_code=503, detail="supabase_unavailable")
 
-    # Resolve adapter_id se não veio
-    if not adapter_id:
-        try:
+    try:
+        # Resolve adapter_id se não veio
+        if not adapter_id:
             ac = (
                 supabase.table("adapter_catalog")
                 .select("id")
@@ -119,21 +126,30 @@ async def sync_whatsapp_templates(
                 .execute()
             )
             if not ac.data:
-                raise HTTPException(status_code=404,
-                                    detail="meta_whatsapp_adapter_not_configured")
+                raise HTTPException(
+                    status_code=404,
+                    detail="meta_whatsapp_adapter_not_configured",
+                )
             adapter_id = ac.data[0]["id"]
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"adapter_lookup_failed: {e}")
 
-    from src.services.whatsapp_template_sync import sync_company_templates
-    result = await sync_company_templates(
-        company_id=company_id,
-        adapter_id=str(adapter_id),
-        triggered_by_user_id=user_id,
-    )
-    return result
+        from src.services.whatsapp_template_sync import sync_company_templates
+
+        return await sync_company_templates(
+            company_id=company_id,
+            adapter_id=str(adapter_id),
+            triggered_by_user_id=user_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "sync_whatsapp_templates failed company=%s adapter=%s: %s",
+            company_id,
+            adapter_id,
+            e,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=f"sync_failed: {e}") from e
 
 
 # ─────────────────────────────────────────────────────────────────────────────
