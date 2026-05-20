@@ -98,8 +98,26 @@ def build_oracle_prompt(payload: dict) -> tuple[str, str]:
     if event == "stage_intro":
         comp_type = context.get("component_type", "")
         type_label = _SIPOC_TYPE_LABELS.get(comp_type, comp_type)
+        # A.5/D10: objetivo criado seeda a introducao do Oracle (nao chat em branco).
+        # goal vem top-level (OracleChatRequest.goal) ou em context.goal.
+        goal = payload.get("goal") or context.get("goal") or {}
+        goal_block = ""
+        if isinstance(goal, dict) and (goal.get("title") or goal.get("description")):
+            _t = goal.get("title") or ""
+            _d = goal.get("description") or ""
+            goal_block = (
+                f"\nO objetivo declarado pelo cliente é: \"{_t}\".\n"
+                f"{('Detalhe: ' + _d) if _d else ''}\n"
+                f"- Abra reconhecendo esse objetivo em 1 frase (mostra que entendeu o porquê do mapeamento)\n"
+            )
+        elif isinstance(goal, str) and goal.strip():
+            goal_block = (
+                f"\nO objetivo declarado pelo cliente é: \"{goal.strip()}\".\n"
+                f"- Abra reconhecendo esse objetivo em 1 frase\n"
+            )
         user_prompt = (
-            f"Apresente a etapa '{stage_label}' do SIPOC de forma didática.\n"
+            f"Apresente a etapa '{stage_label}' do SIPOC de forma didática."
+            f"{goal_block}\n"
             f"- Explique o que são {type_label}s no contexto de '{domain}' (1-2 frases)\n"
             f"- Dê 2-3 exemplos típicos para esse domínio\n"
             f"- Termine pedindo o primeiro item\n"
