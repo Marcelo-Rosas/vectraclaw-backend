@@ -192,6 +192,47 @@ async def route_task_execution(
                 row = res.data[0]
                 field_values = row.get("field_values_json") or {}
                 provider = (row.get("adapter_catalog") or {}).get("provider") or "anthropic"
+                # W5 hybrid resolve: company_adapter_values é PRIMARY, agent override
+                # por cima. O router antes lia só o agent config — creds salvas no
+                # company-level (/admin/connectors) não chegavam ao client. Mescla aqui.
+                adapter_id = None
+                try:
+                    ac_row = (
+                        supabase_client.table("agent_adapter_configs")
+                        .select("adapter_id")
+                        .eq("agent_id", agent_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    adapter_id = ac_row.data[0].get("adapter_id") if ac_row.data else None
+                    if adapter_id and company_id:
+                        cv = (
+                            supabase_client.table("company_adapter_values")
+                            .select("field_values_json")
+                            .eq("company_id", company_id)
+                            .eq("adapter_id", adapter_id)
+                            .limit(1)
+                            .execute()
+                        )
+                        if cv.data:
+                            company_vals = cv.data[0].get("field_values_json") or {}
+                            # company primary, agent override (só sobrescreve não-vazios)
+                            merged = dict(company_vals)
+                            merged.update({k: v for k, v in field_values.items() if v not in (None, "")})
+                            field_values = merged
+                    # Resolve vault:// refs → texto claro (groq/hf leem key do config;
+                    # anthropic usa env). resolve_secret_ref em src.api (lazy).
+                    if company_id and field_values:
+                        try:
+                            from src.api import resolve_secret_ref
+                            field_values = {
+                                k: (resolve_secret_ref(v, company_id) if isinstance(v, str) and v.startswith("vault://") else v)
+                                for k, v in field_values.items()
+                            }
+                        except Exception as e:
+                            logger.warning(f"Router: resolve vault refs falhou agent_id={agent_id}: {e}")
+                except Exception as e:
+                    logger.warning(f"Router: company_adapter_values merge falhou agent_id={agent_id}: {e}")
         except Exception as e:
             logger.warning(f"Router: provider lookup falhou agent_id={agent_id}: {e}")
 
