@@ -646,6 +646,18 @@ class ResilientHarnessDaemon:
             result = self._dispatch_research(task)
             return _json.dumps(result)
 
+        # PR M Skillforge — local-first skills (prefix skillforge:sf-*).
+        # SKILLFORGE_ENABLED=0 disables without affecting other handlers.
+        from src.services.skillforge_adapter import (
+            is_skillforge_operation,
+            run_skill_for_task,
+            skillforge_enabled,
+        )
+
+        if skillforge_enabled() and is_skillforge_operation(op_type):
+            result = run_skill_for_task(task)
+            return _json.dumps(result)
+
         if op_type == "rag-ingest":
             from src.agents.mnemos import entrypoint as mnemos_entry
             result = mnemos_entry(task, self._get_supabase())

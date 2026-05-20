@@ -236,6 +236,7 @@ class WorkflowStepRich(CamelModel):
     trigger_type: Optional[str] = None
     trigger_config: Dict[str, Any] = Field(default_factory=dict)
     agent_specialty_config_id: Optional[str] = None
+    sipoc_meta: Optional[Dict[str, Any]] = None
 
     class Config:
         alias_generator = to_camel
@@ -750,6 +751,9 @@ class AgentSpecialty(CamelModel):
     system_prompt_template: Optional[str] = None
     config_schema: Optional[List[Dict[str, Any]]] = None
     is_active: bool = True
+    # S3-A — governança catálogo (PRD Skills Library v2 §3.3)
+    status: Literal["active", "deprecated", "experimental", "community"] = "active"
+    source: Literal["internal", "import_csv", "athena", "skillforge"] = "internal"
 
     def to_zod_dict(self):
         d = self.dict(by_alias=True)
