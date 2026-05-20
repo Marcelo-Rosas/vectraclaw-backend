@@ -155,7 +155,7 @@ async def _handle_classify(prompt: str, input_data: Dict[str, Any]) -> Dict[str,
     import json as _json
 
     from src.agents.athena_schemas import ClassifyOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -236,11 +236,12 @@ async def _handle_classify(prompt: str, input_data: Dict[str, Any]) -> Dict[str,
     user_prompt = _build_classify_prompt(goal, company_context, rag_chunks)
 
     try:
-        text, metadata = await gemini_generate(
-            _resolve_model(input_data),
+        text, metadata = await generate_for_agent(
+            ATHENA_AGENT_ID,
             user_prompt,
             system_instruction=system_instruction,
             response_mime_type="application/json",
+            fallback_model=_resolve_model(input_data),
         )
     except Exception as exc:
         logger.exception("athena-classify gemini call failed task=%s", task_id)
@@ -483,7 +484,7 @@ async def _handle_charter(prompt: str, input_data: Dict[str, Any]) -> Dict[str, 
     import json as _json
 
     from src.agents.athena_schemas import CharterOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -580,11 +581,12 @@ async def _handle_charter(prompt: str, input_data: Dict[str, Any]) -> Dict[str, 
     # 5) Gemini
     user_prompt = _build_charter_prompt(goal, company_context, rag_chunks)
     try:
-        text, metadata = await gemini_generate(
-            _resolve_model(input_data),
+        text, metadata = await generate_for_agent(
+            ATHENA_AGENT_ID,
             user_prompt,
             system_instruction=_CHARTER_SYSTEM_PROMPT,
             response_mime_type="application/json",
+            fallback_model=_resolve_model(input_data),
         )
     except Exception as exc:
         logger.exception("athena-charter gemini call failed task=%s", task_id)
@@ -810,7 +812,7 @@ async def _handle_stakeholder_map(prompt: str, input_data: Dict[str, Any]) -> Di
     import json as _json
 
     from src.agents.athena_schemas import StakeholderMapOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -1137,7 +1139,7 @@ async def _handle_risk_register(prompt: str, input_data: Dict[str, Any]) -> Dict
     import json as _json
 
     from src.agents.athena_schemas import RiskRegisterOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -1734,7 +1736,7 @@ async def _handle_evm(prompt: str, input_data: Dict[str, Any]) -> Dict[str, Any]
     import json as _json
 
     from src.agents.athena_schemas import EVMOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -2050,7 +2052,7 @@ async def _handle_audit(prompt: str, input_data: Dict[str, Any]) -> Dict[str, An
     import json as _json
 
     from src.agents.athena_schemas import AuditOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -2407,7 +2409,7 @@ async def _handle_recommend(prompt: str, input_data: Dict[str, Any]) -> Dict[str
     import json as _json
 
     from src.agents.athena_schemas import RecommendOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -3124,7 +3126,7 @@ async def _handle_prioritize(prompt: str, input_data: Dict[str, Any]) -> Dict[st
     import json as _json
 
     from src.agents.athena_schemas import PrioritizeOutput, ValidationBlock
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
@@ -3627,7 +3629,7 @@ async def _handle_onboarding(prompt: str, input_data: Dict[str, Any]) -> Dict[st
         Mnemos polling não pega automaticamente, requer retry manual)
     """
     from datetime import datetime as _dt, timezone as _tz
-    from src.services.gemini_client import generate as gemini_generate
+    from src.services.agent_llm import generate_for_agent
 
     started_at = _dt.now(_tz.utc).isoformat()
     supabase = input_data.get("_supabase")
