@@ -1,10 +1,12 @@
 fastapi>=0.110.0,<1
 uvicorn==0.23.2
 supabase>=2.5.0,<3
+postgrest>=2.5.0,<3  # direct import (api_routes, api.py) — also pulled by supabase
 python-dotenv==1.0.0
 pydantic>=2.13,<3
 python-jose[cryptography]==3.3.0
 requests==2.31.0
+httpx>=0.27.0,<1
 pdfplumber>=0.11.0
 reportlab>=4.0,<5
 python-multipart>=0.0.9
@@ -19,3 +21,6 @@ ofxparse>=0.21
 pytest>=8.0.0
 playwright>=1.40.0
 PyYAML>=6.0
+# Skillforge (PR M Skills Library v2) — optional CC BY-SA business skills library.
+# Adapter falls back to local-first stubs when not installed.
+# skills-ia-empresariales @ git+https://github.com/chema74/skills-ia-empresariales.git@main
