@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.services.rag.embedder import FallbackEmbedder, GeminiEmbedder, OpenAIEmbedder
 from src.services.rag.models import ChunkResult
 
 logger = logging.getLogger("Athena.RAG")
@@ -55,8 +54,8 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
     Args:
         task: dict da row vectraclip.tasks (id, input_json, company_id, ...).
         supabase: client com service_role (do daemon).
-        embedder: injetável para testes; default cria FallbackEmbedder
-                  (OpenAI primário, Gemini fallback) igual ao Mnemos.
+        embedder: injetável para testes; default resolve_embedder()
+                  (catalog-driven, Ollama nomic 768-dim) igual ao Mnemos.
 
     Returns:
         dict com status ('done' | 'errored'), chunks_inserted, page_count, error.
@@ -204,7 +203,7 @@ async def query_top_k(
     *,
     k: int = 5,
     min_score: float = 0.0,
-    embedder: Optional[OpenAIEmbedder] = None,
+    embedder: Optional[object] = None,
     supabase_client=None,
 ) -> List[ChunkResult]:
     """Embed pergunta + busca top-k chunks Athena via pgvector cosine.
@@ -217,7 +216,7 @@ async def query_top_k(
         company_id: UUID da company. Obrigatório (multi-tenant).
         k: top-k chunks a retornar (default 5).
         min_score: score mínimo (0..1) para filtrar resultado ruim.
-        embedder: instance reutilizável; se None, cria nova OpenAIEmbedder.
+        embedder: instance reutilizável; se None, usa resolve_embedder().
         supabase_client: injetável para testes; default usa src.api.supabase.
 
     Returns:

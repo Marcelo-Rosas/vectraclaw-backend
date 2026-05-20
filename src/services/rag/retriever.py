@@ -2,7 +2,7 @@
 Retriever: query_top_k via Supabase RPC `match_rag_chunks`.
 
 Pipeline:
-1. Embed da pergunta (OpenAIEmbedder)
+1. Embed da pergunta (resolve_embedder — catalog-driven)
 2. RPC com query_embedding + p_company_id + p_match_count
 3. Retorna ChunkResult[] ordenado por score DESC (1.0 = idêntico, 0.0 = oposto)
 
@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from .embedder import FallbackEmbedder, GeminiEmbedder, OpenAIEmbedder
 from .models import ChunkResult
 
 logger = logging.getLogger("rag.retriever")
@@ -27,7 +26,7 @@ async def query_top_k(
     *,
     k: int = 5,
     min_score: float = 0.0,
-    embedder: Optional[OpenAIEmbedder] = None,
+    embedder: Optional[object] = None,
     supabase_client=None,
 ) -> List[ChunkResult]:
     """Embed pergunta + busca top-k chunks da company via pgvector cosine.
@@ -37,7 +36,7 @@ async def query_top_k(
         company_id: UUID da company. Obrigatório (multi-tenant).
         k: top-k chunks a retornar (default 5).
         min_score: score mínimo (0..1) para filtrar resultado ruim.
-        embedder: instance reutilizável; se None, cria nova OpenAIEmbedder.
+        embedder: instance reutilizável; se None, usa resolve_embedder().
         supabase_client: injetável para testes; default usa src.api.supabase.
 
     Returns:

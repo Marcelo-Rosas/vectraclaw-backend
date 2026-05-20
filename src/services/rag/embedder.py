@@ -288,13 +288,16 @@ class OllamaEmbedder:
         return out
 
 
-def resolve_embedder(agent_id: str = "00000000-0000-0000-0000-000000000003"):
+def resolve_embedder(agent_id: Optional[str] = None):
     """Catalog-driven (Regra #2): resolve o embedder pelo adapter do agente
     (default Mnemos). Lê agent_adapter_configs + W5 company values + vault →
     provider/model/base_url/dimensions. ollama→OllamaEmbedder; google→Gemini;
     openai→OpenAI. Sem config → fallback Ollama local (nomic).
 
     Single-tenant dev: resolve por agent_id (limit 1)."""
+    if agent_id is None:
+        from src.agent_ids import MNEMOS_AGENT_ID
+        agent_id = MNEMOS_AGENT_ID
     provider = None
     model = None
     base_url = None
