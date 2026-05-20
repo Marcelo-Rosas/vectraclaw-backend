@@ -10,7 +10,7 @@ Inputs via task.description:
   PLANNER_PATH=<caminho absoluto .csv ou .xlsx>
   PERIODO_INICIO=YYYY-MM-DD   (opcional)
   PERIODO_FIM=YYYY-MM-DD      (opcional)
-  RECIPIENT=email@ex.com      (opcional, default: marcelo.rosas@vectracargo.com.br)
+  RECIPIENT=email@ex.com      (opcional; se ausente usa companies.notification_email)
 """
 from __future__ import annotations
 
@@ -30,14 +30,34 @@ logger = logging.getLogger("Kronos")
 
 from src.agent_ids import HERMES_REPORTER_AGENT_ID as HERMES_REPORTER_UUID  # SSOT (alias preserva nome local)
 
-# F5 N5: email pessoal era literal hardcoded em 3 callsites (default param +
-# 2 fallbacks `.get("RECIPIENT", DEFAULT_RECIPIENT)`). Mover pra env var.
-# Idealmente recipient vem de agent_specialty_configs.values.recipient (mesmo
-# pattern de HermesReporter) — env é fallback dev/test.
-DEFAULT_RECIPIENT = os.getenv(
-    "KRONOS_DEFAULT_RECIPIENT",
-    "marcelo.rosas@vectracargo.com.br",  # fallback dev
-)
+# Regra de Ouro #2: o destinatário do relatório NÃO mora no .py. SSOT =
+# vectraclip.companies.notification_email (config por company). Cadeia de
+# resolução (sem fallback literal — vazar relatório financeiro pro e-mail
+# errado em multi-tenant é P1): RECIPIENT explícito na task → company →
+# erro (fail-loud, daemon marca task errored em vez de chutar e-mail).
+def _resolve_recipient(client: Any, company_id: str, inputs: dict) -> str:
+    explicit = (inputs.get("RECIPIENT") or "").strip()
+    if explicit:
+        return explicit
+    if client and company_id:
+        try:
+            r = (
+                client.table("companies")
+                .select("notification_email")
+                .eq("company_id", company_id)
+                .limit(1)
+                .execute()
+            )
+            email = ((r.data[0].get("notification_email") if r.data else None) or "").strip()
+            if email:
+                return email
+        except Exception as exc:
+            logger.warning("Kronos: falha ao ler companies.notification_email (%s)", exc)
+    raise ValueError(
+        "Kronos: destinatário não resolvido — configure "
+        f"companies.notification_email para company_id={company_id!r} "
+        "ou informe RECIPIENT na task."
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data types
@@ -1044,7 +1064,11 @@ def load_rules_from_db(client) -> dict:
                     len(expense), len(revenue))
         return {"expense": expense, "revenue": revenue}
     except Exception as exc:
-        logger.warning("load_rules_from_db falhou (%s) — usando regras hardcoded", exc)
+        logger.warning(
+            "load_rules_from_db falhou (%s) — usando regras hardcoded "
+            "[rules_source=hardcoded_fallback — kronos_rules indisponível, "
+            "auditoria pode rodar com regras desatualizadas]", exc,
+        )
         return {"expense": _EXPENSE_RULES, "revenue": _REVENUE_RULES}
 
 
@@ -1310,7 +1334,7 @@ def dispatch_to_hermes_reporter(
     company_id: str,
     kronos_task_id: str,
     markdown: str,
-    recipient: str = DEFAULT_RECIPIENT,
+    recipient: str,
     period_label: str = "",
 ) -> str:
     """Materializa workflow global `kronos-hermes-handoff` (VEC-334). Retorna ID da subtask oracle-report."""
@@ -1533,7 +1557,7 @@ def entrypoint(task: dict, supabase_client: Any) -> dict:
 
     ofx_path     = inputs.get("OFX_PATH", "")
     planner_path = inputs.get("PLANNER_PATH", "")
-    recipient    = inputs.get("RECIPIENT", DEFAULT_RECIPIENT)
+    recipient    = _resolve_recipient(supabase_client, company_id, inputs)
     apply_baixa  = inputs.get("APPLY_BAIXA", "false").lower() in ("true", "1", "yes")
 
     if not ofx_path or not planner_path:
@@ -1665,9 +1689,9 @@ def entrypoint_backlog(task: dict, supabase_client: Any) -> dict:
     ofx_path       = inputs.get("OFX_PATH", "")
     periodo_inicio = inputs.get("PERIODO_INICIO", "")
     periodo_fim    = inputs.get("PERIODO_FIM", "")
-    recipient      = inputs.get("RECIPIENT", DEFAULT_RECIPIENT)
     task_id        = task.get("id", "unknown")
     company_id     = task.get("company_id", "")
+    recipient      = _resolve_recipient(supabase_client, company_id, inputs)
 
     # Detecção de modo
     current_output = task.get("output_json") or {}
