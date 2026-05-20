@@ -161,24 +161,91 @@ class McpClient:
         endpoint, headers = resolve_mcp_auth(server, field_values, secret_resolver)
         return cls(endpoint, headers=headers)
 
-    def _jsonrpc(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Optional[Dict[str, Any]]:
-        """POST JSON-RPC 2.0. Retorna result ou None em falha."""
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
-        resp = requests.post(self.server_url, headers=self.headers, json=payload, timeout=timeout)
+    # MCP protocol version negociada no initialize
+    MCP_PROTOCOL_VERSION = "2025-06-18"
+
+    @staticmethod
+    def _parse_rpc_body(resp: "requests.Response") -> Dict[str, Any]:
+        """Streamable HTTP pode devolver JSON puro OU SSE (text/event-stream).
+        Extrai o objeto JSON-RPC do data: ... do último frame SSE se for o caso."""
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "text/event-stream" in ctype:
+            last: Dict[str, Any] = {}
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if line.startswith("data:"):
+                    chunk = line[len("data:"):].strip()
+                    if chunk and chunk != "[DONE]":
+                        try:
+                            last = json.loads(chunk)
+                        except Exception:
+                            continue
+            return last
+        try:
+            return resp.json()
+        except Exception:
+            return {}
+
+    def _ensure_session(self, timeout: int = 15) -> None:
+        """Handshake MCP obrigatório: initialize → notifications/initialized.
+        Captura Mcp-Session-Id (Streamable HTTP) pra reusar nas chamadas seguintes."""
+        if getattr(self, "_initialized", False):
+            return
+        self._session_id = getattr(self, "_session_id", None)
+        self._id = 0
+        init_headers = dict(self.headers)
+        init_headers["Accept"] = "application/json, text/event-stream"
+        self._id += 1
+        init_payload = {
+            "jsonrpc": "2.0", "id": self._id, "method": "initialize",
+            "params": {
+                "protocolVersion": self.MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "vectraclaw-mcp-client", "version": "1.0"},
+            },
+        }
+        resp = requests.post(self.server_url, headers=init_headers, json=init_payload, timeout=timeout)
         resp.raise_for_status()
-        data = resp.json()
+        sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
+        if sid:
+            self._session_id = sid
+        # notifications/initialized (notification — sem id, sem resposta esperada)
+        notif_headers = dict(init_headers)
+        if self._session_id:
+            notif_headers["Mcp-Session-Id"] = self._session_id
+        try:
+            requests.post(
+                self.server_url, headers=notif_headers,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout=timeout,
+            )
+        except Exception as e:
+            logger.warning(f"notifications/initialized falhou (segue): {e}")
+        self._initialized = True
+
+    def _jsonrpc(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: int = 15) -> Optional[Dict[str, Any]]:
+        """POST JSON-RPC 2.0 com handshake MCP + session + parse SSE."""
+        self._ensure_session(timeout=timeout)
+        headers = dict(self.headers)
+        headers["Accept"] = "application/json, text/event-stream"
+        if getattr(self, "_session_id", None):
+            headers["Mcp-Session-Id"] = self._session_id
+        self._id = getattr(self, "_id", 0) + 1
+        payload = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}}
+        resp = requests.post(self.server_url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = self._parse_rpc_body(resp)
         if "error" in data:
             raise RuntimeError(f"mcp_jsonrpc_error:{data['error']}")
         return data.get("result")
 
     def list_tools(self) -> List[Dict[str, Any]]:
-        """Lista tools. Tenta JSON-RPC tools/list; fallback GET /tools legacy."""
+        """Lista tools via MCP tools/list (após initialize). Fallback GET /tools legacy."""
         try:
             result = self._jsonrpc("tools/list")
             if result and isinstance(result.get("tools"), list):
                 return result["tools"]
         except Exception as e:
-            logger.warning(f"tools/list JSON-RPC falhou em {self.server_url} ({e}); tentando GET legacy")
+            logger.warning(f"tools/list MCP falhou em {self.server_url} ({e}); tentando GET legacy")
         try:
             response = requests.get(f"{self.server_url}/tools", headers=self.headers, timeout=10)
             response.raise_for_status()
@@ -188,13 +255,13 @@ class McpClient:
             return []
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Executa tool. Tenta JSON-RPC tools/call; fallback POST legacy."""
+        """Executa tool via MCP tools/call (após initialize). Fallback POST legacy."""
         try:
             result = self._jsonrpc("tools/call", {"name": tool_name, "arguments": arguments}, timeout=30)
             if result is not None:
                 return result
         except Exception as e:
-            logger.warning(f"tools/call JSON-RPC falhou ({e}); tentando POST legacy")
+            logger.warning(f"tools/call MCP falhou ({e}); tentando POST legacy")
         try:
             payload = {"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}}
             response = requests.post(f"{self.server_url}/tools/call", headers=self.headers, json=payload, timeout=30)
