@@ -45,6 +45,25 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _field_def_to_camel(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Normaliza um item de field_definitions (shape seed {key,label,type,required,...})
+    pro shape camelCase que o frontend McpEmbeddedFieldDefinition espera
+    ({fieldKey,fieldLabel,fieldType,isRequired,...}). Sem isso o filtro
+    embeddedFieldsToAdapterFields(d.fieldKey) derruba todos os campos → form vazio."""
+    if not isinstance(d, dict):
+        return {}
+    return {
+        "fieldKey": d.get("fieldKey") or d.get("key"),
+        "fieldLabel": d.get("fieldLabel") or d.get("label"),
+        "fieldType": d.get("fieldType") or d.get("type") or "text",
+        "isRequired": d.get("isRequired") if d.get("isRequired") is not None else bool(d.get("required", False)),
+        "optionsJson": d.get("optionsJson") or d.get("options_json"),
+        "sortOrder": d.get("sortOrder") or d.get("sort_order"),
+        "defaultValue": d.get("defaultValue") if d.get("defaultValue") is not None else d.get("default"),
+        "placeholder": d.get("placeholder"),
+    }
+
+
 def _server_to_camel(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": row.get("id"),
@@ -53,7 +72,7 @@ def _server_to_camel(row: Dict[str, Any]) -> Dict[str, Any]:
         "transport": row.get("transport"),
         "endpointUrlTemplate": row.get("endpoint_url_template"),
         "authType": row.get("auth_type"),
-        "fieldDefinitions": row.get("field_definitions") or [],
+        "fieldDefinitions": [_field_def_to_camel(d) for d in (row.get("field_definitions") or [])],
         "category": row.get("category"),
         "icon": row.get("icon"),
         "color": row.get("color"),
