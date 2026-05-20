@@ -140,20 +140,14 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
                 }
 
             # 7. Embed (async run inside sync entrypoint do daemon)
-            # VEC-397: Gemini é primário, OpenAI é fallback. Cota OpenAI já
-            # estourou em prod (smoke VEC-394 2026-05-11); Gemini key vital­
-            # mente disponível. FallbackEmbedder.model é atualizado dinami­
-            # camente para refletir qual provider entregou cada chunk.
+            # Catalog-driven (Regra de Ouro #2 NO HARDCODE): o embedder é
+            # resolvido pelo adapter do Mnemos em `agent_adapter_configs`
+            # (provider/model/base_url/dimensions). Default = Ollama local
+            # (nomic-embed-text, 768-dim) — sem dependência de quota Gemini/
+            # OpenAI, que estouraram em prod (Gemini 403 + OpenAI quota).
             if embedder is None:
-                from src.services.rag.embedder import (
-                    FallbackEmbedder,
-                    GeminiEmbedder,
-                    OpenAIEmbedder,
-                )
-                embedder = FallbackEmbedder(
-                    primary=GeminiEmbedder(),
-                    fallbacks=[OpenAIEmbedder()],
-                )
+                from src.services.rag.embedder import resolve_embedder
+                embedder = resolve_embedder()
 
             texts = [c.content for c in chunks]
             embeddings = asyncio.run(embedder.embed_batch(texts))
