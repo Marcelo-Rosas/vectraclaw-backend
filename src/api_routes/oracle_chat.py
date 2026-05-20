@@ -41,6 +41,9 @@ class OracleChatRequest(BaseModel):
     context: Optional[Dict[str, Any]] = None
     process_id: Optional[str] = None
     activity_id: Optional[str] = None  # PR5: scoped chat per-activity
+    # A.5/D10: objetivo criado seeda a introdução do Oracle no stage_intro.
+    # {title, description} — frontend passa ao abrir o chat pós-criar Goal.
+    goal: Optional[Dict[str, Any]] = None
 
 
 def _component_summary(row: Dict[str, Any]) -> Dict[str, Any]:
