@@ -314,7 +314,7 @@ def _build_step_row(
         "on_failure_action": "block",  # FailureAction enum (block|skip|retry|escalate); engine workflow_engine.py:191 coage p/ enum — "errored" causava ValueError latente
         "active": True,
         "contract_version": "v1",
-        "validation_status": "pending",
+        "validation_status": "amarelo",  # CHECK aceita verde|amarelo|vermelho; amarelo=não-validado (era "pending" → 23514)
         "validation_errors": [],
         "logic_pattern": node_data.get("logic_pattern"),  # se vier do BPMN; senão NULL
         "responsavel": responsavel,
