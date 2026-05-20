@@ -1040,7 +1040,9 @@ class ResilientHarnessDaemon:
     def _send_oracle_research_email(self, task: dict, result: dict) -> None:
         """
         Envia o relatório oracle-research por e-mail via HermesReporter.
-        Destinatário: ORACLE_REPORT_EMAIL env var (fallback: marcelo.rosas@vectracargo.com.br).
+        Destinatário (Regra #2 — sem literal): companies.notification_email pelo
+        company_id da task → env ORACLE_REPORT_EMAIL (override ops) → skip (não
+        vaza para e-mail pessoal de ninguém em multi-tenant).
         """
         try:
             output_json = result.get("output_json") or {}
@@ -1049,7 +1051,31 @@ class ResilientHarnessDaemon:
                 logger.info("_send_oracle_research_email: sem report_markdown, skip")
                 return
 
-            recipient = os.getenv("ORACLE_REPORT_EMAIL", "marcelo.rosas@vectracargo.com.br").strip()
+            recipient = ""
+            company_id = task.get("company_id")
+            if company_id:
+                try:
+                    r = (
+                        self._get_supabase()
+                        .table("companies")
+                        .select("notification_email")
+                        .eq("company_id", company_id)
+                        .limit(1)
+                        .execute()
+                    )
+                    recipient = ((r.data[0].get("notification_email") if r.data else None) or "").strip()
+                except Exception as exc:
+                    logger.warning("_send_oracle_research_email: falha ao ler companies.notification_email (%s)", exc)
+            if not recipient:
+                recipient = os.getenv("ORACLE_REPORT_EMAIL", "").strip()
+            if not recipient:
+                logger.warning(
+                    "_send_oracle_research_email: destinatário não resolvido "
+                    "(companies.notification_email vazio + ORACLE_REPORT_EMAIL ausente) "
+                    "— relatório NÃO enviado (sem fallback literal). task=%s company=%s",
+                    task.get("id"), company_id,
+                )
+                return
             title = (task.get("title") or "Oracle Research").strip()
             input_data = task.get("input_json") or {}
             company_name = (input_data.get("company_name") or "").strip()
