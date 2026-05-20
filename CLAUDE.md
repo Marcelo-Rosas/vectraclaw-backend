@@ -87,7 +87,7 @@ Branch → commit → push → `gh pr create` → checks → `gh pr merge --squa
 
 - **Escopo pequeno por PR.** Não bundlar features distintas.
 - **Feature WIP grande?** Quebra em 5-8 PRs por subsistema (managed_agents, hermes, oracle, workflow, api.py, etc.).
-- **Migrations:** seguir `supabase/CLAUDE.md`. **Nunca** `mcp apply_migration` direto no remoto.
+- **Migrations:** seguir `supabase/CLAUDE.md`. **Regra de Ouro #6:** nunca MCP/SQL Editor para DDL — só `supabase/migrations/` + `db push` (`docs/CODE-PATTERNS.md` P9).
 - **Daemons rodando durante merge:** rebaseline OK; mas restart de daemon é manual e exige confirmação do usuário (downtime ~3-5s).
 - **Pré-merge:** `git diff --stat`, `git status --short`, rodar tests do escopo, monitor `daemon-*.log` por erros.
 

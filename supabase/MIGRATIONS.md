@@ -135,11 +135,13 @@ Saída do `supabase migration list` (CLI **v2.84.2**). Como ler:
 | Causa | O que fazer daqui pra frente |
 |--------|------------------------------|
 | DDL no SQL Editor / outro repositório | Só DDL versionado em `migrations/` + `db push` |
-| `apply_migration` via MCP (proibido no repo) | Ver `supabase/CLAUDE.md` |
+| `apply_migration` / DDL via MCP Supabase | **Regra de Ouro #6** — ver `docs/CODE-PATTERNS.md` P9 e `supabase/CLAUDE.md` |
 | Arquivo `.sql` apagado ou renomeado após aplicar no remoto | Nunca apagar versão já aplicada em prod sem `repair` + plano |
 | PRs paralelos com timestamps colidentes | Timestamp sempre crescente; conflito = resolver antes do merge |
 
-**Nota interna:** a migration `20260511010811_vec388_*` documenta aplicação prévia via MCP — exemplo do tipo de evento que gera drift.
+**Notas internas (drift por MCP):**
+- `20260511010811_vec388_*` — aplicação prévia via MCP documentada no arquivo.
+- **2026-05-20:** versões órfãs `20260520030345`, `20260520030518`, `20260520030549` (sem `.sql` local) bloquearam `db push` até `migration repair --status reverted` + push das migrations git (`20260520020000`…`20260520140000`).
 
 ---
 
