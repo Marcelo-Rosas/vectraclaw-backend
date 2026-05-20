@@ -138,18 +138,12 @@ def entrypoint(task: dict, supabase, *, embedder=None) -> Dict[str, Any]:
                     "page_count": extracted.page_count,
                 }
 
-            # 7. Embed (VEC-397: Gemini primário, OpenAI fallback — cota OpenAI
-            # já estourou em prod no smoke VEC-394 2026-05-11)
+            # 7. Embed — catalog-driven (Regra de Ouro #2). Mesmo embedder do
+            # Mnemos (Ollama nomic-embed-text 768-dim local), resolvido via
+            # adapter. Mantém athena_chunks na MESMA dimensão de rag_chunks.
             if embedder is None:
-                from src.services.rag.embedder import (
-                    FallbackEmbedder,
-                    GeminiEmbedder,
-                    OpenAIEmbedder as _OpenAIEmbedder,
-                )
-                embedder = FallbackEmbedder(
-                    primary=GeminiEmbedder(),
-                    fallbacks=[_OpenAIEmbedder()],
-                )
+                from src.services.rag.embedder import resolve_embedder
+                embedder = resolve_embedder()
 
             texts = [c.content for c in chunks]
             embeddings = asyncio.run(embedder.embed_batch(texts))
@@ -241,12 +235,11 @@ async def query_top_k(
     if sb is None:
         raise RuntimeError("Supabase client indisponível em src.api.supabase")
 
-    # VEC-397: default vira FallbackEmbedder (Gemini primário, OpenAI fallback).
-    # Antes era OpenAIEmbedder direto e qualquer 429 derrubava o /athena/query.
-    emb = embedder or FallbackEmbedder(
-        primary=GeminiEmbedder(),
-        fallbacks=[OpenAIEmbedder()],
-    )
+    # Catalog-driven (Regra de Ouro #2): embedder da query DEVE ser o mesmo do
+    # ingest (Ollama nomic 768-dim), senão a dimensão do vetor de busca não bate
+    # com athena_chunks e o RPC falha. resolve_embedder lê o adapter do Mnemos.
+    from src.services.rag.embedder import resolve_embedder
+    emb = embedder or resolve_embedder()
     query_embedding = await emb.embed_one(query_text)
     if not query_embedding:
         return []

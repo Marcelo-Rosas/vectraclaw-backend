@@ -232,3 +232,112 @@ class FallbackEmbedder:
             f"FallbackEmbedder: todos {1 + len(self.fallbacks)} embedders falharam. "
             f"Último erro: {last_err!r}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OllamaEmbedder — embedding LOCAL (sem API key, sem 403/quota). nomic-embed-text
+# = 768 dim. Não normaliza → L2 manual (schema cosine vector_cosine_ops).
+# ─────────────────────────────────────────────────────────────────────────────
+
+OLLAMA_DEFAULT_MODEL = "nomic-embed-text"
+OLLAMA_DEFAULT_DIM = 768
+OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434"
+
+
+class OllamaEmbedder:
+    def __init__(
+        self,
+        *,
+        model: str = OLLAMA_DEFAULT_MODEL,
+        dimensions: int = OLLAMA_DEFAULT_DIM,
+        base_url: str = OLLAMA_DEFAULT_BASE_URL,
+    ) -> None:
+        self.model = model
+        self.dimensions = dimensions
+        self.base_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
+
+    async def embed_one(self, text: str) -> List[float]:
+        r = await self.embed_batch([text])
+        return r[0] if r else []
+
+    async def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        import requests
+
+        def _one(t: str) -> List[float]:
+            if not t or not t.strip():
+                return [0.0] * self.dimensions
+            resp = requests.post(
+                f"{self.base_url}/api/embeddings",
+                json={"model": self.model, "prompt": t},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            vec = resp.json().get("embedding") or []
+            norm = math.sqrt(sum(v * v for v in vec))
+            if norm > 0:
+                vec = [v / norm for v in vec]
+            return vec
+
+        out = [await asyncio.to_thread(_one, t) for t in texts]
+        logger.info(
+            "rag.embedder ollama: %d texts → %d-dim (model=%s, L2-normalized, base=%s)",
+            len(texts), self.dimensions, self.model, self.base_url,
+        )
+        return out
+
+
+def resolve_embedder(agent_id: str = "00000000-0000-0000-0000-000000000003"):
+    """Catalog-driven (Regra #2): resolve o embedder pelo adapter do agente
+    (default Mnemos). Lê agent_adapter_configs + W5 company values + vault →
+    provider/model/base_url/dimensions. ollama→OllamaEmbedder; google→Gemini;
+    openai→OpenAI. Sem config → fallback Ollama local (nomic).
+
+    Single-tenant dev: resolve por agent_id (limit 1)."""
+    provider = None
+    model = None
+    base_url = None
+    dimensions = None
+    try:
+        from src.api import supabase, resolve_secret_ref
+        if supabase:
+            res = (
+                supabase.table("agent_adapter_configs")
+                .select("field_values_json, company_id, adapter_id, adapter_catalog!inner(provider)")
+                .eq("agent_id", agent_id).limit(1).execute()
+            )
+            if res.data:
+                row = res.data[0]
+                provider = (row.get("adapter_catalog") or {}).get("provider")
+                fv = dict(row.get("field_values_json") or {})
+                cid, aid = row.get("company_id"), row.get("adapter_id")
+                if cid and aid:
+                    cv = (
+                        supabase.table("company_adapter_values")
+                        .select("field_values_json").eq("company_id", cid).eq("adapter_id", aid).limit(1).execute()
+                    )
+                    if cv.data:
+                        merged = dict(cv.data[0].get("field_values_json") or {})
+                        merged.update({k: v for k, v in fv.items() if v not in (None, "")})
+                        fv = merged
+                if cid:
+                    fv = {k: (resolve_secret_ref(v, str(cid)) if isinstance(v, str) and v.startswith("vault://") else v) for k, v in fv.items()}
+                model = fv.get("model_id") or fv.get("model")
+                base_url = fv.get("base_url")
+                dimensions = int(fv["dimensions"]) if fv.get("dimensions") else None
+    except Exception as e:
+        logger.warning("resolve_embedder(%s) falhou (fallback ollama local): %s", agent_id, e)
+
+    if provider == "ollama":
+        return OllamaEmbedder(
+            model=model or OLLAMA_DEFAULT_MODEL,
+            dimensions=dimensions or OLLAMA_DEFAULT_DIM,
+            base_url=base_url or OLLAMA_DEFAULT_BASE_URL,
+        )
+    if provider == "google":
+        return GeminiEmbedder(model=model or DEFAULT_GEMINI_MODEL, dimensions=dimensions or DEFAULT_DIMENSIONS)
+    if provider == "openai":
+        return OpenAIEmbedder(model=model or DEFAULT_MODEL, dimensions=dimensions or DEFAULT_DIMENSIONS)
+    # default: Ollama local (nomic) — sem dep de API key/quota
+    return OllamaEmbedder()

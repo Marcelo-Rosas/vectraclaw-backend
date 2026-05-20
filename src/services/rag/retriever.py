@@ -56,12 +56,12 @@ async def query_top_k(
     if sb is None:
         raise RuntimeError("Supabase client indisponível em src.api.supabase")
 
-    # VEC-397: default vira FallbackEmbedder (Gemini primário, OpenAI fallback).
-    # Antes era OpenAIEmbedder direto e qualquer 429 derrubava o /rag/query.
-    emb = embedder or FallbackEmbedder(
-        primary=GeminiEmbedder(),
-        fallbacks=[OpenAIEmbedder()],
-    )
+    # Catalog-driven (Regra de Ouro #2): a query DEVE usar o mesmo embedder do
+    # ingest (Ollama nomic 768-dim), senão a dimensão do vetor de busca não bate
+    # com rag_chunks e o RPC match_rag_chunks falha. resolve_embedder lê o
+    # adapter do Mnemos.
+    from .embedder import resolve_embedder
+    emb = embedder or resolve_embedder()
     query_embedding = await emb.embed_one(query_text)
     if not query_embedding:
         return []
