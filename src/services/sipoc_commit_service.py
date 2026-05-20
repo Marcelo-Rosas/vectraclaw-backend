@@ -20,7 +20,9 @@ Convenções:
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,6 +30,125 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.services.sipoc_5w2h_keys import normalize_5w2h_keys
 
 logger = logging.getLogger("SipocCommit")
+
+# RAG corpus: bucket + Mnemos (curador). O SIPOC commitado é a FONTE do fluxo —
+# vira exemplo no RAG pro Oracle ancorar mapeamentos futuros (auto-loop).
+_RAG_BUCKET = os.getenv("RAG_STORAGE_BUCKET", "rag-documents")
+_MNEMOS_AGENT_ID = "00000000-0000-0000-0000-000000000003"
+
+# Rótulos de raia SIPOC pra serialização markdown (snake_case → humano).
+_SIPOC_TYPE_HEADINGS = {
+    "supplier": "Suppliers (Fornecedores)",
+    "input": "Inputs (Entradas)",
+    "activity": "Process (Atividades)",
+    "output": "Outputs (Saídas)",
+    "customer": "Customers (Clientes)",
+}
+_5W2H_LABELS = {
+    "what": "O quê", "why": "Por quê", "who": "Quem", "where": "Onde",
+    "when": "Quando", "how": "Como", "how_much": "Quanto",
+}
+
+
+def _serialize_sipoc_markdown(
+    *, process_name: str, sector_name: str, description: Optional[str],
+    components: List[Dict[str, Any]],
+) -> str:
+    """Serializa o SIPOC commitado em markdown pro corpus RAG. Agrupado por raia
+    (S→I→P→O→C); atividades expõem 5W2H. É o texto que o Oracle vai recuperar
+    como exemplo de processo parecido."""
+    lines: List[str] = [
+        f"# SIPOC: {process_name}",
+        f"Setor: {sector_name}",
+    ]
+    if description and description.strip():
+        lines.append(f"Objetivo/Descrição: {description.strip()}")
+    lines.append("")
+
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for comp in components:
+        by_type.setdefault((comp.get("type") or "").strip(), []).append(comp)
+
+    for ctype in ("supplier", "input", "activity", "output", "customer"):
+        items = by_type.get(ctype) or []
+        if not items:
+            continue
+        lines.append(f"## {_SIPOC_TYPE_HEADINGS.get(ctype, ctype)}")
+        for comp in items:
+            content = comp.get("content") or {}
+            name = (comp.get("name") or content.get("name") or content.get("title") or "").strip()
+            lines.append(f"- **{name or '(sem nome)'}**")
+            if ctype == "activity":
+                norm = normalize_5w2h_keys(content if isinstance(content, dict) else {})
+                for k, label in _5W2H_LABELS.items():
+                    v = norm.get(k)
+                    if v:
+                        lines.append(f"  - {label}: {v}")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def ingest_sipoc_to_rag(
+    supabase, *, company_id: str, process_id: str, process_name: str,
+    sector_name: str, description: Optional[str], components: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Best-effort: serializa o SIPOC commitado e enfileira ingestão no RAG
+    (Storage → rag_documents → task rag-ingest pro Mnemos, 768-dim). NUNCA
+    levanta — o commit não pode falhar por causa do RAG. Retorna warning ou None."""
+    try:
+        md = _serialize_sipoc_markdown(
+            process_name=process_name, sector_name=sector_name,
+            description=description, components=components,
+        )
+        md_bytes = md.encode("utf-8")
+        sha256 = hashlib.sha256(md_bytes).hexdigest()
+        # .txt/text-plain: o extractor do RAG não suporta markdown; markdown como
+        # texto puro é suficiente pro embedder (chunk + 768-dim).
+        filename = f"SIPOC — {process_name}.txt"
+        storage_path = f"{company_id}/sipoc-{process_id}.txt"
+
+        supabase.storage.from_(_RAG_BUCKET).upload(
+            storage_path, md_bytes,
+            file_options={"content-type": "text/plain", "upsert": "true"},
+        )
+        now = _now_iso()
+        doc = supabase.table("rag_documents").insert({
+            "company_id": company_id,
+            "filename": filename,
+            "storage_path": storage_path,
+            "sha256": sha256,
+            "mime_type": "text/plain",
+            "size_bytes": len(md_bytes),
+            "status": "uploaded",
+            "uploaded_at": now,
+            # metadata = sinal de recuperação pro Oracle (filtra/rankeia por setor)
+            "metadata": {
+                "source": "sipoc_committed",
+                "sector": sector_name,
+                "process_id": process_id,
+            },
+        }).execute()
+        if not doc.data:
+            return "rag ingest: rag_documents insert vazio (SIPOC não entrou no corpus)"
+        document_id = doc.data[0]["id"]
+
+        supabase.table("tasks").insert({
+            "company_id": company_id,
+            "title": f"RAG ingest (SIPOC): {process_name}",
+            "description": f"Ingestão do SIPOC commitado '{process_name}' no corpus (auto-loop).",
+            "operation_type": "rag-ingest",
+            "status": "queued",
+            "budget_limit": 0, "spent": 0, "cost_usd": 0,
+            "executor_type": "auto",
+            "assigned_to_agent_id": _MNEMOS_AGENT_ID,
+            "input_json": {"document_id": document_id, "filename": filename, "sha256": sha256},
+            "created_at": now, "updated_at": now,
+        }).execute()
+        logger.info("sipoc_commit: SIPOC %s enfileirado no RAG (doc=%s)", process_id, document_id)
+        return None
+    except Exception as exc:
+        logger.warning("ingest_sipoc_to_rag falhou process=%s (commit segue ok): %s", process_id, exc)
+        return f"rag ingest falhou (SIPOC commitado mas não entrou no corpus): {exc!s}"
 
 
 class SipocCommitError(Exception):
@@ -344,6 +465,20 @@ def commit_sipoc(
         inserted_components=inserted_components,
         warnings=warnings,
     )
+
+    # 6) Auto-loop: SIPOC commitado vira exemplo no RAG (a FONTE realimenta o
+    # corpus). Best-effort — não falha o commit se o RAG estiver indisponível.
+    rag_warning = ingest_sipoc_to_rag(
+        supabase,
+        company_id=str(company_id),
+        process_id=process_id,
+        process_name=process_name,
+        sector_name=sector.get("name") or "",
+        description=process_description,
+        components=components or [],
+    )
+    if rag_warning:
+        warnings.append(rag_warning)
 
     result = {
         "process_id": process_id,
