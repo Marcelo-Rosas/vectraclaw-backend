@@ -36,6 +36,12 @@ class ResilientHarnessDaemon:
         # mesmo quando daemon está polando sem tasks. Configurável via env.
         self._idle_heartbeat_interval = int(os.getenv("DAEMON_IDLE_HEARTBEAT_SECONDS", "30"))
         self._last_heartbeat_at: Optional[datetime] = None
+        # PR7 Fase 1 — dispatch catalog-driven: cache de operation_types_catalog
+        # (op_type → handler ref). TTL evita SELECT por task mas permite editar
+        # o catálogo sem restart (Correção A do hardcode-auditor).
+        self._optype_handlers: Dict[str, Dict[str, Any]] = {}
+        self._optype_cache_ts: float = 0.0
+        self._optype_cache_ttl: int = int(os.getenv("OPTYPE_HANDLER_CACHE_TTL_SECONDS", "120"))
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
@@ -528,6 +534,63 @@ class ResilientHarnessDaemon:
                 task.get("id"), session_id, e,
             )
 
+    def _load_optype_handlers(self) -> Dict[str, Any]:
+        """PR7: carrega/atualiza cache de handlers do operation_types_catalog (TTL).
+        Permite editar o catálogo sem restart do daemon. Se o DB cair, mantém o
+        cache anterior (degrada pro fallback if-chain, nunca trava)."""
+        now = time.monotonic()
+        if self._optype_handlers and (now - self._optype_cache_ts) < self._optype_cache_ttl:
+            return self._optype_handlers
+        client = self._get_supabase()
+        if not client:
+            return self._optype_handlers
+        try:
+            res = (
+                client.table("operation_types_catalog")
+                .select("id,handler_module,handler_function,handler_is_async,handler_pass_supabase")
+                .execute()
+            )
+            # 61 rows — filtro em Python (evita pitfalls de NOT NULL no postgrest)
+            self._optype_handlers = {
+                r["id"]: r
+                for r in (res.data or [])
+                if r.get("handler_module") and r.get("handler_function")
+            }
+            self._optype_cache_ts = now
+            logger.info("PR7: %d handlers carregados do operation_types_catalog", len(self._optype_handlers))
+        except Exception as e:
+            logger.warning("_load_optype_handlers falhou (mantém cache/fallback): %s", e)
+        return self._optype_handlers
+
+    def _try_catalog_dispatch(self, task: dict, op_type: str):
+        """PR7 fast-path catalog-driven. Retorna (matched, result_json|None).
+        Se a row do op_type tiver handler ref, importa via importlib + chama
+        conforme flags (async / pass_supabase). Em QUALQUER falha, loga e devolve
+        matched=False → cai na cadeia if-elif legada (safety net intacto)."""
+        import asyncio
+        import importlib
+        import json as _json
+
+        row = self._load_optype_handlers().get(op_type)
+        if not row:
+            return False, None
+        try:
+            mod = importlib.import_module(row["handler_module"])
+            fn = getattr(mod, row["handler_function"])
+            args = (task, self._get_supabase()) if row.get("handler_pass_supabase") else (task,)
+            result = asyncio.run(fn(*args)) if row.get("handler_is_async") else fn(*args)
+            logger.info(
+                "PR7 catalog dispatch: op=%s → %s.%s",
+                op_type, row["handler_module"], row["handler_function"],
+            )
+            return True, _json.dumps(result)
+        except Exception as e:
+            logger.error(
+                "PR7 catalog dispatch FALHOU op=%s → %s.%s (%s) — fallback if-chain",
+                op_type, row.get("handler_module"), row.get("handler_function"), e,
+            )
+            return False, None
+
     def execute_task(self, task: dict) -> str:
         import asyncio
         import json as _json
@@ -540,6 +603,13 @@ class ResilientHarnessDaemon:
         # Handlers que ignorarem `task["_resolved_*"]` seguem funcionando
         # com seu fluxo legado (backcompat 100%).
         self._populate_resolved_specialty(task)
+
+        # PR7 Fase 1 — fast-path catalog-driven (operation_types_catalog.handler_*).
+        # Se o op_type tem handler ref na tabela, despacha por ela. Senão (ou em
+        # falha), cai na cadeia if-elif abaixo (fallback intacto).
+        _matched, _catalog_result = self._try_catalog_dispatch(task, op_type)
+        if _matched:
+            return _catalog_result
 
         # Deterministic branches for native Python agents
         # W9 (2026-05-18) — Morpheus inbound triage. Sem LLM, puro matching
@@ -656,11 +726,6 @@ class ResilientHarnessDaemon:
 
         if skillforge_enabled() and is_skillforge_operation(op_type):
             result = run_skill_for_task(task)
-            return _json.dumps(result)
-
-        if op_type == "rag-ingest":
-            from src.agents.mnemos import entrypoint as mnemos_entry
-            result = mnemos_entry(task, self._get_supabase())
             return _json.dumps(result)
 
         # Default: forward to claude -p
