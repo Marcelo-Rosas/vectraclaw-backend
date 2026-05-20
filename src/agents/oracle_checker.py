@@ -2,7 +2,9 @@ import json
 import logging
 from typing import Any, Dict, List
 
-from src.services.gemini_client import DEFAULT_MODEL, generate
+from src.agent_ids import ORACLE_AGENT_ID
+from src.services.agent_llm import generate_for_agent
+from src.services.gemini_client import DEFAULT_MODEL
 
 logger = logging.getLogger("OracleChecker")
 
@@ -61,7 +63,11 @@ async def _check_w2h_analysis(state: Dict[str, Any], maker_text: str) -> Dict[st
         '"pattern_correction":null,"replacement_text":null,"feedback":""}'
     )
 
-    text, _ = await generate(DEFAULT_MODEL, prompt, response_mime_type="application/json")
+    text, _ = await generate_for_agent(
+        ORACLE_AGENT_ID, prompt,
+        response_mime_type="application/json",
+        fallback_model=DEFAULT_MODEL,
+    )
     return _parse_result(text, state, event="w2h_analysis")
 
 
@@ -81,7 +87,11 @@ async def _check_component_ack(state: Dict[str, Any], maker_text: str) -> Dict[s
         'Retorne APENAS JSON: {"verdict":"accept","replacement_text":null,"feedback":""}'
     )
 
-    text, _ = await generate(DEFAULT_MODEL, prompt, response_mime_type="application/json")
+    text, _ = await generate_for_agent(
+        ORACLE_AGENT_ID, prompt,
+        response_mime_type="application/json",
+        fallback_model=DEFAULT_MODEL,
+    )
     return _parse_result(text, state, event="component_ack")
 
 
@@ -98,7 +108,11 @@ async def _check_meta_input(state: Dict[str, Any], maker_text: str) -> Dict[str,
         '"replacement_text":null,"feedback":""}'
     )
 
-    text, _ = await generate(DEFAULT_MODEL, prompt, response_mime_type="application/json")
+    text, _ = await generate_for_agent(
+        ORACLE_AGENT_ID, prompt,
+        response_mime_type="application/json",
+        fallback_model=DEFAULT_MODEL,
+    )
     return _parse_result(text, state, event="meta_input")
 
 
