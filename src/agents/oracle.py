@@ -115,11 +115,24 @@ def build_oracle_prompt(payload: dict) -> tuple[str, str]:
                 f"\nO objetivo declarado pelo cliente é: \"{goal.strip()}\".\n"
                 f"- Abra reconhecendo esse objetivo em 1 frase\n"
             )
+        # Passo 2 RAG-grounded: exemplos reais do corpus (SIPOCs commitados,
+        # templates, artefatos) recuperados por setor. Oracle ancora a fala em
+        # processos parecidos, não em conhecimento genérico/hardcoded.
+        rag_examples = context.get("rag_examples") or []
+        rag_block = ""
+        if rag_examples:
+            joined = "\n---\n".join(str(e).strip() for e in rag_examples[:3])
+            rag_block = (
+                f"\nProcessos SEMELHANTES já mapeados nesta empresa (use como "
+                f"REFERÊNCIA real — cite o que for coerente, NÃO invente):\n{joined}\n"
+            )
         user_prompt = (
             f"Apresente a etapa '{stage_label}' do SIPOC de forma didática."
-            f"{goal_block}\n"
+            f"{goal_block}"
+            f"{rag_block}\n"
             f"- Explique o que são {type_label}s no contexto de '{domain}' (1-2 frases)\n"
-            f"- Dê 2-3 exemplos típicos para esse domínio\n"
+            f"- Dê 2-3 exemplos típicos para esse domínio"
+            f"{' (priorize os dos processos semelhantes acima)' if rag_examples else ''}\n"
             f"- Termine pedindo o primeiro item\n"
             f"Seja natural e conversacional."
         )

@@ -246,6 +246,42 @@ async def oracle_chat(body: OracleChatRequest, request: Request):
                 raise
             logger.warning("oracle_chat scoped enrichment falhou (degrada gracioso): %s", e)
 
+    # Passo 2 (RAG-grounded): ancora a entrevista em exemplos REAIS do corpus
+    # (SIPOCs commitados via auto-loop, templates, artefatos) — o Oracle conduz
+    # com base em processos parecidos, não em string hardcoded. Best-effort:
+    # corpus vazio (cold-start) → sem exemplos → Oracle segue genérico (LLM).
+    if body.event == "stage_intro":
+        try:
+            from src.api import get_user_scope
+            cid = (get_user_scope(request.state.token) or {}).get("company_id")
+            if cid:
+                from src.services.rag.retriever import query_top_k
+                goal = payload.get("goal") or {}
+                if isinstance(goal, dict):
+                    goal_txt = f"{goal.get('title', '')} {goal.get('description', '')}".strip()
+                else:
+                    goal_txt = str(goal or "")
+                comp_type = (payload.get("context") or {}).get("component_type", "")
+                q = f"{payload.get('domain', '')} {goal_txt} {comp_type}".strip()
+                if q:
+                    hits = await query_top_k(q, str(cid), k=3, min_score=0.15)
+                    examples = [
+                        h.content[:500] for h in hits
+                        if getattr(h, "content", "")
+                    ]
+                    if examples:
+                        base_ctx = payload.get("context") or {}
+                        if not isinstance(base_ctx, dict):
+                            base_ctx = {}
+                        base_ctx["rag_examples"] = examples
+                        payload["context"] = base_ctx
+                        logger.info(
+                            "oracle_chat RAG-grounded: %d exemplo(s) injetado(s) session=%s q=%.60s",
+                            len(examples), session_id, q,
+                        )
+        except Exception as e:
+            logger.warning("oracle_chat RAG grounding falhou (degrada gracioso): %s", e)
+
     async def event_gen():
         try:
             from src.agents.oracle_runner import stream_oracle_chat_v2
