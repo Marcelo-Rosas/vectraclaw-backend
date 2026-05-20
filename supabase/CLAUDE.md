@@ -65,12 +65,19 @@ INSERT INTO llm_models (...) VALUES (...);
 
 ---
 
-## ⛔ NUNCA usar `mcp apply_migration`
+## ⛔ NUNCA usar MCP para DDL — **REGRA DE OURO #6**
+
+> Canônico: `docs/CODE-PATTERNS.md` P9. Esta seção é o checklist operacional.
 
 DDL **sempre** vai como arquivo em `supabase/migrations/` + `supabase db push` (local) ou CI.
 
+**Proibido (agentes e humanos):**
+- `apply_migration` via MCP Supabase (Cursor, Claude, Codex, etc.)
+- DDL no SQL Editor do dashboard sem gerar migration no git
+- `execute_sql` via MCP para CREATE/ALTER/DROP/INSERT de catálogo versionado
+
 **Por quê:**
-- Apply via MCP cria registro no histórico remoto sem arquivo correspondente local → drift permanente.
+- Apply via MCP cria registro no histórico remoto sem arquivo correspondente local → drift permanente (ex.: 2026-05-20 — versões `20260520030345`… sem `.sql`).
 - Não tem versionamento Git → impossível auditar.
 - Não roda em outros ambientes (staging) automaticamente.
 

@@ -8,7 +8,22 @@
 
 ---
 
-## P0 — Espelhar antes de criar (regra dura)
+## Regras de Ouro (índice)
+
+| # | Regra | Seção |
+|---|--------|--------|
+| **1** | Espelhar antes de criar (SELECT / vizinho no catálogo) | P0, P7 |
+| **2** | Metadata-driven — **NO HARDCODE** | P1 |
+| **3** | Pós-merge: `docker cp` + restart (não assumir deploy automático) | P4 |
+| **4** | Invocar `hardcode-auditor` **antes** de melhorar código | P8 (auditor) |
+| **5** | Scripts one-off: Docker ephemeral (sem instalar deps no host) | `scripts/autopilot/*` |
+| **6** | **NUNCA MCP** para DDL/migrations no Supabase | P9 |
+
+Detalhe operacional de migrations: `supabase/CLAUDE.md`, `supabase/MIGRATIONS.md`.
+
+---
+
+## P0 — Espelhar antes de criar (regra dura) — **REGRA DE OURO #1**
 
 **Antes de adicionar entry em qualquer catálogo (`agent_specialties`, `adapter_catalog`,
 `llm_models`, `operation_types_catalog`, `agent_execution_modes`, etc.), você DEVE:**
@@ -420,6 +435,43 @@ operador, sustentada por dados objetivos do relatório.
 
 **Padrão de saída do auditor** é determinístico — code review consegue cruzar
 PR com o relatório linha a linha.
+
+---
+
+## P9 — NUNCA MCP para DDL/migrations — **REGRA DE OURO #6**
+
+> **Origem 2026-05-20:** `db push` bloqueado por 3 versões só no remoto
+> (`20260520030345`, `20260520030518`, `20260520030549`) sem `.sql` no git —
+> típico de `apply_migration` via MCP Supabase ou SQL Editor fora do fluxo.
+
+**Regra:** qualquer DDL/DML de schema (CREATE/ALTER TABLE, seeds de catálogo,
+CHECK, RLS, RPC) **só** via arquivo em `supabase/migrations/` + `supabase db push`.
+**Proibido** usar ferramentas MCP (`apply_migration`, `execute_sql` para DDL)
+ou SQL Editor no dashboard para mudanças que devem persistir em produção.
+
+**Por quê:**
+- MCP cria registro em `supabase_migrations.schema_migrations` **sem** arquivo
+  local → `Remote migration versions not found in local migrations directory`
+- Sem Git → sem review, sem reprodução em outro ambiente
+- `migration repair` só conserta o livro-razão; não substitui o `.sql` perdido
+
+**Fluxo correto:**
+
+```powershell
+$ts = Get-Date -Format "yyyyMMddHHmmss"
+New-Item "supabase/migrations/${ts}_minha_mudanca.sql"
+# editar SQL (prefixo vectraclip., cabeçalho P7)
+supabase migration list
+supabase db push --dry-run
+supabase db push
+```
+
+**Se o agente sugerir MCP para migration:** recusar, criar o `.sql` e usar CLI.
+MCP Supabase é aceitável para **leitura** (`list_tables`, `execute_sql` SELECT,
+logs, advisors) — nunca para aplicar schema.
+
+**Drift já existente:** `supabase/MIGRATIONS.md` (repair versão a versão + recuperar
+SQL antes de `reverted` às cegas).
 
 ---
 
