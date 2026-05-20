@@ -23,6 +23,10 @@ ALTER TABLE vectraclip.agent_specialties DROP CONSTRAINT IF EXISTS agent_special
 UPDATE vectraclip.agent_specialties SET source = 'seed'       WHERE source IN ('internal', 'seed');
 UPDATE vectraclip.agent_specialties SET source = 'import_csv' WHERE source = 'skillforge';
 
+UPDATE vectraclip.agent_specialties SET source = 'seed'       WHERE source IN ('internal', 'seed');
+UPDATE vectraclip.agent_specialties SET source = 'import_csv' WHERE source = 'skillforge';
+
+ALTER TABLE vectraclip.agent_specialties DROP CONSTRAINT IF EXISTS agent_specialties_source_check;
 ALTER TABLE vectraclip.agent_specialties
   ADD CONSTRAINT agent_specialties_source_check
   CHECK (source IN ('seed', 'athena', 'import_csv', 'markdown_upload'));
