@@ -584,11 +584,14 @@ BusinessCaseStrength = Literal["strong", "adequate", "weak", "absent"]
 
 
 class SmartBreakdown(BaseModel):
-    specific: str = Field(min_length=20)
-    measurable: str = Field(min_length=10)
-    achievable: str = Field(min_length=10)
-    relevant: str = Field(min_length=10)
-    timebound: str = Field(min_length=10)
+    # min_length relaxado: campos SMART aceitam respostas tersas válidas
+    # ("10 min", "100"). Descritividade é incentivada por prompt, não imposta
+    # por min rígido que rejeita output válido de modelos abertos (Groq/Llama).
+    specific: str = Field(min_length=3)
+    measurable: str = Field(min_length=1)
+    achievable: str = Field(min_length=1)
+    relevant: str = Field(min_length=1)
+    timebound: str = Field(min_length=1)
 
 
 class ClassifyOutputs(BaseModel):
