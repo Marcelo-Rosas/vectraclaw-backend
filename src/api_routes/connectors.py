@@ -9,6 +9,8 @@ orquestração via src/services/connector_bus.py.
 Endpoints:
 - GET  /api/connectors/whatsapp/webhook   meta_whatsapp_webhook_verify  (handshake hub.challenge)
 - POST /api/connectors/whatsapp/webhook   meta_whatsapp_webhook         (mensagens inbound)
+- GET  /api/connectors/instagram/webhook  meta_instagram_webhook_verify (handshake hub.challenge)
+- POST /api/connectors/instagram/webhook  meta_instagram_webhook        (DM inbound Instagram)
 - GET  /api/companies/{company_id}/connector-sessions  list_connector_sessions
 - POST /api/connector-sessions/{session_id}/reply      reply_connector_session
 
@@ -52,16 +54,18 @@ router = APIRouter(tags=["connectors"])
 # Slug canônico do adapter Meta WhatsApp Cloud API no adapter_catalog.
 # Não é hardcode de catálogo (slug é a CHAVE de lookup, não o dado).
 META_WHATSAPP_ADAPTER_SLUG = "meta-whatsapp"
+# Wizard POST /adapters/from-profile usa _slugify_adapter_slug → snake_case (meta_instagram).
+# Seeds/migrations legados podem usar kebab-case (meta-instagram). Aceitar ambos no lookup.
+META_INSTAGRAM_ADAPTER_SLUGS = ("meta_instagram", "meta-instagram")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lookup adapter config (catalog-driven, sem env)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_meta_adapter_targets() -> List[Dict[str, Any]]:
-    """Lista (company_id, adapter_id) de TODA company que tem adapter
-    meta-whatsapp ativo no catalog. Não carrega values ainda — quem itera
-    decide ler company_adapter_values e/ou agent_adapter_configs."""
+def _load_meta_adapter_targets(adapter_slug: str) -> List[Dict[str, Any]]:
+    """Lista (company_id, adapter_id) de TODA company que tem adapter Meta
+    ativo no catalog (slug meta-whatsapp ou meta-instagram)."""
     from src.api import supabase
     if not supabase:
         return []
@@ -69,27 +73,44 @@ def _load_meta_adapter_targets() -> List[Dict[str, Any]]:
         adapters = (
             supabase.table("adapter_catalog")
             .select("id,company_id")
-            .eq("slug", META_WHATSAPP_ADAPTER_SLUG)
+            .eq("slug", adapter_slug)
             .eq("is_active", True)
             .execute()
         )
-        return adapters.data or []
+        return adapters.data or []  # pyright: ignore[reportReturnType]
     except Exception as e:
-        logger.error("_load_meta_adapter_targets failed: %s", e)
+        logger.error("_load_meta_adapter_targets slug=%s failed: %s", adapter_slug, e)
         return []
 
 
+def _load_meta_instagram_adapter_targets() -> List[Dict[str, Any]]:
+    """Adapters Instagram ativos (meta_instagram do wizard ou meta-instagram legado)."""
+    rows: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for slug in META_INSTAGRAM_ADAPTER_SLUGS:
+        for row in _load_meta_adapter_targets(slug):
+            adapter_id = str(row.get("id") or "")
+            if adapter_id and adapter_id not in seen_ids:
+                seen_ids.add(adapter_id)
+                rows.append(row)
+    return rows
+
+
 def _resolve_meta_config_for_company(
-    company_id: str, adapter_id: str
+    company_id: str,
+    adapter_id: str,
+    *,
+    routing_field: str = "phone_number_id",
+    require_routing_field: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """W5 — Resolve config Meta efetiva pra (company, adapter), aplicando
     lookup híbrido em CADA field individualmente:
       1. agent_adapter_configs.field_values_json[field] (override de exceção)
       2. company_adapter_values.field_values_json[field] (PRIMARY)
-    Retorna dict {company_id, agent_id_override, phone_number_id, app_secret,
-    webhook_verify_token, access_token, api_version} com valores JÁ
-    desreferenciados (vault:// resolvido). Retorna None se phone_number_id
-    não está setado (config incompleta — não dá pra rotear webhook)."""
+    Retorna dict com routing_field (phone_number_id ou instagram_account_id),
+    app_secret, webhook_verify_token, access_token, api_version.
+    Retorna None se require_routing_field=True e routing_field não está setado.
+    Handshake GET usa require_routing_field=False (só precisa webhook_verify_token)."""
     from src.api import (
         supabase,
         get_company_adapter_values,
@@ -116,8 +137,8 @@ def _resolve_meta_config_for_company(
         )
         if agent_cfgs.data:
             row = agent_cfgs.data[0]
-            agent_values = row.get("field_values_json") or {}
-            agent_id_override = row.get("agent_id")
+            agent_values = row.get("field_values_json") or {}  # pyright: ignore[reportAssignmentType]
+            agent_id_override = row.get("agent_id")  # pyright: ignore[reportAssignmentType]
     except Exception as e:
         logger.warning("agent_adapter_configs lookup failed for company=%s: %s",
                        company_id, e)
@@ -125,19 +146,136 @@ def _resolve_meta_config_for_company(
     def _r(field: str) -> Optional[str]:
         return resolve_adapter_field_value(field, agent_values, company_values, company_id)
 
+    routing_value = _r(routing_field)
     resolved = {
         "company_id": company_id,
         "adapter_id": adapter_id,
         "agent_id_override": agent_id_override,
+        routing_field: routing_value,
         "phone_number_id": _r("phone_number_id"),
+        "instagram_account_id": _r("instagram_account_id"),
         "app_secret": _r("app_secret"),
+        # Wizard opcional: secret do app Instagram API (produto 182784…), distinta do app pai.
+        "meta_instagram": _r("meta_instagram"),
         "webhook_verify_token": _r("webhook_verify_token"),
         "access_token": _r("access_token"),
         "api_version": _r("api_version"),
     }
-    if not resolved["phone_number_id"]:
-        return None  # config incompleta — não roteia
+    if require_routing_field and not routing_value:
+        return None
     return resolved
+
+
+def _company_meta_hmac_secrets(company_id: str) -> List[str]:
+    """Secrets 32-char em company_secrets (nomes meta/whatsapp/instagram)."""
+    from src.api import supabase, resolve_secret_ref
+
+    if not supabase or not company_id:
+        return []
+    out: List[str] = []
+    try:
+        rows = (
+            supabase.schema("vectraclip")
+            .table("company_secrets")
+            .select("name,vault_secret_id")
+            .eq("company_id", company_id)
+            .execute()
+        )
+        for row in rows.data or []:
+            name = str(row.get("name") or "").lower()
+            if any(
+                skip in name
+                for skip in ("verify_token", "phone_number")
+            ):
+                continue
+            # access_token no nome só entra se for 32 hex (secret Meta colado no campo errado).
+            if "access_token" in name:
+                ref = f"vault://{row.get('vault_secret_id')}"
+                plain_at = _normalize_meta_app_secret(
+                    resolve_secret_ref(ref, company_id) or ""
+                )
+                if plain_at and plain_at not in out:
+                    out.append(plain_at)
+                continue
+            if not any(tok in name for tok in ("app_secret", "meta_instagram")):
+                continue
+            ref = f"vault://{row.get('vault_secret_id')}"
+            plain = _normalize_meta_app_secret(
+                resolve_secret_ref(ref, company_id) or ""
+            )
+            if plain and plain not in out:
+                out.append(plain)
+    except Exception as e:
+        logger.warning("company_meta_hmac_secrets lookup failed: %s", e)
+    return out
+
+
+def _meta_app_secret_env_overrides() -> List[str]:
+    """Override opcional (docker .env) — 32 hex, ex. secret do app pai no painel Meta."""
+    import os
+
+    out: List[str] = []
+    for key in (
+        "VECTRACLAW_META_APP_SECRET",
+        "META_APP_SECRET",
+        "META_INSTAGRAM_APP_SECRET",
+    ):
+        v = _normalize_meta_app_secret(os.getenv(key, ""))
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def _instagram_hmac_secret_candidates(cfg: Dict[str, Any]) -> List[str]:
+    """Secrets para validar X-Hub-Signature-256.
+
+    Webhook configurado no app pai (ex. 699996529141137) usa ``app_secret`` do Basic
+    Settings. O field ``meta_instagram`` (produto IG 182784…) só entra como fallback.
+    """
+    import os
+
+    candidates: List[str] = []
+    for v in _meta_app_secret_env_overrides():
+        candidates.append(v)
+    parent_only = os.getenv("VECTRACLAW_IG_WEBHOOK_PARENT_APP_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    keys = ("app_secret",) if parent_only else ("app_secret", "meta_instagram")
+    for key in keys:
+        v = _normalize_meta_app_secret(str(cfg.get(key) or ""))
+        if v and v not in candidates:
+            candidates.append(v)
+    # Wizard legado: App Secret 32 hex colado em access_token — Meta assina com essa chave.
+    at_misfiled = _normalize_meta_app_secret(str(cfg.get("access_token") or ""))
+    if at_misfiled and at_misfiled not in candidates:
+        candidates.append(at_misfiled)
+        logger.warning(
+            "meta_instagram webhook: HMAC candidate from access_token field (prefix=%s) "
+            "— mova para app_secret no wizard",
+            at_misfiled[:6],
+        )
+    company_id = str(cfg.get("company_id") or "").strip()
+    if company_id:
+        for row in _load_meta_adapter_targets(META_WHATSAPP_ADAPTER_SLUG):
+            if str(row.get("company_id") or "") != company_id:
+                continue
+            wa = _resolve_meta_config_for_company(
+                row["company_id"],
+                row["id"],
+                routing_field="phone_number_id",
+                require_routing_field=False,
+            )
+            if wa:
+                wa_sec = _normalize_meta_app_secret(str(wa.get("app_secret") or ""))
+                if wa_sec and wa_sec not in candidates:
+                    candidates.append(wa_sec)
+            break
+        for extra in _company_meta_hmac_secrets(company_id):
+            if extra not in candidates:
+                candidates.append(extra)
+    return candidates
 
 
 def _find_meta_config_by_phone_number_id(phone_number_id: str) -> Optional[Dict[str, Any]]:
@@ -147,32 +285,170 @@ def _find_meta_config_by_phone_number_id(phone_number_id: str) -> Optional[Dict[
     if not phone_number_id:
         return None
     pid_target = phone_number_id.strip()
-    for adapter_row in _load_meta_adapter_targets():
+    for adapter_row in _load_meta_adapter_targets(META_WHATSAPP_ADAPTER_SLUG):
         resolved = _resolve_meta_config_for_company(
-            adapter_row["company_id"], adapter_row["id"]
+            adapter_row["company_id"],
+            adapter_row["id"],
+            routing_field="phone_number_id",
         )
-        if resolved and resolved["phone_number_id"].strip() == pid_target:
+        if resolved and str(resolved.get("phone_number_id") or "").strip() == pid_target:
             return resolved
     return None
 
 
+def _find_instagram_config_by_account_id(instagram_account_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve config meta-instagram pela chave instagram_account_id (entry.id)."""
+    if not instagram_account_id:
+        return None
+    target = instagram_account_id.strip()
+    for adapter_row in _load_meta_instagram_adapter_targets():
+        resolved = _resolve_meta_config_for_company(
+            adapter_row["company_id"],
+            adapter_row["id"],
+            routing_field="instagram_account_id",
+        )
+        if resolved and str(resolved.get("instagram_account_id") or "").strip() == target:
+            return resolved
+    return None
+
+
+def _resolve_instagram_webhook_cfg(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Config para validar HMAC antes de parsear messaging (entry.id ou adapter único)."""
+    ig_id = ""
+    for entry in payload.get("entry") or []:
+        if isinstance(entry, dict):
+            ig_id = str(entry.get("id") or "").strip()
+            if ig_id:
+                break
+    if ig_id:
+        cfg = _find_instagram_config_by_account_id(ig_id)
+        if cfg:
+            return cfg
+    for adapter_row in _load_meta_instagram_adapter_targets():
+        return _resolve_meta_config_for_company(
+            adapter_row["company_id"],
+            adapter_row["id"],
+            routing_field="instagram_account_id",
+            require_routing_field=False,
+        )
+    return None
+
+
+def _verify_instagram_webhook_hmac(
+    request: Request,
+    body_bytes: bytes,
+    payload: Dict[str, Any],
+    cfg: Dict[str, Any],
+    x_hub_signature_256: Optional[str],
+    x_hub_signature: Optional[str] = None,
+) -> None:
+    """Valida X-Hub-Signature-256 (e sha1 legado) ou levanta HTTPException (401/503)."""
+    hmac_secrets = _instagram_hmac_secret_candidates(cfg)
+    if not hmac_secrets and not _meta_signature_skip_enabled():
+        raise HTTPException(503, "app_secret_not_configured_for_company")
+    if _meta_signature_skip_enabled():
+        logger.warning(
+            "meta_instagram webhook: HMAC skipped (VECTRACLAW_IG_WEBHOOK_SKIP_HMAC) "
+            "company_id=%s",
+            cfg.get("company_id"),
+        )
+        return
+    sig_headers: List[tuple[str, str]] = []
+    if x_hub_signature_256:
+        sig_headers.append(("sha256", x_hub_signature_256))
+    if x_hub_signature:
+        sig_headers.append(("sha1", x_hub_signature))
+    if not sig_headers:
+        logger.warning(
+            "meta_instagram webhook: missing X-Hub-Signature-256 company_id=%s",
+            cfg.get("company_id"),
+        )
+        raise HTTPException(401, "invalid_meta_signature")
+    for idx, secret in enumerate(hmac_secrets):
+        for algo, header_val in sig_headers:
+            if algo == "sha256" and _verify_meta_signature_with_payload(
+                body_bytes, payload, header_val, secret
+            ):
+                logger.info(
+                    "meta_instagram webhook: HMAC ok candidate=%s/%s prefix=%s "
+                    "algo=sha256 company_id=%s",
+                    idx + 1,
+                    len(hmac_secrets),
+                    secret[:6],
+                    cfg.get("company_id"),
+                )
+                return
+            if algo == "sha1" and _verify_meta_signature(
+                body_bytes, header_val, secret, algorithm="sha1"
+            ):
+                logger.info(
+                    "meta_instagram webhook: HMAC ok candidate=%s/%s prefix=%s "
+                    "algo=sha1 company_id=%s",
+                    idx + 1,
+                    len(hmac_secrets),
+                    secret[:6],
+                    cfg.get("company_id"),
+                )
+                return
+    header = (x_hub_signature_256 or "").strip()
+    expected = header.split("=", 1)[1].strip().lower() if "sha256=" in header else ""
+    digests: List[str] = []
+    for secret in hmac_secrets:
+        dig = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest().lower()
+        digests.append(f"{secret[:6]}:{dig[:16]}")
+    try:
+        from pathlib import Path
+
+        body_tag = hashlib.sha256(body_bytes).hexdigest()[:16]
+        Path(f"/tmp/meta_ig_{body_tag}.bin").write_bytes(body_bytes)
+        Path(f"/tmp/meta_ig_{body_tag}.sig").write_text(header, encoding="utf-8")
+        Path("/tmp/meta_ig_webhook_last.bin").write_bytes(body_bytes)
+        Path("/tmp/meta_ig_webhook_last.sig").write_text(header, encoding="utf-8")
+    except Exception as e:
+        logger.warning("meta_instagram webhook: body capture failed: %s", e)
+    logger.warning(
+        "meta_instagram webhook: HMAC mismatch company_id=%s "
+        "candidates=%s tried=%s body_len=%s body_sha256=%s expected_sig=%s "
+        "content_encoding=%s",
+        cfg.get("company_id"),
+        len(hmac_secrets),
+        digests,
+        len(body_bytes),
+        hashlib.sha256(body_bytes).hexdigest()[:16],
+        expected[:16],
+        request.headers.get("content-encoding"),
+    )
+    raise HTTPException(401, "invalid_meta_signature")
+
+
 def _find_any_meta_config_with_verify_token(verify_token: str) -> Optional[Dict[str, Any]]:
-    """Handshake GET vem ANTES do POST e Meta não envia phone_number_id no GET.
-    Aceita qualquer config Meta cujo webhook_verify_token (resolvido via W5)
-    bata. Multi-tenant com mesmo verify_token: primeiro match — admin deve
-    usar tokens distintos."""
+    """Handshake GET: aceita verify_token de meta-whatsapp OU meta-instagram."""
     if not verify_token:
         return None
     vt = verify_token.strip()
-    for adapter_row in _load_meta_adapter_targets():
-        resolved = _resolve_meta_config_for_company(
-            adapter_row["company_id"], adapter_row["id"]
-        )
-        if not resolved:
-            continue
-        cfg_token = (resolved.get("webhook_verify_token") or "").strip()
-        if cfg_token and hmac.compare_digest(cfg_token, vt):
-            return resolved
+    instagram_rows = _load_meta_instagram_adapter_targets()
+    for slug, routing_field, rows in (
+        (META_WHATSAPP_ADAPTER_SLUG, "phone_number_id", _load_meta_adapter_targets(META_WHATSAPP_ADAPTER_SLUG)),
+        (META_INSTAGRAM_ADAPTER_SLUGS[0], "instagram_account_id", instagram_rows),
+    ):
+        for adapter_row in rows:
+            resolved = _resolve_meta_config_for_company(
+                adapter_row["company_id"],
+                adapter_row["id"],
+                routing_field=routing_field,
+                require_routing_field=False,
+            )
+            if not resolved:
+                continue
+            cfg_token = (resolved.get("webhook_verify_token") or "").strip()
+            if not cfg_token:
+                logger.warning(
+                    "meta webhook verify: adapter slug=%s company=%s sem webhook_verify_token resolvido",
+                    slug, adapter_row.get("company_id"),
+                )
+                continue
+            if hmac.compare_digest(cfg_token, vt):
+                return resolved
     return None
 
 
@@ -204,17 +480,87 @@ async def meta_whatsapp_webhook_verify(
     return Response(content=hub_challenge, media_type="text/plain")
 
 
-def _verify_meta_signature(body_bytes: bytes, signature_header: str, app_secret: str) -> bool:
-    """X-Hub-Signature-256 = 'sha256=<hex_hmac>'. Compara via hmac.compare_digest."""
-    if not signature_header or not signature_header.startswith("sha256="):
+def _normalize_meta_app_secret(value: str) -> str:
+    """App Secret Meta: 32 chars hex; remove espaços/BOM de cópia do painel."""
+    v = (value or "").strip().replace("\r", "").replace("\n", "")
+    if len(v) != 32:
+        return ""
+    try:
+        int(v, 16)
+    except ValueError:
+        return ""
+    return v.lower()
+
+
+def _verify_meta_signature(
+    body_bytes: bytes,
+    signature_header: str,
+    app_secret: str,
+    *,
+    algorithm: str = "sha256",
+) -> bool:
+    """Valida ``sha256=<hex>`` ou ``sha1=<hex>`` (legado) sobre body bruto."""
+    secret = _normalize_meta_app_secret(app_secret)
+    if not signature_header or not secret:
         return False
-    expected = signature_header.split("=", 1)[1].strip()
-    digest = hmac.new(
-        app_secret.encode("utf-8"),
-        body_bytes,
-        hashlib.sha256,
-    ).hexdigest()
+    header = signature_header.strip()
+    prefix = f"{algorithm}="
+    if not header.lower().startswith(prefix):
+        return False
+    expected = header.split("=", 1)[1].strip().lower()
+    hash_fn = hashlib.sha256 if algorithm == "sha256" else hashlib.sha1
+    digest = hmac.new(secret.encode("utf-8"), body_bytes, hash_fn).hexdigest().lower()
     return hmac.compare_digest(expected, digest)
+
+
+def _verify_meta_signature_with_payload(
+    body_bytes: bytes,
+    payload: Dict[str, Any],
+    signature_header: str,
+    app_secret: str,
+) -> bool:
+    """Valida HMAC no body bruto; fallbacks se proxy reformatar JSON."""
+    if _verify_meta_signature(body_bytes, signature_header, app_secret):
+        return True
+    import json
+
+    candidates: list[bytes] = []
+    try:
+        candidates.append(
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        candidates.append(
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        )
+        candidates.append(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        candidates.append(json.dumps(payload, sort_keys=True).encode("utf-8"))
+    except Exception:
+        pass
+    for alt in candidates:
+        if alt != body_bytes and _verify_meta_signature(alt, signature_header, app_secret):
+            logger.info("meta_instagram webhook: HMAC ok on JSON re-encode variant")
+            return True
+    return False
+
+
+def _meta_signature_debug_enabled() -> bool:
+    import os
+    return os.getenv("VECTRACLAW_IG_WEBHOOK_DEBUG", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _meta_signature_skip_enabled() -> bool:
+    import os
+    return os.getenv("VECTRACLAW_IG_WEBHOOK_SKIP_HMAC", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _parse_meta_message(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -369,6 +715,253 @@ async def meta_whatsapp_webhook(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Meta Instagram — GET (handshake) e POST (DM inbound)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/api/connectors/instagram/webhook")
+@router.get("/connectors/instagram/webhook")
+async def meta_instagram_webhook_verify(
+    hub_mode: Optional[str] = Query(default=None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(default=None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(default=None, alias="hub.challenge"),
+):
+    """Handshake Meta para Instagram (mesmo fluxo hub.challenge do WhatsApp)."""
+    if hub_mode != "subscribe":
+        raise HTTPException(400, "invalid_hub_mode")
+    if not hub_verify_token or not hub_challenge:
+        raise HTTPException(400, "missing_hub_params")
+    cfg = _find_any_meta_config_with_verify_token(hub_verify_token)
+    if not cfg:
+        logger.warning(
+            "meta_instagram verify token mismatch (token first 4 chars: %s)",
+            hub_verify_token[:4],
+        )
+        raise HTTPException(403, "verify_token_mismatch")
+    logger.info("meta_instagram webhook verified for company_id=%s", cfg.get("company_id"))
+    return Response(content=hub_challenge, media_type="text/plain")
+
+
+@router.post("/api/connectors/instagram/webhook")
+@router.post("/connectors/instagram/webhook")
+async def meta_instagram_webhook(
+    request: Request,
+    x_hub_signature_256: Optional[str] = Header(default=None, alias="X-Hub-Signature-256"),
+    x_hub_signature: Optional[str] = Header(default=None, alias="X-Hub-Signature"),
+):
+    """Recebe payload Meta Instagram (object=instagram). Mesmo pipeline W3:
+    connector_session + inbound-triage via connector_channels."""
+    from src.services import connector_bus
+    from src.services.instagram_parser import (
+        instagram_message_to_bus_dict,
+        parse_instagram_payload,
+    )
+
+    body_bytes = await request.body()
+    if not body_bytes:
+        raise HTTPException(400, "empty_body")
+    try:
+        import json
+        payload = json.loads(body_bytes)
+    except Exception:
+        raise HTTPException(400, "invalid_json")
+
+    if payload.get("object") != "instagram":
+        logger.info("meta_instagram webhook: object=%s ignored", payload.get("object"))
+        return {"received": True, "had_message": False}
+
+    cfg = _resolve_instagram_webhook_cfg(payload)
+    if not cfg:
+        logger.warning("meta_instagram webhook: no adapter config for HMAC")
+        raise HTTPException(404, "no_adapter_config_for_instagram_webhook")
+    _verify_instagram_webhook_hmac(
+        request,
+        body_bytes,
+        payload,
+        cfg,
+        x_hub_signature_256,
+        x_hub_signature,
+    )
+
+    parsed = parse_instagram_payload(payload)
+    if not parsed:
+        return {"received": True, "had_message": False}
+
+    last_session: Optional[Dict[str, Any]] = None
+    last_msg: Optional[Dict[str, Any]] = None
+    last_task_id: Optional[str] = None
+
+    for ig_msg in parsed:
+        msg = instagram_message_to_bus_dict(ig_msg)
+        if not msg["instagram_account_id"]:
+            continue
+        if not msg["external_id"]:
+            continue
+
+        msg_cfg = _find_instagram_config_by_account_id(msg["instagram_account_id"])
+        if not msg_cfg:
+            logger.warning(
+                "meta_instagram webhook: skip unknown instagram_account_id=%s",
+                msg["instagram_account_id"],
+            )
+            continue
+
+        company_id = str(msg_cfg.get("company_id") or "").strip()
+        if not company_id:
+            continue
+
+        try:
+            session = connector_bus.get_or_open_session(
+                company_id=company_id,
+                channel="instagram",
+                connector_id=msg["instagram_account_id"],
+                external_id=msg["external_id"],
+                external_name=msg.get("external_name"),
+                external_meta={"mid": msg["message_id"], "msg_type": msg["msg_type"]},
+            )
+            if msg["content"]:
+                connector_bus.append_history(
+                    session_id=session["id"],
+                    role="user",
+                    content=msg["content"],
+                    extra={"mid": msg["message_id"], "timestamp": msg["timestamp"]},
+                )
+        except RuntimeError as e:
+            logger.error("meta_instagram_webhook bus failure: %s", e)
+            raise HTTPException(503, str(e))
+        except Exception:
+            logger.exception("meta_instagram_webhook unexpected failure")
+            raise HTTPException(500, "instagram_webhook_failed")
+
+        task_id: Optional[str] = None
+        if msg["content"]:
+            task_id = _dispatch_inbound_task(
+                company_id=company_id,
+                session=session,
+                msg=msg,
+            )
+        last_session = session
+        last_msg = msg
+        last_task_id = task_id
+
+    if not last_session or not last_msg:
+        return {"received": True, "had_message": False}
+
+    delivered = False
+    if last_msg.get("content"):
+        delivered = await _instagram_inline_triage_and_reply(
+            session_id=str(last_session["id"]),
+            task_id=last_task_id,
+        )
+
+    return {
+        "session_id": last_session["id"],
+        "status": last_session.get("status"),
+        "external_id": last_msg["external_id"],
+        "had_content": bool(last_msg["content"]),
+        "task_id": last_task_id,
+        "reply_delivered": delivered,
+    }
+
+
+async def _instagram_inline_triage_and_reply(
+    *,
+    session_id: str,
+    task_id: Optional[str],
+) -> bool:
+    """Triage Morpheus + reply DM no webhook (daemon pode estar parado)."""
+    import os
+
+    if os.getenv("VECTRACLAW_IG_INLINE_TRIAGE", "true").strip().lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return False
+
+    from src.api import supabase
+    from src.services import connector_bus
+
+    if not supabase or not session_id:
+        return False
+
+    reply_text = (
+        "Recebi sua mensagem! 👋 Já encaminhei pro time e respondemos em breve."
+    )
+    if task_id:
+        try:
+            tres = (
+                supabase.table("tasks")
+                .select("*")
+                .eq("id", task_id)
+                .limit(1)
+                .execute()
+            )
+            if tres.data:
+                from src.agents.morpheus_inbound_triage import entrypoint as triage_entry
+
+                result = triage_entry(tres.data[0], supabase)
+                if isinstance(result, dict):
+                    candidate = str(result.get("output_text") or "").strip()
+                    if candidate:
+                        reply_text = candidate
+                    if str(result.get("status") or "").strip() == "done":
+                        patch: Dict[str, Any] = {
+                            "status": "done",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        if result.get("output_json") is not None:
+                            patch["output_json"] = result["output_json"]
+                        (
+                            supabase.table("tasks")
+                            .update(patch)
+                            .eq("id", task_id)
+                            .eq("status", "queued")
+                            .execute()
+                        )
+        except Exception as e:
+            logger.warning(
+                "meta_instagram inline triage failed task=%s: %s", task_id, e
+            )
+
+    try:
+        sres = (
+            supabase.table("connector_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .limit(1)
+            .execute()
+        )
+        if not sres.data:
+            return False
+        session_row = sres.data[0]
+    except Exception as e:
+        logger.warning("meta_instagram inline reply: session load failed: %s", e)
+        return False
+
+    try:
+        delivered = await connector_bus.reply(session_row, reply_text)
+        if delivered:
+            logger.info(
+                "meta_instagram inline reply sent session=%s task=%s len=%d",
+                session_id,
+                task_id,
+                len(reply_text),
+            )
+        else:
+            logger.warning(
+                "meta_instagram inline reply NOT delivered session=%s task=%s",
+                session_id,
+                task_id,
+            )
+        return bool(delivered)
+    except Exception as e:
+        logger.exception(
+            "meta_instagram inline reply failed session=%s: %s", session_id, e
+        )
+        return False
+
+
 def _resolve_inbound_routing(channel: str) -> Optional[Dict[str, Any]]:
     """W7 P0-9 — Lookup catalog-driven do roteamento default pra um canal inbound.
 
@@ -451,8 +1044,27 @@ def _dispatch_inbound_task(
 
     content = msg["content"]
     external_label = (msg.get("external_name") or msg.get("external_id") or "").strip()
-    title = f"WhatsApp: {external_label[:30]} — {content[:60]}".strip()
+    channel = (session.get("channel") or "connector").strip()
+    channel_labels = {"whatsapp": "WhatsApp", "instagram": "Instagram"}
+    prefix = channel_labels.get(channel, channel.title() or "Connector")
+    title = f"{prefix}: {external_label[:30]} — {content[:60]}".strip()
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    input_json: Dict[str, Any] = {
+        "source": f"meta_{channel}_webhook",
+        "session_id": session["id"],
+        "external_id": msg["external_id"],
+        "external_name": msg.get("external_name"),
+        "message": content,
+        "channel": channel,
+        "button_id_hint": msg.get("button_id_hint"),
+    }
+    if msg.get("phone_number_id"):
+        input_json["phone_number_id"] = msg["phone_number_id"]
+        input_json["wamid"] = msg.get("message_id")
+    if msg.get("instagram_account_id"):
+        input_json["instagram_account_id"] = msg["instagram_account_id"]
+        input_json["mid"] = msg.get("message_id")
 
     task_row = {
         "company_id": company_id,
@@ -467,19 +1079,7 @@ def _dispatch_inbound_task(
         # do F2. Auditor 2026-05-18: zero hardcode novo, metadata-driven puro.
         "executor_type": "auto",
         "assigned_to_agent_id": assigned_agent,
-        "input_json": {
-            "source": "meta_whatsapp_webhook",
-            "session_id": session["id"],
-            "external_id": msg["external_id"],
-            "external_name": msg.get("external_name"),
-            "phone_number_id": msg["phone_number_id"],
-            "message": content,
-            "wamid": msg.get("message_id"),
-            # W9 — channel pra Morpheus consultar connector_channels.fallback_operation_type;
-            # button_id_hint pra inbound_intent_rules.button_id (match exato Meta interactive)
-            "channel": session.get("channel"),
-            "button_id_hint": msg.get("button_id_hint"),
-        },
+        "input_json": input_json,
         "created_at": now_iso,
         "updated_at": now_iso,
     }
