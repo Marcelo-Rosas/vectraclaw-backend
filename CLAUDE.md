@@ -108,6 +108,7 @@ Branch → commit → push → `gh pr create` → checks → `gh pr merge --squa
 
 - `COMANDOS.md` — operações: kill server, reenfileirar task, smoke SMTP, daemon logs, supabase CLI cheatsheet
 - `supabase/MIGRATIONS.md` — drift handling, repair seguro, fluxo de `db pull`/`db push`
+- `docs/HANDOFF-TRILHA-A-CLIP-INSTAGRAM.md` — Trilha A + Instagram (#295/#296/#297); espelho Clip `HANDOFF-TRILHA-A-CLIP.md`
 - `docs/PRD-*` — specs de agentes e features (Hodos QUALP, Oracle, Workflow Builder)
 - `docs/VEC-*` — issues Linear documentadas
 - `docs/ADR-VEC-237-*.md` — Architecture Decision Records
