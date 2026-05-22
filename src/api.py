@@ -792,6 +792,9 @@ async def auth_middleware(request: Request, call_next):
         # (POST) verificados dentro do handler contra agent_adapter_configs.
         "/api/connectors/whatsapp/webhook",
         "/connectors/whatsapp/webhook",
+        # Meta Instagram Messaging API (hub.* + HMAC; sem JWT Supabase).
+        "/api/connectors/instagram/webhook",
+        "/connectors/instagram/webhook",
     ]
     if any(path == p for p in public_paths):
         return await call_next(request)

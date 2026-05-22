@@ -36,6 +36,31 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _pg_dict(value: Any) -> Dict[str, Any]:
+    """Coerce PostgREST JSON cell to dict (basedpyright-safe)."""
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _pg_row(value: Any) -> Dict[str, Any]:
+    """Coerce PostgREST table row to dict."""
+    if isinstance(value, dict):
+        return value
+    raise RuntimeError("connector_bus: expected dict row from PostgREST")
+
+
+def _pg_history(value: Any) -> List[Dict[str, Any]]:
+    """Coerce JSONB history ring buffer to list of message dicts."""
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
 def get_or_open_session(
     *,
     company_id: str,
@@ -64,13 +89,13 @@ def get_or_open_session(
         .execute()
     )
     if existing.data:
-        row = existing.data[0]
+        row = _pg_row(existing.data[0])
         # Atualiza external_name/meta se vierem novos (refresh barato).
         updates: Dict[str, Any] = {}
         if external_name and external_name != row.get("external_name"):
             updates["external_name"] = external_name
         if external_meta:
-            updates["external_meta"] = {**(row.get("external_meta") or {}), **external_meta}
+            updates["external_meta"] = {**_pg_dict(row.get("external_meta")), **external_meta}
         if updates:
             updates["updated_at"] = _now_iso()
             supabase.table("connector_sessions").update(updates).eq("id", row["id"]).execute()
@@ -95,7 +120,7 @@ def get_or_open_session(
         "connector_session opened company=%s channel=%s external=%s id=%s",
         company_id, channel, external_id, res.data[0]["id"],
     )
-    return res.data[0]
+    return _pg_row(res.data[0])
 
 
 def append_history(
@@ -107,6 +132,7 @@ def append_history(
 ) -> Dict[str, Any]:
     """Faz append ao ring buffer JSONB de history. Trunca pra
     CONNECTOR_HISTORY_RING_SIZE últimas trocas. Atualiza last_message + last_message_at.
+    Mensagens do usuário (`role=user`) também atualizam last_inbound_at (janela Meta 24h).
     Best-effort: loga warning se falhar mas não levanta (caller já tem msg)."""
     from src.api import supabase
     if not supabase:
@@ -122,7 +148,7 @@ def append_history(
     if not current.data:
         raise RuntimeError(f"connector_session_not_found: {session_id}")
 
-    history: List[Dict[str, Any]] = current.data[0].get("history") or []
+    history = _pg_history(current.data[0].get("history"))
     entry = {"role": role, "content": content, "ts": _now_iso()}
     if extra:
         entry.update(extra)
@@ -136,11 +162,13 @@ def append_history(
         "last_message_at": entry["ts"],
         "updated_at": entry["ts"],
     }
+    if role == "user":
+        update_row["last_inbound_at"] = entry["ts"]
     res = supabase.table("connector_sessions").update(update_row).eq("id", session_id).execute()
     if not res.data:
         logger.warning("connector_session append_history returned empty for %s", session_id)
         return {"id": session_id, **update_row}
-    return res.data[0]
+    return _pg_row(res.data[0])
 
 
 def promote_to_processing(
@@ -170,7 +198,7 @@ def promote_to_processing(
         raise RuntimeError(f"connector_session_promote_failed: {session_id}")
     logger.info("connector_session promoted id=%s task=%s agent=%s",
                 session_id, task_id, routed_to_agent)
-    return res.data[0]
+    return _pg_row(res.data[0])
 
 
 def close_session(*, session_id: str, status: str = "closed") -> Dict[str, Any]:
@@ -187,7 +215,7 @@ def close_session(*, session_id: str, status: str = "closed") -> Dict[str, Any]:
     res = supabase.table("connector_sessions").update(update_row).eq("id", session_id).execute()
     if not res.data:
         raise RuntimeError(f"connector_session_close_failed: {session_id}")
-    return res.data[0]
+    return _pg_row(res.data[0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +223,26 @@ def close_session(*, session_id: str, status: str = "closed") -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _META_GRAPH_BASE = "https://graph.facebook.com"
+_INSTAGRAM_GRAPH_BASE = "https://graph.instagram.com"
+
+
+def _build_instagram_messages_url(
+    access_token: str,
+    api_version: str,
+    instagram_account_id: str,
+) -> str:
+    """URL de envio DM Instagram.
+
+    - Token ``IGAA…`` (Instagram API com Instagram Login): ``graph.instagram.com/.../me/messages``
+    - Token ``EAA…`` / Page (Messenger legado): ``graph.facebook.com/.../{ig_account_id}/messages``
+    """
+    ver = (api_version or "v21.0").strip()
+    if not ver.startswith("v"):
+        ver = f"v{ver}"
+    if access_token.strip().upper().startswith("IG"):
+        return f"{_INSTAGRAM_GRAPH_BASE}/{ver}/me/messages"
+    ig_id = instagram_account_id.strip()
+    return f"{_META_GRAPH_BASE}/{ver}/{ig_id}/messages"
 
 
 async def reply(
@@ -235,6 +283,8 @@ async def reply(
             template_params=template_params,
             append_role=append_role,
         )
+    if channel == "instagram":
+        return await _reply_instagram_meta(session, message, append_role=append_role)
     logger.warning("connector_bus.reply: canal '%s' não suportado (W12: dispatch table)", channel)
     return False
 
@@ -374,6 +424,98 @@ async def _reply_whatsapp_meta(
         "connector_bus._reply_whatsapp_meta: sent session=%s to=%s len=%d kind=%s",
         session.get("id"), to_digits, len(message),
         ("template" if use_template else "text"),
+    )
+    return True
+
+
+async def _reply_instagram_meta(
+    session: Dict[str, Any],
+    message: str,
+    *,
+    append_role: Optional[str] = "agent",
+) -> bool:
+    """Envia DM via Instagram Messaging API (Graph). connector_id da session =
+    instagram_account_id (set no webhook inbound)."""
+    instagram_account_id = (session.get("connector_id") or "").strip()
+    recipient_id = (session.get("external_id") or "").strip()
+    if not instagram_account_id or not recipient_id or not message.strip():
+        logger.warning(
+            "connector_bus._reply_instagram_meta: missing fields ig=%s to=%s",
+            bool(instagram_account_id), bool(recipient_id),
+        )
+        return False
+
+    try:
+        from src.api_routes.connectors import _find_instagram_config_by_account_id
+    except Exception as e:
+        logger.error("connector_bus: import instagram resolver falhou: %s", e)
+        return False
+
+    cfg = _find_instagram_config_by_account_id(instagram_account_id)
+    if not cfg:
+        logger.warning(
+            "connector_bus._reply_instagram_meta: no adapter for instagram_account_id=%s",
+            instagram_account_id,
+        )
+        return False
+
+    access_token = (cfg.get("access_token") or "").strip()
+    api_version = (cfg.get("api_version") or "v21.0").strip()
+    if not access_token:
+        logger.warning(
+            "connector_bus._reply_instagram_meta: access_token vazio ig=%s",
+            instagram_account_id,
+        )
+        return False
+
+    company_id = session.get("company_id")
+    adapter_id = cfg.get("adapter_id")
+    if not _is_in_session_window(session, company_id, adapter_id):
+        window_h = resolve_session_window_hours_safe(company_id, adapter_id)
+        logger.warning(
+            "connector_bus._reply_instagram_meta: FORA janela %dh — reply bloqueado session=%s",
+            window_h, session.get("id"),
+        )
+        return False
+
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": message[:1000]},
+    }
+    url = _build_instagram_messages_url(access_token, api_version, instagram_account_id)
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code >= 400:
+            logger.error(
+                "connector_bus._reply_instagram_meta: API %s url=%s ig=%s body=%s",
+                resp.status_code, url, instagram_account_id, resp.text[:500],
+            )
+            return False
+    except Exception as e:
+        logger.exception("connector_bus._reply_instagram_meta HTTP falhou: %s", e)
+        return False
+
+    if append_role is not None:
+        try:
+            append_history(
+                session_id=session["id"],
+                role=append_role,
+                content=message,
+                extra={"channel": "instagram", "delivery": "instagram_graph_api"},
+            )
+        except Exception as e:
+            logger.warning("connector_bus._reply_instagram_meta append_history: %s", e)
+
+    logger.info(
+        "connector_bus._reply_instagram_meta: sent session=%s url=%s to=%s len=%d",
+        session.get("id"), url, recipient_id, len(message),
     )
     return True
 

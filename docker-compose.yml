@@ -5,17 +5,22 @@ services:
     restart: unless-stopped
     volumes:
       - nous-hermes-config:/root/.hermes
+    mem_limit: 4g
+    cpus: 4
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9120/health"]
       interval: 30s
       timeout: 15s
       retries: 5
-      start_period: 180s
+      start_period: 120s
 
   backend:
     build: .
     container_name: vectraclaw-backend
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     ports:
       - "3100:3000"
     env_file:
@@ -23,11 +28,11 @@ services:
     environment:
       PORT: "3000"
       NOUS_HERMES_RUNTIME_URL: http://nous-hermes-runtime:9120
+      # Webhook Instagram no app pai 699996529141137 — HMAC só com App Secret do Basic Settings
+      VECTRACLAW_IG_WEBHOOK_PARENT_APP_ONLY: "true"
+    mem_limit: 2g
+    cpus: 2
     depends_on:
-      # service_started (NÃO _healthy): backend não bloqueia esperando o
-      # nous-hermes ficar healthy. O healthcheck dele tem start_period 180s +
-      # boot lento do runtime → recreate do backend levava 10min-1h. Nous-hermes
-      # é provider fallback; backend tolera ele aquecendo e sobe em segundos.
       nous-hermes-runtime:
         condition: service_started
     healthcheck:
@@ -41,11 +46,16 @@ services:
     build: .
     container_name: vectraclaw-daemon
     restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     command: ["python", "-m", "src.agent_daemon"]
     env_file:
       - .env
     environment:
       NOUS_HERMES_RUNTIME_URL: http://nous-hermes-runtime:9120
+    mem_limit: 2g
+    cpus: 2
     depends_on:
       backend:
         condition: service_healthy
@@ -59,6 +69,8 @@ services:
     command: tunnel --config /etc/cloudflared/config.yml run
     volumes:
       - ./cloudflared:/etc/cloudflared:ro
+    mem_limit: 256m
+    cpus: 0.5
     depends_on:
       backend:
         condition: service_healthy
