@@ -5059,16 +5059,24 @@ async def create_routine(request: Request, company_id: str, payload: Dict[str, A
     if merged_metadata is not None:
         row["metadata"] = merged_metadata
 
+    wf_def_id = payload.get("workflowDefinitionId")
+    if wf_def_id:
+        row["workflow_definition_id"] = wf_def_id
+
     if not supabase:
         new_rot = row.copy()
         new_rot["id"] = f"rot_tmp_{int(datetime.now().timestamp())}"
         new_rot["companyId"] = new_rot.pop("company_id")
         new_rot["createdAt"] = new_rot.pop("created_at")
+        if wf_def_id:
+            new_rot["workflowDefinitionId"] = wf_def_id
         MOCK_ROUTINES.append(new_rot)
         return new_rot
 
     try:
-        res = supabase.table("routines").insert(row).execute()
+        client = get_authenticated_client(request.state.token)
+        _assert_workflow_definition_for_company(client, wf_def_id, company_id)
+        res = client.table("routines").insert(row).execute()
         return _routine_wire_dict(res.data[0])
     except Exception as e:
         logger.error(f"create_routine failed: {e}")
@@ -5107,10 +5115,18 @@ async def patch_routine(request: Request, routine_id: str, payload: Dict[str, An
         return row
     try:
         client = get_authenticated_client(request.state.token)
-        res = client.table("routines").select("id,metadata").eq("id", routine_id).limit(1).execute()
+        res = (
+            client.table("routines")
+            .select("id,metadata,company_id")
+            .eq("id", routine_id)
+            .limit(1)
+            .execute()
+        )
         if not res.data:
             raise HTTPException(404, "routine_not_found")
-        current_metadata = res.data[0].get("metadata")
+        routine_row = res.data[0]
+        current_metadata = routine_row.get("metadata")
+        routine_company_id = routine_row.get("company_id")
 
         # Normalise camelCase keys from the frontend to snake_case for DB
         CAMEL_TO_SNAKE = {
@@ -5118,6 +5134,7 @@ async def patch_routine(request: Request, routine_id: str, payload: Dict[str, An
             "promptTemplate": "prompt_template",
             "nextRunAt": "next_run_at",
             "operationType": "operation_type",
+            "workflowDefinitionId": "workflow_definition_id",
         }
         normalised = {CAMEL_TO_SNAKE.get(k, k): v for k, v in payload.items()}
 
@@ -5130,8 +5147,15 @@ async def patch_routine(request: Request, routine_id: str, payload: Dict[str, An
             "metadata",
             "next_run_at",
             "operation_type",
+            "workflow_definition_id",
         }
         update_data = {k: v for k, v in normalised.items() if k in ALLOWED}
+        if "workflow_definition_id" in update_data:
+            _assert_workflow_definition_for_company(
+                client,
+                update_data.get("workflow_definition_id"),
+                routine_company_id,
+            )
         if payload.get("executionParams") is not None or payload.get("metadata") is not None:
             merged_metadata = _merge_routine_execution_params_payload(
                 payload,
@@ -5232,6 +5256,35 @@ def _load_kronos_operation_types() -> set[str]:
     except Exception as e:
         logger.warning(f"_load_kronos_operation_types fallback empty: {e}")
         return set()
+
+
+def _assert_workflow_definition_for_company(
+    client: Any,
+    workflow_definition_id: Optional[str],
+    company_id: str,
+) -> None:
+    """Valida FK lógica: workflow_definitions.id pertence à mesma company."""
+    if not workflow_definition_id:
+        return
+    try:
+        res = (
+            client.table("workflow_definitions")
+            .select("id")
+            .eq("id", workflow_definition_id)
+            .eq("company_id", company_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error("_assert_workflow_definition_for_company failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="workflow_definitions_unavailable"
+        ) from exc
+    if not res.data:
+        raise HTTPException(
+            status_code=422,
+            detail="workflow_definition_not_found_or_wrong_company",
+        )
 
 
 def _routine_wire_dict(row: dict) -> dict:
