@@ -348,6 +348,11 @@ class Goal(CamelModel):
     metric: str
     target: float
     current: float
+    kind: Optional[str] = None
+    confidence: Optional[float] = None
+    business_case_strength: Optional[str] = None
+    classified_at: Optional[datetime] = None
+    pmoia_metadata: Optional[Dict[str, Any]] = None
 
     @validator('parent_goal_id', pre=True)
     def empty_to_none(cls, v):
@@ -357,6 +362,13 @@ class Goal(CamelModel):
 
     def to_zod_dict(self):
         d = self.dict(by_alias=True)
+        if self.classified_at:
+            d["classifiedAt"] = self.classified_at.isoformat().replace("+00:00", "Z")
+        meta = self.pmoia_metadata if isinstance(self.pmoia_metadata, dict) else {}
+        if meta.get("classification_rationale") is not None:
+            d["classificationRationale"] = meta["classification_rationale"]
+        if meta.get("next_handler_suggested") is not None:
+            d["nextHandlerSuggested"] = meta["next_handler_suggested"]
         return d
 
 
@@ -551,6 +563,7 @@ class Routine(CamelModel):
     schedule: RoutineSchedule
     agent_id: Optional[str] = None
     operation_type: Optional[str] = None
+    workflow_definition_id: Optional[str] = None
     metadata: Optional[dict] = None
     prompt_template: Optional[str] = None
     next_run_at: Optional[datetime] = None
