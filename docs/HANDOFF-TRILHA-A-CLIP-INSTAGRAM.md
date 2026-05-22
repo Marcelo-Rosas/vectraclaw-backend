@@ -1,8 +1,8 @@
 # Handoff — Trilha A (Clip) + Instagram PR0 validado
 
-> **Data:** 2026-05-22  
-> **Backend repo:** `vectraclaw-backend` (VectraClaw) — `main` @ merge #295 + #296  
-> **Frontend repo:** VectraClip (`cargo-flow-navigator` / `vectraclip-frontend`)  
+> **Data:** 2026-05-22 (atualizado pós-merge Clip #63)  
+> **Backend repo:** `vectraclaw-backend` (VectraClaw) — `main` @ #295 + #296 + handoff #297  
+> **Frontend repo:** `vectraclip-frontend` — `main` @ `fa6c95bf` ([PR #63](https://github.com/Marcelo-Rosas/vectraclip-frontend/pull/63) mergeado)  
 > **ADR backbone:** `docs/ADR-VEC-MAPEAR-ANALISAR-AUTOMATIZAR.md` §5  
 > **Plano detalhado:** `.cursor/plans/pr-b1_b2_trilha_a_c4c5c7a7.plan.md`  
 > **Espelho Clip (fonte de verdade UI):** `vectraclip-frontend/docs/HANDOFF-TRILHA-A-CLIP.md`
@@ -16,9 +16,10 @@
 | [PRs mergeados](#prs-mergeados-backend) | Links #295 / #296 |
 | [Instagram validado](#instagram--estado-validado-2026-05-22) | Pipeline webhook, HMAC, inbound-triage, smoke pytest |
 | [APIs Clip](#apis-prontas-para-o-clip-trilha-a) | PR-B1 routines, PR-B2 goals, BPMN materialize, from-workflow |
-| [Checklist FE-GAP](#checklist-clip--ordem-p0-fe-gap) | P0 itens 1–6 ✅ no workspace; 7 = P1 |
+| [Checklist FE-GAP](#checklist-clip--ordem-p0-fe-gap) | P0 1–6 ✅ em `main` Clip #63; 7 = P1 |
+| [Smoke E2E pós-deploy](#smoke-e2e-pós-deploy-clip-63--api) | 5 passos em prod (Pages + API) |
 | [O que NÃO fazer](#o-que-não-fazer) | IGAA no verify token, classify por DM, etc. |
-| [Prompt agente](#prompt-curto-para-colar-no-agente-vectraclip) | Validação E2E + PR (não implementar do zero) |
+| [Prompt agente](#prompt-curto-pós-merge--validação-ou-p1) | Smoke prod ou PR P1 |
 
 ---
 
@@ -29,7 +30,7 @@
 | **Instagram DM (PR0)** | Validado em prod/tunnel | DM teste → resposta automática human-triage |
 | **PR-B1** routine↔workflow | Em `main` (#295) | `workflowDefinitionId` create/patch/get + FK |
 | **PR-B2** goal classify wire | Em `main` (#295) | `kind`, `confidence`, `classifiedAt` no GET goals |
-| **Clip Trilha A UI** | **P0 no workspace** (VectraClip) | Itens 1–6 abaixo implementados; P1 (wizard Meta, picker RAG) pendente. Espelho: `vectraclip-frontend/docs/HANDOFF-TRILHA-A-CLIP.md` |
+| **Clip Trilha A UI** | **P0 em `main`** ([#63](https://github.com/Marcelo-Rosas/vectraclip-frontend/pull/63) → `fa6c95bf`) | 19 arquivos, itens 1–6; P1 (FE-GAP-07/08) pendente. Deploy: Cloudflare Pages |
 
 ## Duas trilhas (separadas — não misturar)
 
@@ -38,12 +39,29 @@
 
 ---
 
-## PRs mergeados (backend)
+## PRs mergeados
+
+### VectraClip (`vectraclip-frontend`)
+
+| Item | Detalhe |
+|------|---------|
+| Branch | `feat/trilha-a-clip-p0` → squash **`fa6c95bf`** |
+| PR | [#63](https://github.com/Marcelo-Rosas/vectraclip-frontend/pull/63) — **MERGED** |
+| Escopo | 19 arquivos — Trilha A P0 apenas (sem intelligence/specialties/BPMN gateway WIP) |
+| CI | Nenhum check GitHub (`statusCheckRollup` vazio); typecheck OK em Docker antes do push |
+| Deploy | Cloudflare Pages no push em `main` → https://app.vectraclip.vectracargo.com.br (hard refresh ~2–5 min após merge) |
+
+### VectraClaw (`vectraclaw-backend`)
 
 | PR | Título | O que desbloqueia no Clip |
 |----|--------|---------------------------|
 | [#295](https://github.com/Marcelo-Rosas/vectraclaw-backend/pull/295) | PR-B1/B2 Trilha A wire | RoutineEditor + GoalDetail pós-classify |
-| [#296](https://github.com/Marcelo-Rosas/vectraclaw-backend/pull/296) | PR0 Instagram webhook | N/A no Clip (só ops Meta); Trilha B estável |
+| [#296](https://github.com/Marcelo-Rosas/vectraclaw-backend/pull/296) | PR0 Instagram webhook | Trilha B; filtro sessões IG |
+| [#297](https://github.com/Marcelo-Rosas/vectraclaw-backend/pull/297) | Handoff canônico | Este documento + checklist P0 |
+| [#298](https://github.com/Marcelo-Rosas/vectraclaw-backend/pull/298) | Pointer handoff em `CLAUDE.md` | — |
+| [#299](https://github.com/Marcelo-Rosas/vectraclaw-backend/pull/299) | Disciplina PR para docs/handoff | — |
+
+**WIP local no Claw** (Kronos, Dockerfile, `postgrest_coerce`, migrations, etc.) **não** entrou nos merges acima — próximo PR por escopo.
 
 ---
 
@@ -131,18 +149,18 @@ Validação FK: workflow da mesma `company_id` (422 se inválido).
 
 ## Checklist Clip — ordem P0 → P1 (FE-GAP)
 
-**Estado (2026-05-22):** P0 itens **1–6 implementados** no workspace VectraClip; item **7 = P1**. Próximo passo no Clip = **validação E2E** contra API com #295/#296 em prod + **PR** `vectraclip-frontend` (não reimplementar do zero).
+**Estado (2026-05-22):** P0 itens **1–6 em `main` do Clip** ([#63](https://github.com/Marcelo-Rosas/vectraclip-frontend/pull/63)); item **7 = P1**. Próximo passo = **smoke E2E em prod** (Pages + API #295/#296), não novo PR de P0.
 
-Merge/deploy backend **#295** antes de validar **run-now** com workflow em prod; **#296** para Trilha B (Instagram).
+Backend **#295** / **#296** devem estar em prod antes de validar **run-now** com workflow.
 
-| # | Item | FE-GAP | Backend | Status Clip (workspace) |
+| # | Item | FE-GAP | Backend | Status Clip (`main` #63) |
 |---|------|--------|---------|-------------------------|
-| 1 | `BpmnMaterializeButton` no `BpmnEditor` | FE-GAP-01 | materialize API | ✅ `BpmnEditor.tsx` |
-| 2 | “Classificar com Athena” + badge em `GoalDetail` | FE-GAP-02/10 | **#295** GET goal | ✅ `GoalClassifyPanel.tsx` |
-| 3 | `Routine` + select `workflowDefinitionId` | FE-GAP-03 | **#295** | ✅ `RoutineEditor.tsx` |
-| 4 | Cadência nos steps (canvas + templates 4h/23h/3d/7d) | FE-GAP-04/05 | workflow PUT | ✅ `StepCadenceSection.tsx`, `instagramProspectionCadence.ts` |
-| 5 | Run workflow na UI | FE-GAP-09 | from-workflow | ✅ `WorkflowCanvas` + deep-link `Workflow.tsx?slug=` |
-| 6 | Filtro canal Instagram em sessões | FE-GAP-06 | PR0 `instagram` | ✅ `ConnectorSessions.tsx` |
+| 1 | `BpmnMaterializeButton` no `BpmnEditor` | FE-GAP-01 | materialize API | ✅ |
+| 2 | “Classificar com Athena” + badge em `GoalDetail` | FE-GAP-02/10 | **#295** GET goal | ✅ |
+| 3 | `Routine` + select `workflowDefinitionId` | FE-GAP-03 | **#295** | ✅ |
+| 4 | Cadência nos steps (canvas + templates 4h/23h/3d/7d) | FE-GAP-04/05 | workflow PUT | ✅ |
+| 5 | Run workflow na UI | FE-GAP-09 | from-workflow | ✅ |
+| 6 | Filtro canal Instagram em sessões | FE-GAP-06 | PR0 `instagram` | ✅ |
 | 7 | Wizard Meta IG / picker RAG | FE-GAP-07/08 | adapters catalog | ⬜ P1 |
 
 **Tipos TypeScript (Clip — já em `src/types/api.ts`):**
@@ -189,20 +207,28 @@ Próximos PRs backend sugeridos (escopo pequeno):
 
 ---
 
-## Prompt curto para colar no agente VectraClip
+## Smoke E2E pós-deploy (Clip #63 + API)
+
+Rodar em https://app.vectraclip.vectracargo.com.br (hard refresh após `fa6c95bf`) contra API com #295/#296:
+
+1. `/bpmn/:id` → **Materializar** → `/workflow?slug=...`
+2. `/goals/:id` → **Classificar com Athena** → badge `kind` no GET goal
+3. `/routines/:id` → `workflowDefinitionId` → **run-now**
+4. `/workflow` → painel step → **Cadência** (templates 4h/23h/3d/7d)
+5. `/connectors/sessions` → filtro **Instagram**
+
+**P1 Clip (próximo PR):** FE-GAP-07/08 — wizard Meta help, picker RAG.
+
+---
+
+## Prompt curto (pós-merge — validação ou P1)
 
 ```text
-Backend main: #295 (routine workflowDefinitionId + goal classify wire) + #296 (Instagram).
+Clip main fa6c95bf (#63) + Backend #295/#296/#297 mergeados. P0 Trilha A shipped.
 
-Clip P0 já no workspace — validar E2E e abrir PR vectraclip-frontend:
-1) /bpmn/:id → Materializar → /workflow?slug=...
-2) /goals/:id → Classificar com Athena → badge kind
-3) /routines/:id → workflowDefinitionId → run-now
-4) /workflow → step panel → Cadência; opcional profile instagram_prospection_adr no Spin
-5) /connectors/sessions → filtro Instagram
+Smoke E2E em app.vectraclip.vectracargo.com.br (não reimplementar P0).
+P1: FE-GAP-07/08 wizard Meta + RAG picker → PR dedicado vectraclip-frontend.
 
-P1 restante: FE-GAP-07/08 (wizard Meta help, RAG picker).
-
-API: https://api-vectraclip.vectracargo.com.br ou :3100 dev.
-Handoff: docs/HANDOFF-TRILHA-A-CLIP-INSTAGRAM.md (Claw) + docs/HANDOFF-TRILHA-A-CLIP.md (Clip).
+Handoff: vectraclip-frontend/docs/HANDOFF-TRILHA-A-CLIP.md
+        vectraclaw-backend/docs/HANDOFF-TRILHA-A-CLIP-INSTAGRAM.md
 ```
