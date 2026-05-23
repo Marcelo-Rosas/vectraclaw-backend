@@ -33,7 +33,8 @@ from src.agent_ids import (  # SSOT AGENT_IDs — ver src/agent_ids.py
 )
 from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
-    Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
+    Incident, IncidentAudit, AdapterCatalogItem, AdapterRuntimeProfile, AdapterFieldDefinition,
+    AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
     specialty_source_zod_to_db,
     AgentDomain, AgentExecutionMode, WorkflowLogicPattern, WorkflowTriggerType,
@@ -843,9 +844,12 @@ app.add_middleware(
 app.add_middleware(CorrelationIdMiddleware)
 
 
-@app.exception_handler(HTTPException)
-async def http_exception_with_cors(request: Request, exc: HTTPException) -> JSONResponse:
-    """Garante headers CORS em erros HTTPException (4xx) mesmo fora do CORSMiddleware."""
+def _cors_json_response(
+    request: Request,
+    *,
+    status_code: int,
+    detail: Any,
+) -> JSONResponse:
     origin = request.headers.get("Origin")
     headers = cors_headers_for_request(
         origin,
@@ -857,9 +861,26 @@ async def http_exception_with_cors(request: Request, exc: HTTPException) -> JSON
         headers["X-Correlation-Id"] = cid
         headers["X-Request-Id"] = cid
     return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
+        status_code=status_code,
+        content={"detail": detail},
         headers=headers,
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_with_cors(request: Request, exc: HTTPException) -> JSONResponse:
+    """Garante headers CORS em erros HTTPException (4xx/5xx)."""
+    return _cors_json_response(request, status_code=exc.status_code, detail=exc.detail)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_with_cors(request: Request, exc: Exception) -> JSONResponse:
+    """500 não tratado — evita resposta sem CORS (browser reporta CORS em vez do 500 real)."""
+    logger.error("unhandled_exception path=%s: %s", request.url.path, exc, exc_info=True)
+    return _cors_json_response(
+        request,
+        status_code=500,
+        detail="internal_server_error",
     )
 
 
@@ -9329,12 +9350,58 @@ async def list_agent_specialties(request: Request):
             .order("name")
             .execute()
         )
-        return [AgentSpecialty(**row).to_zod_dict() for row in (res.data or [])]
+        out: List[Dict[str, Any]] = []
+        for row in res.data or []:
+            try:
+                raw = dict(row)
+                schema = raw.get("config_schema")
+                if schema is not None and not isinstance(schema, list):
+                    if isinstance(schema, dict):
+                        raw["config_schema"] = (
+                            schema.get("fields")
+                            if isinstance(schema.get("fields"), list)
+                            else []
+                        )
+                    else:
+                        raw["config_schema"] = []
+                out.append(AgentSpecialty(**raw).to_zod_dict())
+            except Exception as row_err:
+                logger.warning(
+                    "list_agent_specialties skip row id=%s: %s",
+                    row.get("id"),
+                    row_err,
+                )
+        return out
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"list_agent_specialties failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/adapter-runtime-profiles")
+@app.get("/adapter-runtime-profiles")
+async def list_adapter_runtime_profiles(request: Request):
+    """Catálogo cross-tenant de perfis de runtime (wizard Connectors)."""
+    if not supabase:
+        return []
+    try:
+        res = (
+            supabase.table("adapter_runtime_profiles")
+            .select(
+                "id,name,description,default_provider,field_definitions_template,"
+                "display_order,is_active,created_at,updated_at"
+            )
+            .eq("is_active", True)
+            .order("display_order")
+            .execute()
+        )
+        return [AdapterRuntimeProfile(**row).to_zod_dict() for row in (res.data or [])]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("list_adapter_runtime_profiles failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 class AgentSpecialtyInput(BaseModel):

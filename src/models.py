@@ -440,6 +440,48 @@ class AdapterCatalogItem(CamelModel):
         return self.dict(by_alias=True)
 
 
+class AdapterRuntimeProfileFieldTemplate(CamelModel):
+  field_key: str
+  field_label: str
+  field_type: str
+  is_required: bool = False
+  options_json: Optional[Dict[str, Any]] = None
+  sort_order: int = 0
+
+
+class AdapterRuntimeProfile(CamelModel):
+    """Catálogo cross-tenant — GET /api/adapter-runtime-profiles."""
+
+    id: str
+    name: str
+    description: Optional[str] = None
+    default_provider: str
+    field_definitions_template: List[AdapterRuntimeProfileFieldTemplate] = Field(
+        default_factory=list
+    )
+    display_order: int = 100
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+    @validator("field_definitions_template", pre=True)
+    def _coerce_field_template(cls, v: Any) -> List[Any]:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                return []
+        return []
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
+
 class AdapterFieldDefinition(CamelModel):
     id: str
     company_id: str
