@@ -5,5 +5,12 @@ ingress:
   - hostname: api-vectraclip.vectracargo.com.br
     service: http://backend:3000
     originRequest:
+      # WebSocket upgrade (wss://) — pass-through de Upgrade/Connection/querystring
+      connectTimeout: 30s
+      keepAliveTimeout: 90s
+      keepAliveConnections: 100
+      http2Origin: true
       noTLSVerify: false
+      # Preserva query string (?token=) e headers do handshake
+      disableChunkedEncoding: false
   - service: http_status:404

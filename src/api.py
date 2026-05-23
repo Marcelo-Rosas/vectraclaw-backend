@@ -35,6 +35,7 @@ from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
+    specialty_source_zod_to_db,
     AgentDomain, AgentExecutionMode, WorkflowLogicPattern, WorkflowTriggerType,
     OperationType, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
@@ -45,7 +46,14 @@ from src.services.heartbeat_doctor import audit as incident_audit
 from src.services.heartbeat_doctor import store as incident_store
 from src.services.morpheus_dispatcher import MorpheusDispatcher
 from src.ws_manager import manager as ws_manager
+from src.postgrest_coerce import pg_dict, pg_int, pg_optional_str, pg_row, pg_str, pg_str_set
 from src.tenant_ids import company_row_public_id
+from src.middleware.cors_policy import (
+    build_cors_allow_origins,
+    build_cors_origin_regex,
+    cors_headers_for_request,
+)
+from src.middleware.http_observability import CorrelationIdMiddleware, get_http_metrics
 from src.agents.sipoc_researcher import research_sector
 from src.services.sipoc_promotion import promote_activity_to_automation
 from src.services.sipoc_validator import validate_sipoc_consistency
@@ -209,27 +217,10 @@ def _zod_user_role(raw: Optional[str]) -> Literal["admin", "member"]:
         return "admin"
     return "member"
 
-# CORS — regra do Starlette: com allow_credentials=True, allow_origins=["*"] é
-# silenciosamente ignorado (browser não aceita wildcard + credenciais).
-# Usamos lista explícita + regex para aceitar qualquer porta de localhost.
-# Override em produção via env CORS_ALLOW_ORIGINS (CSV) ou CORS_ALLOW_ORIGIN_REGEX.
-_cors_origins_env = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
-_cors_origins = (
-    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
-    if _cors_origins_env
-    else [
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:3100",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
-        "http://127.0.0.1:3100",
-    ]
-)
-_cors_origin_regex = os.getenv(
-    "CORS_ALLOW_ORIGIN_REGEX",
-    r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-)
+# CORS — allowlist estrita (dev + https://app.vectraclip.vectracargo.com.br).
+# Extras via CORS_ALLOW_ORIGINS (CSV). SSOT: src/middleware/cors_policy.py
+_cors_origins = build_cors_allow_origins()
+_cors_origin_regex = build_cors_origin_regex()
 
 load_dotenv()
 
@@ -752,15 +743,16 @@ async def auth_middleware(request: Request, call_next):
     # O CORSMiddleware é registrado DEPOIS deste middleware, então já é a
     # camada mais externa e também adicionaria os headers — mas mantemos
     # aqui para sobreviver a mudanças futuras na ordem de registro.
-    origin = request.headers.get("Origin", "*")
+    origin = request.headers.get("Origin")
     def cors_error(status: int, detail: str) -> JSONResponse:
         return JSONResponse(
             status_code=status,
             content={"detail": detail},
-            headers={
-                "Access-Control-Allow-Origin": origin,
-                "Access-Control-Allow-Credentials": "true",
-            },
+            headers=cors_headers_for_request(
+                origin,
+                allow_origins=_cors_origins,
+                origin_regex=_cors_origin_regex,
+            ),
         )
 
     # Pular auth em rotas públicas
@@ -841,11 +833,41 @@ app.add_middleware(
     allow_origins=_cors_origins,
     allow_origin_regex=_cors_origin_regex,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Length", "Content-Type"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-Id", "X-Correlation-Id"],
+    expose_headers=["Content-Length", "Content-Type", "X-Request-Id", "X-Correlation-Id"],
     max_age=600,
 )
+
+# Observabilidade por último = camada mais externa (correlation-id em toda resposta).
+app.add_middleware(CorrelationIdMiddleware)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_with_cors(request: Request, exc: HTTPException) -> JSONResponse:
+    """Garante headers CORS em erros HTTPException (4xx) mesmo fora do CORSMiddleware."""
+    origin = request.headers.get("Origin")
+    headers = cors_headers_for_request(
+        origin,
+        allow_origins=_cors_origins,
+        origin_regex=_cors_origin_regex,
+    )
+    cid = getattr(request.state, "correlation_id", None)
+    if cid:
+        headers["X-Correlation-Id"] = cid
+        headers["X-Request-Id"] = cid
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=headers,
+    )
+
+
+@app.get("/api/health/metrics")
+@app.get("/health/metrics")
+async def health_metrics():
+    """Métricas leves em memória (42501/CORS/WS) — substituir por Prometheus depois."""
+    return {"metrics": get_http_metrics()}
 
 @app.get("/")
 @app.get("/api")
@@ -1015,11 +1037,14 @@ async def create_sipoc_sector(request: Request, payload: Dict[str, Any]):
     # Auto-gera slug se não fornecido (coluna NOT NULL no DB)
     if not payload.get("slug"):
         payload["slug"] = _slugify_sipoc(payload["name"])
-    # RLS sipoc_sectors_tenant_insert exige with_check company_id = sipoc_company_id().
-    # Sem injetar company_id o row vai NULL → 42501. Pega do JWT (request.state).
+    # Tenant: nunca confiar no company_id do cliente — trigger DB também sobrescreve.
     _caller_company = getattr(request.state, "company_id", None)
-    if _caller_company and not payload.get("company_id"):
-        payload["company_id"] = str(_caller_company)
+    if not _caller_company:
+        raise HTTPException(
+            status_code=403,
+            detail="tenant_claim_missing: app_metadata.vectraclip.company_id",
+        )
+    payload["company_id"] = str(_caller_company)
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_sectors").insert(payload).execute()
@@ -1048,6 +1073,13 @@ async def create_sipoc_position(request: Request, payload: Dict[str, Any]):
         return {"id": "mock-id", "title": payload.get("title")}
     payload = _normalize_sipoc_payload_to_snake(payload)
     payload["title"] = _validate_sipoc_name(payload.get("title"), kind="Cargo")
+    _caller_company = getattr(request.state, "company_id", None)
+    if not _caller_company:
+        raise HTTPException(
+            status_code=403,
+            detail="tenant_claim_missing: app_metadata.vectraclip.company_id",
+        )
+    payload["company_id"] = str(_caller_company)
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_positions").insert(payload).execute()
@@ -3373,7 +3405,7 @@ async def auth_signup(payload: SignupPayload):
         cmp_res = supabase.table("companies").insert(company_payload).execute()
         if not cmp_res.data:
             raise HTTPException(500, "company_insert_returned_empty")
-        company_id = cmp_res.data[0]["company_id"]
+        company_id = pg_optional_str(cmp_res.data[0].get("company_id"))
         logger.info(f"signup: company_id={company_id} created")
 
         # Step 3: create app_user vinculado (id = Auth user_id)
@@ -5252,7 +5284,7 @@ def _load_kronos_operation_types() -> set[str]:
             .eq("is_active", True)
             .execute()
         )
-        ids = {row["id"] for row in (res.data or []) if row.get("id")}
+        ids = pg_str_set(res.data, "id")
         _KRONOS_OP_TYPES_CACHE["value"] = ids
         _KRONOS_OP_TYPES_CACHE["fetched_at"] = now
         return ids
@@ -5551,7 +5583,7 @@ async def reset_routine_ofx_cursor(request: Request, routine_id: str):
 
 @app.get("/api/companies/{company_id}/workflow-steps")
 @app.get("/companies/{company_id}/workflow-steps")
-async def list_workflow_steps(request: Request, company_id: str):
+async def list_company_workflow_steps(request: Request, company_id: str):
     """Returns SIPOC-like workflow steps mapped from workflow_definitions/workflow_steps."""
     if not supabase:
         return []
@@ -5671,7 +5703,7 @@ async def list_workflow_steps(request: Request, company_id: str):
             )
         return mapped
     except Exception as e:
-        logger.warning(f"list_workflow_steps failed: {e}")
+        logger.warning(f"list_company_workflow_steps failed: {e}")
         return []
 
 
@@ -5969,7 +6001,11 @@ async def create_workflow_step(company_id: str, request: Request):
             .limit(1)
             .execute()
         )
-        next_order = (max_res.data[0]["step_order"] + 1) if max_res.data else 1
+        next_order = (
+            pg_int(max_res.data[0].get("step_order"), 0) + 1
+            if max_res.data
+            else 1
+        )
 
         normalized = _normalize_5w2h_payload(body)
         _coerce_sipoc_responsavel(normalized)
@@ -6496,7 +6532,7 @@ def get_company_adapter_values(company_id: str, adapter_id: str) -> Optional[Dic
         )
         if not res.data:
             return None
-        return res.data[0].get("field_values_json") or {}
+        return pg_dict(res.data[0].get("field_values_json"))
     except Exception as e:
         logger.error("get_company_adapter_values failed: %s", e)
         return None
@@ -7323,7 +7359,10 @@ def _resolve_vault_secret(company_id: str, name: str) -> str:
             "read_company_secret",
             {"p_company_id": company_id, "p_name": name},
         ).execute()
-        return res.data or ""
+        data = res.data
+        if isinstance(data, str):
+            return data
+        return pg_str(data) if data is not None else ""
     except Exception as e:
         logger.warning(f"[vault] failed to resolve secret {name!r} for company {company_id}: {e}")
         return ""
@@ -7430,7 +7469,7 @@ async def get_agent_inbox(request: Request, agent_id: str, limit: int = 20):
                 logger.debug(f"[inbox] no adapter config for agent {agent_id}")
                 return []
             field_values = res.data[0].get("field_values_json") or {}
-            company_id = res.data[0].get("company_id", "")
+            company_id = pg_str(res.data[0].get("company_id"))
         else:
             cfg = next(
                 (c for c in MOCK_AGENT_ADAPTER_CONFIGS if c.get("agentId") == agent_id),
@@ -7635,7 +7674,7 @@ async def post_task_dispatch(request: Request, payload: TaskDispatchInput):
                 .execute()
             )
             if ac_res.data:
-                adapter_cfg = ac_res.data[0]
+                adapter_cfg = pg_row(ac_res.data[0])
         except PostgrestAPIError:
             adapter_cfg = None
         except Exception:
@@ -9368,7 +9407,8 @@ async def patch_agent_specialty(request: Request, specialty_id: str, payload: Di
         if "configSchema" in payload: update_data["config_schema"] = payload["configSchema"]
         if "isActive" in payload: update_data["is_active"] = payload["isActive"]
         if "status" in payload: update_data["status"] = payload["status"]
-        if "source" in payload: update_data["source"] = payload["source"]
+        if "source" in payload:
+            update_data["source"] = specialty_source_zod_to_db(str(payload["source"]))
         if not update_data:
             raise HTTPException(status_code=400, detail="no_fields_to_update")
         res = supabase.table("agent_specialties").update(update_data).eq("id", specialty_id).execute()
@@ -9639,6 +9679,7 @@ from src.api_routes import llm_api_keys as _llm_api_keys_routes  # noqa: E402  #
 from src.api_routes import sipoc_commit as _sipoc_commit_routes  # noqa: E402  # PR2.3 autopilot SIPOC commit
 from src.api_routes import bpmn_materialize as _bpmn_materialize_routes  # noqa: E402  # Phase 3 BPMN bridge
 from src.api_routes import agent_mcp_bindings as _agent_mcp_bindings_routes  # noqa: E402  # N6 MCP bindings
+from src.api_routes import intelligence as _intelligence_routes  # noqa: E402  # VEC-168
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -9661,3 +9702,4 @@ app.include_router(_llm_api_keys_routes.router)  # W13.1 — AI Gateway llm_api_
 app.include_router(_sipoc_commit_routes.router)  # PR2.3 autopilot — SIPOC commit endpoint
 app.include_router(_bpmn_materialize_routes.router)  # Phase 3 autopilot — BPMN materialize bridge
 app.include_router(_agent_mcp_bindings_routes.router)  # N6 — MCP server catalog + agent MCP bindings
+app.include_router(_intelligence_routes.router)  # VEC-168 — cross-company intelligence dashboard
