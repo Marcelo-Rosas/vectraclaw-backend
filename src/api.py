@@ -35,6 +35,7 @@ from src.models import (
     Agent, Task, Goal, Heartbeat, AuditLogEntry, CouncilApproval, User, AuthSession,
     Incident, IncidentAudit, AdapterCatalogItem, AdapterFieldDefinition, AgentAdapterConfig,
     AgentExecutionConfig, LlmModel, AgentSpecialty, AgentSpecialtyConfig, AgentSharedConfig,
+    specialty_source_zod_to_db,
     AgentDomain, AgentExecutionMode, WorkflowLogicPattern, WorkflowTriggerType,
     OperationType, Routine,
     SipocCompany, SipocSector, SipocPosition, SipocProcess, SipocComponent,
@@ -9368,7 +9369,8 @@ async def patch_agent_specialty(request: Request, specialty_id: str, payload: Di
         if "configSchema" in payload: update_data["config_schema"] = payload["configSchema"]
         if "isActive" in payload: update_data["is_active"] = payload["isActive"]
         if "status" in payload: update_data["status"] = payload["status"]
-        if "source" in payload: update_data["source"] = payload["source"]
+        if "source" in payload:
+            update_data["source"] = specialty_source_zod_to_db(str(payload["source"]))
         if not update_data:
             raise HTTPException(status_code=400, detail="no_fields_to_update")
         res = supabase.table("agent_specialties").update(update_data).eq("id", specialty_id).execute()

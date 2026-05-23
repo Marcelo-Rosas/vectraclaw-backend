@@ -754,6 +754,37 @@ class LlmApiKey(CamelModel):
         extra = "ignore"
 
 
+# Contrato DB §2.1 (CONTRACTS-AGENT-CAPABILITIES) vs wire Clip (Zod legacy).
+_SPECIALTY_SOURCE_DB = frozenset({"seed", "athena", "import_csv", "markdown_upload"})
+_SPECIALTY_SOURCE_WIRE = frozenset({"internal", "import_csv", "athena", "skillforge"})
+
+
+def specialty_source_db_to_zod(db_source: str, slug: str = "") -> str:
+    """Mapeia `agent_specialties.source` (Postgres) → enum do frontend."""
+    if db_source == "seed":
+        return "internal"
+    if db_source == "import_csv" and slug.startswith("sf-"):
+        return "skillforge"
+    if db_source == "markdown_upload":
+        return "import_csv"
+    if db_source in ("athena", "import_csv"):
+        return db_source
+    if db_source in _SPECIALTY_SOURCE_WIRE:
+        return db_source
+    return "internal"
+
+
+def specialty_source_zod_to_db(wire_source: str) -> str:
+    """Mapeia enum do frontend → valor persistido no Postgres."""
+    if wire_source == "internal":
+        return "seed"
+    if wire_source == "skillforge":
+        return "import_csv"
+    if wire_source in _SPECIALTY_SOURCE_DB:
+        return wire_source
+    return "seed"
+
+
 class AgentSpecialty(CamelModel):
     id: str
     name: str
@@ -764,9 +795,9 @@ class AgentSpecialty(CamelModel):
     system_prompt_template: Optional[str] = None
     config_schema: Optional[List[Dict[str, Any]]] = None
     is_active: bool = True
-    # S3-A — governança catálogo (PRD Skills Library v2 §3.3)
-    status: Literal["active", "deprecated", "experimental", "community"] = "active"
-    source: Literal["internal", "import_csv", "athena", "skillforge"] = "internal"
+    # S3-A — governança catálogo (CONTRACTS §2.1; migration 20260521000000)
+    status: Literal["active", "draft", "deprecated", "experimental", "community"] = "active"
+    source: Literal["seed", "athena", "import_csv", "markdown_upload"] = "seed"
 
     def to_zod_dict(self):
         d = self.dict(by_alias=True)
@@ -774,6 +805,7 @@ class AgentSpecialty(CamelModel):
             d["systemPromptTemplate"] = ""
         if d.get("description") is None:
             d["description"] = ""
+        d["source"] = specialty_source_db_to_zod(self.source, self.slug)
         return d
 
 
