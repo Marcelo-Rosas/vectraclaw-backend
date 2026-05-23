@@ -836,14 +836,34 @@ async def meta_instagram_webhook(
         if not company_id:
             continue
 
+        ig_external_name = msg.get("external_name")
+        ig_external_meta: Dict[str, Any] = {
+            "mid": msg["message_id"],
+            "msg_type": msg["msg_type"],
+        }
+        if not ig_external_name:
+            from src.services.instagram_profile import resolve_instagram_user_profile
+
+            profile = resolve_instagram_user_profile(
+                msg["external_id"],
+                access_token=str(msg_cfg.get("access_token") or ""),
+                api_version=str(msg_cfg.get("api_version") or "v21.0"),
+            )
+            if profile:
+                ig_external_name = profile.get("display")
+                if profile.get("username"):
+                    ig_external_meta["username"] = profile["username"]
+                if profile.get("name"):
+                    ig_external_meta["ig_name"] = profile["name"]
+
         try:
             session = connector_bus.get_or_open_session(
                 company_id=company_id,
                 channel="instagram",
                 connector_id=msg["instagram_account_id"],
                 external_id=msg["external_id"],
-                external_name=msg.get("external_name"),
-                external_meta={"mid": msg["message_id"], "msg_type": msg["msg_type"]},
+                external_name=ig_external_name,
+                external_meta=ig_external_meta,
             )
             if msg["content"]:
                 connector_bus.append_history(
