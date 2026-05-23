@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, Literal, Any, Dict, List
+from typing import Optional, Literal, Any, Dict, List, Union
 from pydantic import BaseModel, Field, root_validator, validator
 
 def to_camel(string: str) -> str:
@@ -441,12 +441,13 @@ class AdapterCatalogItem(CamelModel):
 
 
 class AdapterRuntimeProfileFieldTemplate(CamelModel):
-  field_key: str
-  field_label: str
-  field_type: str
-  is_required: bool = False
-  options_json: Optional[Dict[str, Any]] = None
-  sort_order: int = 0
+    field_key: str
+    field_label: str
+    field_type: str
+    is_required: bool = False
+    # DB seed pode usar dict (metadata) ou list (enum de modelos) — wire aceita ambos.
+    options_json: Optional[Union[Dict[str, Any], List[Any]]] = None
+    sort_order: int = 0
 
 
 class AdapterRuntimeProfile(CamelModel):

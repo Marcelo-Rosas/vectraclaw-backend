@@ -24,3 +24,32 @@ def test_adapter_runtime_profiles_not_404(client: TestClient) -> None:
     assert r.headers.get("access-control-allow-origin") == (
         "https://app.vectraclip.vectracargo.com.br"
     )
+
+
+def test_adapter_runtime_profile_options_json_list_ok() -> None:
+    """Seed DB usa list em options_json (ex.: enum de modelos) — não pode 500."""
+    from src.models import AdapterRuntimeProfile
+
+    row = AdapterRuntimeProfile(
+        id="test",
+        name="Test",
+        default_provider="groq",
+        field_definitions_template=[
+            {
+                "field_key": "model_id",
+                "field_label": "Model",
+                "field_type": "select",
+                "is_required": True,
+                "options_json": ["sonnet", "haiku", "opus"],
+                "sort_order": 1,
+            }
+        ],
+        created_at="2026-05-22T12:00:00+00:00",
+        updated_at="2026-05-22T12:00:00+00:00",
+    )
+    wire = row.to_zod_dict()
+    assert wire["fieldDefinitionsTemplate"][0]["optionsJson"] == [
+        "sonnet",
+        "haiku",
+        "opus",
+    ]
