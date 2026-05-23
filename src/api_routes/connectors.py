@@ -58,6 +58,26 @@ META_WHATSAPP_ADAPTER_SLUG = "meta-whatsapp"
 # Seeds/migrations legados podem usar kebab-case (meta-instagram). Aceitar ambos no lookup.
 META_INSTAGRAM_ADAPTER_SLUGS = ("meta_instagram", "meta-instagram")
 
+_CONNECTOR_REPLY_BLOCKED_ROLES = ["viewer"]
+
+
+def _schedule_connector_session_ws(
+    company_id: str,
+    session_id: str,
+    **extra: Any,
+) -> None:
+    """Best-effort WS: front invalida lista de sessões (payload mínimo)."""
+    try:
+        import asyncio
+        from src import ws_manager
+
+        payload: Dict[str, Any] = {"session_id": session_id, **extra}
+        message = {"type": "connector_session_updated", "payload": payload}
+        loop = asyncio.get_running_loop()
+        loop.create_task(ws_manager.broadcast(company_id, message))
+    except Exception as e:
+        logger.warning("_schedule_connector_session_ws non-fatal: %s", e)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lookup adapter config (catalog-driven, sem env)
@@ -689,6 +709,12 @@ async def meta_whatsapp_webhook(
                 content=msg["content"],
                 extra={"wamid": msg["message_id"], "timestamp": msg["timestamp"]},
             )
+            _schedule_connector_session_ws(
+                company_id,
+                str(session["id"]),
+                channel=session.get("channel"),
+                external_id=msg["external_id"],
+            )
     except RuntimeError as e:
         logger.error("meta_whatsapp_webhook bus failure: %s", e)
         raise HTTPException(503, str(e))
@@ -825,6 +851,12 @@ async def meta_instagram_webhook(
                     role="user",
                     content=msg["content"],
                     extra={"mid": msg["message_id"], "timestamp": msg["timestamp"]},
+                )
+                _schedule_connector_session_ws(
+                    company_id,
+                    str(session["id"]),
+                    channel=session.get("channel"),
+                    external_id=msg["external_id"],
                 )
         except RuntimeError as e:
             logger.error("meta_instagram_webhook bus failure: %s", e)
@@ -1036,7 +1068,30 @@ def _dispatch_inbound_task(
         logger.error("_dispatch_inbound_task: supabase indisponível")
         return None
 
-    routing = _resolve_inbound_routing(session.get("channel") or "")
+    from src.services.connector_inbound_policy import (
+        inbound_auto_dispatch_skip_reason,
+        is_meta_inbound_channel,
+    )
+
+    channel_slug = (session.get("channel") or "").strip().lower()
+    if not is_meta_inbound_channel(channel_slug):
+        logger.warning(
+            "_dispatch_inbound_task: canal %r não é Meta implementado — skip",
+            channel_slug,
+        )
+        return None
+
+    skip = inbound_auto_dispatch_skip_reason(channel_slug)
+    if skip:
+        logger.info(
+            "_dispatch_inbound_task: auto-dispatch bloqueado (%s) session=%s — "
+            "sessão/histórico OK; task só via humano ou fluxo explícito",
+            skip,
+            session.get("id"),
+        )
+        return None
+
+    routing = _resolve_inbound_routing(channel_slug)
     if not routing:
         return None
     op_type = routing["operation_type"]
@@ -1200,11 +1255,14 @@ async def _do_reply(
     significa que persistiu como histórico mas o envio externo falhou (caller
     pode reenviar). Nunca levanta — retorna detalhes pro front decidir.
     """
-    from src.api import supabase, validate_jwt_company_id
+    from src.api import supabase, validate_jwt_company_id, require_role_not
     from src.services import connector_bus
 
     if not supabase:
         raise HTTPException(503, "supabase_required")
+
+    scope = {"role": getattr(request.state, "role", None)}
+    require_role_not(scope, _CONNECTOR_REPLY_BLOCKED_ROLES, "responder sessão de canal")
 
     sess_q = (
         supabase.table("connector_sessions")
@@ -1243,6 +1301,10 @@ async def _do_reply(
         delivered = await connector_bus.reply(session_row, content, append_role=None)
     except Exception as e:
         logger.warning("_do_reply connector_bus.reply non-fatal: %s", e)
+
+    company_id = str(session_row.get("company_id") or "")
+    if company_id:
+        _schedule_connector_session_ws(company_id, session_id)
 
     return {
         "session_id": session_id,
