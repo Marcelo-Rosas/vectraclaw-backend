@@ -158,3 +158,147 @@ def test_parse_c6_pdf_raises_when_missing(tmp_path: Path):
 
     with pytest.raises(FileNotFoundError):
         parse_c6_pdf(tmp_path / "nope.pdf")
+
+
+# ── Opção A: enrich_ofx_text / enrich_ofx_file ───────────────────────
+
+
+def _ofx_with(*stmttrns: str) -> str:
+    body = "\n".join(stmttrns)
+    return (
+        "OFXHEADER: 100\n<OFX>\n  <BANKMSGSRSV1>\n    <STMTTRNRS>\n"
+        "      <STMTRS>\n        <BANKTRANLIST>\n"
+        f"{body}\n"
+        "        </BANKTRANLIST>\n      </STMTRS>\n"
+        "    </STMTTRNRS>\n  </BANKMSGSRSV1>\n</OFX>\n"
+    )
+
+
+def _stmttrn(amt: str, dtposted: str, memo: str, ttype: str = "DEBIT") -> str:
+    return (
+        "          <STMTTRN>\n"
+        f"            <TRNAMT>{amt}</TRNAMT>\n"
+        f"            <DTPOSTED>{dtposted}</DTPOSTED>\n"
+        f"            <TRNTYPE>{ttype}</TRNTYPE>\n"
+        f"            <MEMO>{memo}</MEMO>\n"
+        "          </STMTTRN>"
+    )
+
+
+def test_is_generic_ofx_memo():
+    from src.agents.kronos_pdf_enricher import is_generic_ofx_memo
+
+    assert is_generic_ofx_memo("TRANSF ENVIADA PIX")
+    assert is_generic_ofx_memo("  transf enviada pix  ")
+    assert not is_generic_ofx_memo("Pix recebido de CAMILLA AZEVEDO")
+    assert not is_generic_ofx_memo("EQUILIBRIO MARMITARIA")
+    assert not is_generic_ofx_memo("")
+    assert not is_generic_ofx_memo(None)
+
+
+def test_enrich_ofx_text_rewrites_generic_memo():
+    from src.agents.kronos_pdf_enricher import enrich_ofx_text
+
+    lookup = {("2026-05-16", 3950): "Pix enviado para POSTO TIO GUSTA"}
+    ofx = _ofx_with(
+        _stmttrn("-39.50", "20260516082806[-3:BRT]", "TRANSF ENVIADA PIX")
+    )
+    new_text, changes = enrich_ofx_text(ofx, lookup)
+
+    assert "<MEMO>Pix enviado para POSTO TIO GUSTA</MEMO>" in new_text
+    assert "TRANSF ENVIADA PIX" not in new_text
+    assert len(changes) == 1
+    assert changes[0]["from"] == "TRANSF ENVIADA PIX"
+    assert changes[0]["to"] == "Pix enviado para POSTO TIO GUSTA"
+    assert changes[0]["date"] == "2026-05-16"
+    assert changes[0]["centavos"] == -3950
+
+
+def test_enrich_ofx_text_preserves_specific_memo():
+    from src.agents.kronos_pdf_enricher import enrich_ofx_text
+
+    # Mesmo com match no lookup, MEMO já específico não é tocado.
+    lookup = {("2026-05-16", 2800): "Pix recebido de OUTRA PESSOA"}
+    ofx = _ofx_with(
+        _stmttrn(
+            "28.00",
+            "20260516082304[-3:BRT]",
+            "Pix recebido de CAMILLA AZEVEDO",
+            ttype="CREDIT",
+        )
+    )
+    new_text, changes = enrich_ofx_text(ofx, lookup)
+
+    assert changes == []
+    assert "Pix recebido de CAMILLA AZEVEDO" in new_text
+
+
+def test_enrich_ofx_text_no_match_keeps_generic():
+    from src.agents.kronos_pdf_enricher import enrich_ofx_text
+
+    lookup = {("2026-05-16", 9999): "Algo"}
+    ofx = _ofx_with(
+        _stmttrn("-39.50", "20260516082806[-3:BRT]", "TRANSF ENVIADA PIX")
+    )
+    new_text, changes = enrich_ofx_text(ofx, lookup)
+
+    assert changes == []
+    assert "TRANSF ENVIADA PIX" in new_text
+
+
+def test_enrich_ofx_text_disambiguates_same_day_by_value():
+    from src.agents.kronos_pdf_enricher import enrich_ofx_text
+
+    lookup = {
+        ("2026-05-12", 2251): "Pix enviado para POSTO TIO GUSTA",
+        ("2026-05-12", 4050): "Pix enviado para DEGUSTA CAFE",
+    }
+    ofx = _ofx_with(
+        _stmttrn("-22.51", "20260512182232[-3:BRT]", "TRANSF ENVIADA PIX"),
+        _stmttrn("-40.50", "20260512093348[-3:BRT]", "TRANSF ENVIADA PIX"),
+    )
+    new_text, changes = enrich_ofx_text(ofx, lookup)
+
+    assert len(changes) == 2
+    assert "<MEMO>Pix enviado para POSTO TIO GUSTA</MEMO>" in new_text
+    assert "<MEMO>Pix enviado para DEGUSTA CAFE</MEMO>" in new_text
+
+
+def test_enrich_ofx_text_escapes_sgml_chars():
+    from src.agents.kronos_pdf_enricher import enrich_ofx_text
+
+    lookup = {("2026-05-12", 4050): "Pix para DEGUSTA & CIA <LTDA>"}
+    ofx = _ofx_with(
+        _stmttrn("-40.50", "20260512093348[-3:BRT]", "TRANSF ENVIADA PIX")
+    )
+    new_text, changes = enrich_ofx_text(ofx, lookup)
+
+    assert len(changes) == 1
+    assert "DEGUSTA &amp; CIA &lt;LTDA&gt;" in new_text
+
+
+def test_enrich_ofx_file_writes_only_when_changed(tmp_path: Path):
+    from src.agents.kronos_pdf_enricher import enrich_ofx_file
+
+    src = tmp_path / "semana.ofx"
+    src.write_text(
+        _ofx_with(
+            _stmttrn("-39.50", "20260516082806[-3:BRT]", "TRANSF ENVIADA PIX")
+        ),
+        encoding="utf-8",
+    )
+
+    # Sem match → devolve o próprio arquivo, sem gravar nada novo.
+    dest, changes = enrich_ofx_file(src, {})
+    assert dest == src
+    assert changes == []
+
+    # Com match → grava arquivo novo preservando o nome.
+    lookup = {("2026-05-16", 3950): "Pix enviado para POSTO TIO GUSTA"}
+    dest2, changes2 = enrich_ofx_file(src, lookup)
+    assert dest2 != src
+    assert dest2.name == src.name
+    assert len(changes2) == 1
+    assert "Pix enviado para POSTO TIO GUSTA" in dest2.read_text(encoding="utf-8")
+    # Original intacto
+    assert "TRANSF ENVIADA PIX" in src.read_text(encoding="utf-8")
