@@ -19,6 +19,7 @@ import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("HermesReporter")
 
@@ -167,12 +168,31 @@ def render_html(
 
 # ── SMTP ─────────────────────────────────────────────────────────────────────
 
-def send_smtp(subject: str, html_body: str, to_addrs: list) -> str:
-    """Envia via SMTP_SSL usando HERMES_SMTP_* env vars. Retorna Message-Id."""
-    server = os.environ["HERMES_SMTP_SERVER"]
-    port = int(os.environ["HERMES_SMTP_PORT"])
-    user = os.environ["HERMES_EMAIL"]
-    pwd = os.environ["HERMES_PASSWORD"]
+def _smtp_from_env() -> Dict[str, Any]:
+    return {
+        "server": os.environ["HERMES_SMTP_SERVER"],
+        "port": int(os.environ["HERMES_SMTP_PORT"]),
+        "user": os.environ["HERMES_EMAIL"],
+        "password": os.environ["HERMES_PASSWORD"],
+    }
+
+
+def send_smtp(
+    subject: str,
+    html_body: str,
+    to_addrs: List[str],
+    *,
+    credentials: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Envia via SMTP_SSL. credentials = metadata mcp-imap; senão HERMES_SMTP_* (dev)."""
+    if credentials is None:
+        creds = _smtp_from_env()
+    else:
+        creds = credentials
+    server = creds["server"]
+    port = int(creds["port"])
+    user = creds["user"]
+    pwd = creds["password"]
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -340,8 +360,28 @@ def _resolve_company_name(company_id: str | None) -> str:
     return "VectraClaw"
 
 
-def entrypoint(task: dict) -> dict:
+def entrypoint(task: dict, supabase: Any = None) -> dict:
     """Ponto de entrada chamado pelo agent_daemon para operation_type='oracle-report'."""
+    from src.agent_ids import HERMES_AGENT_ID
+    from src.services.adapter_field_resolve import load_mcp_imap_smtp_credentials
+
+    company_id = str(task.get("company_id") or "").strip()
+    smtp_creds = (
+        load_mcp_imap_smtp_credentials(
+            supabase,
+            company_id,
+            agent_id=HERMES_AGENT_ID,
+        )
+        if supabase and company_id
+        else None
+    )
+    if not smtp_creds:
+        logger.warning(
+            "HermesReporter: mcp-imap incompleto (smtp_host/port/email/password) — "
+            "preencha Connectors ou HERMES_SMTP_* env. task=%s",
+            task.get("id"),
+        )
+
     desc = task.get("description", "")
     recipients, subject_hint, markdown = _parse_task_description(desc)
     input_json = task.get("input_json") or {}
@@ -384,7 +424,7 @@ def entrypoint(task: dict) -> dict:
             return {"status": "errored", "error": f"render prospect failed: {e}"}
         logger.info("HermesReporter: enviando e-mail (prospect)")
         try:
-            msg_id = send_smtp(subject, html_body, recipients)
+            msg_id = send_smtp(subject, html_body, recipients, credentials=smtp_creds)
         except Exception as e:
             logger.error("HermesReporter: falha no envio SMTP — %s", e)
             return {"status": "errored", "error": f"send_smtp failed: {e}"}
@@ -439,7 +479,7 @@ def entrypoint(task: dict) -> dict:
 
     logger.info("HermesReporter: enviando e-mail")
     try:
-        msg_id = send_smtp(subject, html_body, recipients)
+        msg_id = send_smtp(subject, html_body, recipients, credentials=smtp_creds)
     except Exception as e:
         logger.error("HermesReporter: falha no envio SMTP — %s", e)
         return {"status": "errored", "error": f"send_smtp failed: {e}"}

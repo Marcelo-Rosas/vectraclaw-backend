@@ -72,6 +72,74 @@ def test_send_smtp_uses_env_vars(monkeypatch):
     mock_smtp.send_message.assert_called_once()
 
 
+def test_send_smtp_uses_explicit_credentials(monkeypatch):
+    from src.agents.hermes_reporter import send_smtp
+
+    mock_smtp = MagicMock()
+    mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
+    mock_smtp.__exit__ = MagicMock(return_value=False)
+
+    creds = {
+        "server": "smtpout.secureserver.net",
+        "port": 465,
+        "user": "marcelo.rosas@vectracargo.com.br",
+        "password": "vault-resolved",
+    }
+    with patch("smtplib.SMTP_SSL", return_value=mock_smtp) as mock_cls:
+        send_smtp("Assunto", "<p>ok</p>", ["dest@test.com"], credentials=creds)
+
+    mock_smtp.login.assert_called_once_with("marcelo.rosas@vectracargo.com.br", "vault-resolved")
+    mock_cls.assert_called_once_with(
+        "smtpout.secureserver.net", 465, context=mock_cls.call_args[1]["context"], timeout=30
+    )
+
+
+def test_load_mcp_imap_smtp_credentials_from_metadata():
+    from src.services.adapter_field_resolve import load_mcp_imap_smtp_credentials
+
+    mock_client = MagicMock()
+
+    def table_side_effect(name):
+        t = MagicMock()
+        if name == "adapter_catalog":
+            t.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+                {"id": "adp-imap"}
+            ]
+        elif name == "company_adapter_values":
+            t.select.return_value.eq.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+                {
+                    "field_values_json": {
+                        "email": "user@test.com",
+                        "password": "vault://secret-uuid",
+                        "smtp_host": "smtpout.secureserver.net",
+                        "smtp_port": "465",
+                    }
+                }
+            ]
+        elif name == "agent_adapter_configs":
+            t.select.return_value.eq.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data = []
+        return t
+
+    mock_client.table.side_effect = table_side_effect
+
+    def _fake_resolve(_client, _company_id, value):
+        if str(value).startswith("vault://"):
+            return "plain-pwd"
+        return str(value)
+
+    with patch(
+        "src.services.adapter_field_resolve.resolve_secret_value",
+        side_effect=_fake_resolve,
+    ):
+        creds = load_mcp_imap_smtp_credentials(mock_client, "01b9b40e-2fc4-4cc5-a91e-cb95385d2aa2")
+
+    assert creds is not None
+    assert creds["user"] == "user@test.com"
+    assert creds["password"] == "plain-pwd"
+    assert creds["server"] == "smtpout.secureserver.net"
+    assert creds["port"] == 465
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # entrypoint
 # ──────────────────────────────────────────────────────────────────────────────

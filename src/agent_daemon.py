@@ -677,9 +677,9 @@ class ResilientHarnessDaemon:
                 },
             })
 
-        if op_type == "oracle-report":
+        if op_type in ("oracle-report", "responsavel-pelo-disparo-de-e-mails"):
             from src.agents.hermes_reporter import entrypoint as hr_entry
-            result = hr_entry(task)
+            result = hr_entry(task, self._get_supabase())
             return _json.dumps(result)
 
         if op_type == "rag-ingest":
@@ -1121,6 +1121,8 @@ class ResilientHarnessDaemon:
             subject = f"Oracle Research — {company_name or title}"
 
             from src.agents.hermes_reporter import render_html, send_smtp
+            from src.agent_ids import HERMES_AGENT_ID
+            from src.services.adapter_field_resolve import load_mcp_imap_smtp_credentials
             # Catalog-driven (Regra #2): header deriva de company_name + report_type,
             # não literal "Vectra Cargo" cravado.
             html_body = render_html(
@@ -1129,7 +1131,17 @@ class ResilientHarnessDaemon:
                 company_name=company_name or None,
                 report_type="Oracle Research",
             )
-            msg_id = send_smtp(subject, html_body, [recipient])
+            company_id = str(task.get("company_id") or "").strip()
+            smtp_creds = (
+                load_mcp_imap_smtp_credentials(
+                    self._get_supabase(),
+                    company_id,
+                    agent_id=HERMES_AGENT_ID,
+                )
+                if company_id
+                else None
+            )
+            msg_id = send_smtp(subject, html_body, [recipient], credentials=smtp_creds)
             logger.info(
                 "_send_oracle_research_email: enviado msg_id=%s recipient=%s task=%s",
                 msg_id, recipient, task.get("id"),
