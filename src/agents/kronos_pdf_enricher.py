@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -220,10 +221,158 @@ def _to_iso_date(s: str) -> Optional[str]:
     return None
 
 
+# ── Opção A: enriquecer o OFX antes do import ────────────────────────
+#
+# O OFX do C6 traz o <MEMO> genérico ("TRANSF ENVIADA PIX") sem o
+# destinatário/origem do PIX. Antes de subir o arquivo no Meu Planner,
+# reescrevemos esses MEMOs com a descrição rica do PDF do mesmo banco —
+# cruzando por (data, |valor|). Como a reescrita persiste no <MEMO>, o
+# Meu Planner passa a exibir a descrição completa e a categorização fica
+# mais precisa.
+
+# MEMOs que o OFX C6 emite sem identificar a contraparte. Comparados em
+# lower-case exato — descrições já específicas (ex.: "Pix recebido de
+# CAMILLA...") não entram no set e são preservadas como estão.
+_GENERIC_OFX_MEMOS = frozenset(
+    {
+        "transf enviada pix",
+        "transf recebida pix",
+        "transf enviada",
+        "transf recebida",
+        "pix enviado",
+        "pix recebido",
+    }
+)
+
+_STMTTRN_RE = re.compile(r"<STMTTRN>(?P<body>.*?)</STMTTRN>", re.S)
+_MEMO_TAG_RE = re.compile(r"<MEMO>(?P<v>.*?)</MEMO>", re.S)
+
+
+def is_generic_ofx_memo(memo: Optional[str]) -> bool:
+    """True quando o MEMO é um placeholder genérico do C6 (alvo de reescrita)."""
+    return (memo or "").strip().lower() in _GENERIC_OFX_MEMOS
+
+
+def _ofx_tag(body: str, tag: str) -> str:
+    """Lê o conteúdo de uma tag OFX/SGML (fecho opcional — OFX 1.x omite)."""
+    match = re.search(rf"<{tag}>(?P<v>.*?)(?:</{tag}>|[\r\n])", body, re.S)
+    return match.group("v").strip() if match else ""
+
+
+def _parse_ofx_amount_centavos(amt: str) -> int:
+    """Converte TRNAMT do OFX ('-39.50', formato US com ponto) → centavos signed."""
+    s = (amt or "").strip()
+    if not s:
+        return 0
+    try:
+        return int(round(float(s) * 100))
+    except ValueError:
+        return 0
+
+
+def _ofx_escape(text: str) -> str:
+    """Escapa caracteres SGML/XML no MEMO enriquecido (& < >)."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def enrich_ofx_text(
+    ofx_text: str,
+    lookup: dict[tuple[str, int], str],
+) -> tuple[str, list[dict]]:
+    """Reescreve <MEMO> genéricos do OFX com a descrição rica do PDF.
+
+    Só toca MEMOs em `_GENERIC_OFX_MEMOS` que tenham match no `lookup` por
+    (data ISO, |valor centavos|). Descrições já específicas ficam intactas.
+
+    Devolve `(novo_texto, mudancas)` onde cada mudança é
+    `{"date", "centavos", "from", "to"}`.
+    """
+    changes: list[dict] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        body = match.group("body")
+        memo = _ofx_tag(body, "MEMO")
+        if not memo or not is_generic_ofx_memo(memo):
+            return match.group(0)
+
+        amt = _ofx_tag(body, "TRNAMT")
+        dt = _ofx_tag(body, "DTPOSTED")[:8]
+        if not amt or len(dt) != 8 or not dt.isdigit():
+            return match.group(0)
+
+        iso = f"{dt[0:4]}-{dt[4:6]}-{dt[6:8]}"
+        cents = _parse_ofx_amount_centavos(amt)
+        enriched = find_enriched_description(lookup, iso, cents)
+        if not enriched:
+            return match.group(0)
+
+        enriched_clean = enriched.strip()
+        if enriched_clean.lower() == memo.strip().lower():
+            return match.group(0)
+
+        escaped = _ofx_escape(enriched_clean)
+        new_body = _MEMO_TAG_RE.sub(
+            lambda _m: f"<MEMO>{escaped}</MEMO>", body, count=1
+        )
+        changes.append(
+            {
+                "date": iso,
+                "centavos": cents,
+                "from": memo.strip(),
+                "to": enriched_clean,
+            }
+        )
+        return f"<STMTTRN>{new_body}</STMTTRN>"
+
+    new_text = _STMTTRN_RE.sub(_replace, ofx_text)
+    return new_text, changes
+
+
+def enrich_ofx_file(
+    src_path: Path | str,
+    lookup: dict[tuple[str, int], str],
+    dest_path: Optional[Path | str] = None,
+) -> tuple[Path, list[dict]]:
+    """Lê o OFX, enriquece os MEMOs genéricos e grava o resultado.
+
+    - Sem nenhuma mudança: devolve `(src_path_original, [])` — o caller pode
+      seguir importando o arquivo original sem custo extra.
+    - Com mudanças: grava em `dest_path` (ou num tmp dir, preservando o nome
+      do arquivo original) e devolve `(novo_path, mudancas)`.
+    """
+    src = Path(src_path)
+    text = src.read_text(encoding="utf-8", errors="replace")
+    new_text, changes = enrich_ofx_text(text, lookup or {})
+    if not changes:
+        return src, []
+
+    if dest_path is None:
+        tmpdir = Path(tempfile.mkdtemp(prefix="kronos_ofx_enriched_"))
+        dest = tmpdir / src.name
+    else:
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(new_text, encoding="utf-8")
+    logger.info(
+        "enrich_ofx_file: %d MEMO(s) reescrito(s) em %s → %s",
+        len(changes),
+        src.name,
+        dest,
+    )
+    return dest, changes
+
+
 __all__ = [
     "PdfEntry",
     "parse_c6_pdf",
     "build_pdf_lookup",
     "find_enriched_description",
     "parse_brl_amount_to_centavos",
+    "is_generic_ofx_memo",
+    "enrich_ofx_text",
+    "enrich_ofx_file",
 ]
