@@ -48,6 +48,7 @@ class TaskFactory:
             self.client.table("workflow_steps")
             .select("*")
             .eq("workflow_id", workflow_id)
+            .eq("active", True)
             .order("step_order")
             .execute()
         )
@@ -82,6 +83,55 @@ class TaskFactory:
     # ------------------------------------------------------------------
     # Materialize
     # ------------------------------------------------------------------
+
+    def _resolve_assigned_agent_id(
+        self, company_id: str, row: Dict[str, Any], operation_type: str
+    ) -> Optional[str]:
+        """Resolve assigned_to_agent_id para um step.
+
+        Ordem:
+        1) `agent_specialty_config_id` (override explícito por step)
+        2) `specialty_slug` via MorpheusDispatcher (determinístico)
+        3) fallback Oracle para `oracle-*` (exceto op_types de e-mail)
+        """
+        cfg_id = (row.get("agent_specialty_config_id") or "").strip()
+        if cfg_id:
+            try:
+                cfg = (
+                    self.client.table("agent_specialty_configs")
+                    .select("agent_id")
+                    .eq("id", cfg_id)
+                    .eq("company_id", company_id)
+                    .limit(1)
+                    .execute()
+                )
+                cfg_row = (cfg.data or [None])[0]
+                agent_id = (cfg_row or {}).get("agent_id")
+                if agent_id:
+                    return str(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "_resolve_assigned_agent_id: config_id lookup failed (%s): %s",
+                    cfg_id,
+                    exc,
+                )
+
+        spec_slug = (row.get("specialty_slug") or "").strip()
+        if spec_slug:
+            agent_id = self._dispatcher._find_agent(
+                company_id, spec_slug, operation_type=operation_type
+            )
+            if agent_id:
+                return str(agent_id)
+
+        op = str(operation_type or "")
+        if op.startswith("oracle-") and op not in (
+            "oracle-report",
+            "responsavel-pelo-disparo-de-e-mails",
+        ):
+            return ORACLE_AGENT_ID
+
+        return None
 
     def materialize_workflow(
         self,
@@ -185,11 +235,7 @@ class TaskFactory:
                     or "other"
                 )
                 spec_slug = row.get("specialty_slug")
-                agent_id = None
-                if spec_slug:
-                    agent_id = self._dispatcher._find_agent(company_id, spec_slug)
-                if not agent_id and str(op_type).startswith("oracle-"):
-                    agent_id = ORACLE_AGENT_ID
+                agent_id = self._resolve_assigned_agent_id(company_id, row, op_type)
 
                 merged_child_input = dict(step_inputs.get(step_code, {}) or {})
                 merged_child_input["workflowStepSlug"] = step_code
