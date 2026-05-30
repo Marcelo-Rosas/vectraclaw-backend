@@ -38,3 +38,11 @@ There is no project-wide ruff/mypy/pre-commit config in this tree; rely on `pyte
 ### Long-running processes
 
 Use **tmux** (portal config at `/exec-daemon/tmux.portal.conf`) for dev servers, e.g. session name `vectraclaw-api`.
+
+### Smoke without real Supabase
+
+With only `.env.example` placeholders, `SUPABASE_URL` will not resolve — DB-backed routes (`/api/intelligence/dashboard`, SIPOC lists, daemons) fail with DNS errors. These still validate core backend without a project:
+
+- `GET /api/health`, `GET /api`, `GET /api/health/metrics`
+- `GET /api/audit/parity` — `checks.m3_tools` and `ws_manager` should be `"status": "ok"`
+- Freight cubagem via `src.m3_tools.calculate_cbm` (no HTTP route; used by CMA tools)
