@@ -56,7 +56,9 @@ from src.middleware.cors_policy import (
 )
 from src.middleware.http_observability import CorrelationIdMiddleware, get_http_metrics
 from src.agents.sipoc_researcher import research_sector
-from src.services.sipoc_promotion import promote_activity_to_automation
+from src.services.sipoc_promotion import promote_activity_to_automation, promote_process_to_workflow
+from src.services.telemetry_aggregation import get_workflow_telemetry, get_goal_telemetry
+from src.services.athena_monitor import monitor_workflows
 from src.services.sipoc_validator import validate_sipoc_consistency
 from src.services.sipoc_raci import calculate_raci_stats
 from src.services.sipoc_templates import get_templates_list, get_template_detail
@@ -93,6 +95,7 @@ _OPENAPI_PUBLIC_PATHS = frozenset(
         "/login",
         "/auth/me",
         "/api/auth/me",
+        "/api/gymsite/lead",
     }
 )
 
@@ -883,6 +886,13 @@ async def unhandled_exception_with_cors(request: Request, exc: Exception) -> JSO
         detail="internal_server_error",
     )
 
+@app.exception_handler(ConnectionResetError)
+async def connection_reset_error_handler(request: Request, exc: ConnectionResetError) -> Response:
+    """Silently handle ConnectionResetError (OS noise) without treating as server error."""
+    logger.debug("ConnectionResetError ignored for path=%s", request.url.path)
+    # Return empty 200 response; client likely closed connection.
+    return Response(status_code=200)
+
 
 @app.get("/api/health/metrics")
 @app.get("/health/metrics")
@@ -1011,6 +1021,29 @@ def _slugify_sipoc(name: str) -> str:
     return slug or "sem-nome"
 
 
+def _ensure_unique_slug(client, company_id: str, base_slug: str) -> str:
+    """Verifica se slug já existe pra company e adiciona sufixo numérico se necessário."""
+    slug = base_slug
+    counter = 2
+    max_attempts = 100  # safeguard
+    for _ in range(max_attempts):
+        existing = (
+            client.table("sipoc_sectors")
+            .select("id")
+            .eq("company_id", company_id)
+            .eq("slug", slug)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            return slug
+        slug = f"{base_slug}-{counter}"
+        counter += 1
+    # Fallback extremo (nunca deve acontecer na prática)
+    import uuid as _uuid
+    return f"{base_slug}-{_uuid.uuid4().hex[:8]}"
+
+
 def _normalize_sipoc_payload_to_snake(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Aceita payload em camelCase OU snake_case (frontend velho mistura).
     DB exige snake_case. Defensive transform — não quebra clients corretos.
@@ -1030,6 +1063,9 @@ def _normalize_sipoc_payload_to_snake(payload: Dict[str, Any]) -> Dict[str, Any]
         "responsibleId": "responsible_id",
         "responsiblePositionId": "responsible_position_id",
         "suggestedOperationType": "suggested_operation_type",
+        "goalId": "goal_id",
+        "workflowDefinitionId": "workflow_definition_id",
+        "projectId": "project_id",
         # Status/flags
         "automationStatus": "automation_status",
         "validationStatus": "validation_status",
@@ -1066,6 +1102,12 @@ async def create_sipoc_sector(request: Request, payload: Dict[str, Any]):
             detail="tenant_claim_missing: app_metadata.vectraclip.company_id",
         )
     payload["company_id"] = str(_caller_company)
+    # Garante slug único pra company (evita duplicate key 23505)
+    payload["slug"] = _ensure_unique_slug(
+        client=get_authenticated_client(request.state.token),
+        company_id=payload["company_id"],
+        base_slug=payload["slug"],
+    )
     try:
         client = get_authenticated_client(request.state.token)
         res = client.table("sipoc_sectors").insert(payload).execute()
@@ -1184,18 +1226,51 @@ async def upsert_sipoc_component(request: Request, payload: Dict[str, Any]):
     # Os irmãos POST sectors/processes/positions já chamam isso; este endpoint estava
     # esquecido — bug reportado por user em 2026-05-16 (auditoria de handlers).
     payload = _normalize_sipoc_payload_to_snake(payload)
+    logger.info("upsert_sipoc_component payload=%s", payload)
     try:
         client = get_authenticated_client(request.state.token)
-        # Se tiver ID, atualiza; senão, insere.
         comp_id = payload.get("id")
+
+        # UUID válido? Se não for (ex: "supplier-1" gerado por LLM), ignora e faz INSERT.
+        _is_valid_uuid = False
         if comp_id:
+            import uuid
+            try:
+                uuid.UUID(str(comp_id))
+                _is_valid_uuid = True
+            except ValueError:
+                _is_valid_uuid = False
+                logger.warning("upsert_sipoc_component: id invalido (%s), tratando como INSERT", comp_id)
+                payload.pop("id", None)
+                comp_id = None
+
+        if comp_id and _is_valid_uuid:
+            # Tenta UPDATE; se nao afetar nenhuma linha (novo componente com id pre-gerado), faz INSERT.
             res = client.table("sipoc_components").update(payload).eq("id", comp_id).execute()
-        else:
+            if not getattr(res, "data", None):
+                logger.info("upsert_sipoc_component: UPDATE nao encontrou id=%s, fazendo INSERT", comp_id)
+                payload.pop("id", None)
+                comp_id = None
+
+        if not comp_id:
+            # INSERT novo componente — process_id é obrigatório (NOT NULL + FK)
+            if not payload.get("process_id"):
+                logger.warning("upsert_sipoc_component: process_id ausente no payload INSERT")
+                raise HTTPException(status_code=400, detail="process_id obrigatorio para criar componente")
             res = client.table("sipoc_components").insert(payload).execute()
 
-        return SipocComponent(**res.data[0]).to_zod_dict()
+        data = getattr(res, "data", None)
+        if not data:
+            logger.error("upsert_sipoc_component: resposta vazia do Supabase apos INSERT/UPDATE")
+            raise HTTPException(status_code=500, detail="resposta_vazia_do_banco")
+
+        return SipocComponent(**data[0]).to_zod_dict()
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"upsert_sipoc_component failed: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"upsert_sipoc_component failed: {e}\n{tb}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/sipoc/research")
@@ -1398,6 +1473,12 @@ async def patch_sipoc_process(request: Request, process_id: UUID, payload: Dict[
         update_data["position_id"] = payload["position_id"] or None
     if "responsible_id" in payload:
         update_data["responsible_id"] = payload["responsible_id"] or None
+    if "goal_id" in payload:
+        update_data["goal_id"] = payload["goal_id"] or None
+    if "workflow_definition_id" in payload:
+        update_data["workflow_definition_id"] = payload["workflow_definition_id"] or None
+    if "project_id" in payload:
+        update_data["project_id"] = payload["project_id"] or None
     if "metadata" in payload and isinstance(payload["metadata"], dict):
         update_data["metadata"] = payload["metadata"]
 
@@ -1415,6 +1496,47 @@ async def patch_sipoc_process(request: Request, process_id: UUID, payload: Dict[
         raise
     except Exception as e:
         logger.error(f"patch_sipoc_process failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/sipoc/processes/{process_id}/promote-to-workflow")
+async def promote_sipoc_to_workflow(request: Request, process_id: UUID):
+    """Promove um processo SIPOC para workflow definition + steps + tasks.
+
+    Body opcional: {"goalId": "...", "kind": "project|routine"}
+    """
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    body = await request.json()
+    goal_id = body.get("goalId")
+    kind = body.get("kind", "project")
+
+    scope = await resolve_scope(request)
+    company_id = str(scope.get("company_id") or "")
+
+    try:
+        result = await promote_process_to_workflow(
+            supabase,
+            sipoc_process_id=str(process_id),
+            goal_id=goal_id,
+            company_id=company_id or None,
+            kind=kind,
+        )
+        if result.get("error"):
+            raise HTTPException(400, result["error"])
+        logger.info(
+            "promote_sipoc_to_workflow process=%s workflow=%s steps=%s/%s by=%s",
+            process_id,
+            result.get("workflow_id"),
+            result.get("steps_created"),
+            result.get("steps_expected"),
+            scope.get("user_id"),
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"promote_sipoc_to_workflow failed: {e}")
         raise HTTPException(500, str(e))
 
 
@@ -2570,6 +2692,55 @@ async def get_sipoc_analytics(request: Request):
         logger.error(f"get_sipoc_analytics failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── FASE 4 — Telemetry Aggregation ──────────────────────────────────────────
+
+@app.get("/api/analytics/workflow/{workflow_id}/telemetry")
+async def get_workflow_telemetry_endpoint(request: Request, workflow_id: str):
+    """Retorna telemetria completa de um workflow: custo, SLA, agentes."""
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+    try:
+        client = get_authenticated_client(request.state.token)
+        # Valida que o workflow pertence à company do JWT
+        wf_check = (
+            client.table("workflow_definitions")
+            .select("id")
+            .eq("id", workflow_id)
+            .limit(1)
+            .execute()
+        )
+        if not wf_check.data:
+            raise HTTPException(404, "workflow_not_found")
+        result = get_workflow_telemetry(supabase, workflow_id)
+        if result.get("error"):
+            raise HTTPException(404 if result["error"] == "workflow_not_found" else 503, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_workflow_telemetry failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analytics/goal/{goal_id}/telemetry")
+async def get_goal_telemetry_endpoint(request: Request, goal_id: str):
+    """Retorna telemetria agregada por goal."""
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+    try:
+        client = get_authenticated_client(request.state.token)
+        result = get_goal_telemetry(supabase, goal_id)
+        if result.get("error"):
+            raise HTTPException(404 if result["error"] == "goal_not_found_or_no_data" else 503, result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"get_goal_telemetry failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/sipoc/processes/{process_id}/approve")
 async def approve_process(request: Request, process_id: UUID, payload: Dict[str, Any]):
     if not supabase:
@@ -2607,8 +2778,8 @@ async def list_sipoc_edges(request: Request, process_id: UUID):
     if not supabase:
         return []
     try:
-        client = get_authenticated_client(request.state.token)
-        res = client.table("sipoc_edges").select("*").eq("process_id", process_id).execute()
+        # Usar service role para bypass de problemas de GRANT no DB
+        res = supabase.table("sipoc_edges").select("*").eq("process_id", str(process_id)).execute()
         return res.data or []
     except Exception as e:
         logger.error(f"list_sipoc_edges failed: {e}")
@@ -2619,14 +2790,14 @@ async def save_sipoc_edges(request: Request, process_id: UUID, payload: List[Dic
     if not supabase:
         return {"success": False}
     try:
-        client = get_authenticated_client(request.state.token)
+        # Usar service role para bypass de problemas de GRANT no DB
         # 1. Limpar edges antigas
-        client.table("sipoc_edges").delete().eq("process_id", process_id).execute()
+        supabase.table("sipoc_edges").delete().eq("process_id", str(process_id)).execute()
         # 2. Inserir novas
         if payload:
             for edge in payload:
                 edge["process_id"] = str(process_id)
-            client.table("sipoc_edges").insert(payload).execute()
+            supabase.table("sipoc_edges").insert(payload).execute()
         return {"success": True}
     except Exception as e:
         logger.error(f"save_sipoc_edges failed: {e}")
@@ -3154,14 +3325,16 @@ async def login(payload: LoginPayload):
         raise HTTPException(status_code=503, detail="Serviço de autenticação indisponível")
     
     try:
-        logger.info(f"Tentativa de login para: {payload.email}")
+        email = (payload.email or "").strip().lower()
+        password = payload.password or ""
+        logger.info(f"Tentativa de login para: {email}")
         # Tenta login real no Supabase
         # VEC-199b: usa client dedicado a auth — NUNCA `supabase` (service_role),
         # senão o listener SIGNED_IN zera `_postgrest` e faz o Doctor virar
         # authenticated role, causando `permission denied`.
         res = supabase_auth.auth.sign_in_with_password({
-            "email": payload.email,
-            "password": payload.password,
+            "email": email,
+            "password": password,
         })
         
         if not res.session or not res.user:
@@ -3227,7 +3400,7 @@ async def login(payload: LoginPayload):
         err_msg = str(e).lower()
         # Captura erros comuns de autenticação do GoTrue/Supabase
         if "invalid login credentials" in err_msg or "invalid_credentials" in err_msg:
-             logger.warning(f"Tentativa de login falhou (credenciais): {payload.email}")
+             logger.warning(f"Tentativa de login falhou (credenciais): {email}")
              raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
              
         logger.error(f"Login CRITICAL FAILURE: {type(e).__name__} - {str(e)}")
@@ -3807,9 +3980,11 @@ class NewTaskInput(BaseModel):
     parentTaskId: Optional[str] = None
     assignedToAgentId: Optional[str] = None
     goalId: Optional[str] = None
+    workflowDefinitionId: Optional[str] = None
+    routineId: Optional[str] = None
     inputJson: Optional[Dict[str, Any]] = None
 
-    @validator("parentTaskId", "assignedToAgentId", "goalId", pre=True)
+    @validator("parentTaskId", "assignedToAgentId", "goalId", "workflowDefinitionId", "routineId", pre=True)
     def empty_str_to_none(cls, v):
         if v == "":
             return None
@@ -3848,6 +4023,8 @@ class UpdateTaskInput(BaseModel):
     )
     parent_task_id: Optional[str] = Field(default=None, alias="parentTaskId")
     goal_id: Optional[str] = Field(default=None, alias="goalId")
+    workflow_definition_id: Optional[str] = Field(default=None, alias="workflowDefinitionId")
+    routine_id: Optional[str] = Field(default=None, alias="routineId")
     output_json: Optional[Dict[str, Any]] = Field(default=None, alias="outputJson")
     input_json: Optional[Dict[str, Any]] = Field(default=None, alias="inputJson")
 
@@ -3915,6 +4092,8 @@ async def create_task(request: Request, company_id: str, payload: NewTaskInput):
         "parent_task_id": payload.parentTaskId,
         "assigned_to_agent_id": payload.assignedToAgentId,
         "goal_id": payload.goalId,
+        "workflow_definition_id": payload.workflowDefinitionId,
+        "routine_id": payload.routineId,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -3957,6 +4136,8 @@ async def create_task(request: Request, company_id: str, payload: NewTaskInput):
         "parentTaskId": payload.parentTaskId,
         "assignedToAgentId": payload.assignedToAgentId,
         "goalId": payload.goalId,
+        "workflowDefinitionId": payload.workflowDefinitionId,
+        "routineId": payload.routineId,
         "claimedAt": None,
         "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     })
@@ -4558,6 +4739,7 @@ async def create_project(company_id: str, request: Request):
         "mission": body.get("mission", ""),
         "status": body.get("status", "backlog"),
         "lead_agent_id": body.get("leadAgentId"),
+        "goal_id": body.get("goalId"),
         "target_date": body.get("targetDate"),
         "issue_completion_pct": body.get("issueCompletionPct", 0),
     }
@@ -4608,6 +4790,44 @@ async def delete_project(project_id: str, request: Request):
         return Response(status_code=204)
     except Exception as e:
         logger.error(f"delete_project failed: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/projects/{project_id}/post-mortem")
+async def trigger_post_mortem(project_id: str, request: Request):
+    """
+    Fase 5 do PMO Autônomo: Post-Mortem & Aprendizado
+    Invoca o Oracle para analisar o projeto e extrair lições aprendidas (Toil reduction).
+    """
+    from src.agents.oracle import analyze_project_post_mortem
+    try:
+        client = get_authenticated_client(request.state.token) if supabase else None
+        
+        # Coleta os dados do projeto (mock fallback caso supabase não exista)
+        if client:
+            proj_res = client.table("projects").select("*").eq("id", project_id).single().execute()
+            if not proj_res.data:
+                raise HTTPException(404, "Project not found")
+            project_data = proj_res.data
+        else:
+            project_data = {"id": project_id, "name": "Mock Project", "status": "concluído"}
+
+        # Dispara o agente Oracle para analisar o projeto
+        analysis_result = await analyze_project_post_mortem(project_data)
+
+        if "error" in analysis_result:
+            raise Exception(analysis_result["error"])
+
+        # Salva o resultado no banco (coluna jsonb 'post_mortem_data')
+        structured_data = analysis_result.get("structured_data", {})
+        if client:
+            client.table("projects").update({"post_mortem_data": structured_data}).eq("id", project_id).execute()
+
+        return {"project_id": project_id, "post_mortem": structured_data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"trigger_post_mortem failed: {e}")
         raise HTTPException(500, str(e))
 
 
@@ -4889,6 +5109,118 @@ async def create_adapter(request: Request, company_id: str, payload: NewAdapterI
     except Exception as e:
         logger.error(f"create_adapter failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class CreateAdapterFromProfileInput(BaseModel):
+    runtimeProfileId: str
+    slug: Optional[str] = None
+    displayName: Optional[str] = None
+
+
+def _slugify_adapter_slug(name: str) -> str:
+    import re
+    return re.sub(r"_{2,}", "_", re.sub(r"[^a-z0-9]+", "_", (name or "").lower())).strip("_") or "adapter"
+
+
+@app.post("/api/companies/{company_id}/adapters/from-profile")
+@app.post("/companies/{company_id}/adapters/from-profile")
+async def create_adapter_from_profile(
+    request: Request, company_id: str, payload: CreateAdapterFromProfileInput
+):
+    """Cria adapter a partir de um runtime profile (wizard Connectors)."""
+    validate_jwt_company_id(request.state.token, company_id)
+
+    if not supabase:
+        raise HTTPException(status_code=503, detail="supabase_not_available")
+
+    # 1) Busca runtime profile
+    try:
+        profile_res = (
+            supabase.table("adapter_runtime_profiles")
+            .select("*")
+            .eq("id", payload.runtimeProfileId)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="runtime_profile_not_found")
+        profile = profile_res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("create_adapter_from_profile: profile lookup failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # 2) Deriva slug / display_name
+    slug = (payload.slug or "").strip()
+    if not slug:
+        slug = _slugify_adapter_slug(str(profile.get("name") or ""))
+    display_name = (payload.displayName or "").strip()
+    if not display_name:
+        display_name = str(profile.get("name") or slug)
+
+    # 3) Insere adapter_catalog com runtime_profile_id
+    now = datetime.now(timezone.utc).isoformat()
+    adapter_row = {
+        "company_id": company_id,
+        "slug": slug,
+        "display_name": display_name,
+        "provider": str(profile.get("default_provider") or "credentials"),
+        "is_active": True,
+        "runtime_profile_id": payload.runtimeProfileId,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    try:
+        adapter_res = supabase.table("adapter_catalog").insert(adapter_row).execute()
+        if not adapter_res.data:
+            raise HTTPException(status_code=500, detail="adapter_insert_failed")
+        adapter = adapter_res.data[0]
+        adapter_id = adapter["id"]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("create_adapter_from_profile: adapter insert failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # 4) Cria adapter_field_definitions a partir do template
+    template = profile.get("field_definitions_template") or []
+    if isinstance(template, str):
+        try:
+            import json
+            template = json.loads(template)
+        except Exception:
+            template = []
+    if template:
+        field_rows = []
+        for idx, field in enumerate(template):
+            if not isinstance(field, dict):
+                continue
+            field_rows.append(
+                {
+                    "company_id": company_id,
+                    "adapter_id": adapter_id,
+                    "field_key": str(field.get("field_key") or field.get("fieldKey") or ""),
+                    "field_label": str(field.get("field_label") or field.get("fieldLabel") or ""),
+                    "field_type": str(field.get("field_type") or field.get("fieldType") or "text"),
+                    "is_required": bool(field.get("is_required") or field.get("isRequired")),
+                    "options_json": field.get("options_json") or field.get("optionsJson") or None,
+                    "sort_order": int(field.get("sort_order") or field.get("sortOrder") or idx * 10),
+                    "is_active": True,
+                    "applies_to": "company",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        if field_rows:
+            try:
+                supabase.table("adapter_field_definitions").insert(field_rows).execute()
+            except Exception as e:
+                logger.warning("create_adapter_from_profile: field insert failed: %s", e)
+
+    return AdapterCatalogItem(**adapter).to_zod_dict()
 
 
 @app.put("/api/adapters/{adapter_id}")
@@ -5810,8 +6142,8 @@ def _normalize_5w2h_payload(body: dict) -> dict:
     Rules:
     - If body already has ``fiveW2H`` (dict), use it as the base.
     - Otherwise collect flat fields: what, why, who, where, when, how.
-    - howMuch: string → {"description": str}; dict → as-is; absent → {}
-      Also handles snake_case ``how_much`` as fallback when ``howMuch`` is absent.
+    - how_much: string -> {"description": str}; dict -> as-is; absent -> {}
+      Also handles camelCase ``howMuch`` as fallback when ``how_much`` is absent.
     - Returns a shallow copy of body with ``fiveW2H`` set (flat fields kept for
       backward-compatibility during the transition window).
     """
@@ -5830,22 +6162,27 @@ def _normalize_5w2h_payload(body: dict) -> dict:
             "how": body.get("how") or "",
         }
 
-    # Normalise howMuch -------------------------------------------------------
-    # Priority: fiveW2H.howMuch > flat howMuch > flat how_much
-    inner_how_much = five.get("howMuch")
-    flat_how_much = body.get("howMuch") or body.get("how_much")
+    # Normalise how_much -------------------------------------------------------
+    # Priority: fiveW2H.how_much > flat how_much > flat howMuch
+    inner_how_much = five.get("how_much") or five.get("howMuch")
+    flat_how_much = body.get("how_much") or body.get("howMuch")
 
     if inner_how_much is None:
         if isinstance(flat_how_much, dict):
-            five["howMuch"] = flat_how_much
+            five["how_much"] = flat_how_much
         elif isinstance(flat_how_much, str) and flat_how_much:
-            five["howMuch"] = {"description": flat_how_much}
+            five["how_much"] = {"description": flat_how_much}
         else:
-            five["howMuch"] = {}
+            five["how_much"] = {}
     elif isinstance(inner_how_much, str):
         # Coerce string inside fiveW2H to canonical dict form
-        five["howMuch"] = {"description": inner_how_much} if inner_how_much else {}
-    # else: already a dict — keep as-is
+        five["how_much"] = {"description": inner_how_much} if inner_how_much else {}
+    else:
+        five["how_much"] = inner_how_much
+
+    # Remove the legacy howMuch key if it existed inside fiveW2H
+    if "howMuch" in five:
+        del five["howMuch"]
 
     result["fiveW2H"] = five
     return result
@@ -5878,7 +6215,7 @@ def _validate_5w2h(normalized: dict) -> dict:
         {"status": "verde"|"amarelo"|"vermelho", "errors": [{"field": str, "message": str}]}
 
     Rules:
-    - Required fields: why, how, who, when  (howMuch is NOT validated)
+    - Required fields: why, how, who, when  (how_much is NOT validated)
     - verde    = all 4 filled
     - amarelo  = 1, 2 or 3 of the 4 filled
     - vermelho = none of the 4 filled
@@ -5915,7 +6252,7 @@ def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
         w_where = five.get("where") or meta.get("where") or ""
         w_when  = five.get("when")  or meta.get("when")  or ""
         w_how   = five.get("how")   or meta.get("how")   or ""
-        raw_hm  = five.get("howMuch") or meta.get("howMuch") or {}
+        raw_hm  = five.get("how_much") or five.get("howMuch") or meta.get("how_much") or meta.get("howMuch") or {}
         w_how_much = raw_hm if isinstance(raw_hm, dict) else ({"description": raw_hm} if raw_hm else {})
         return {
             "id": r.get("id"),
@@ -5940,7 +6277,7 @@ def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
             "where": w_where,
             "when": w_when,
             "how": w_how,
-            "howMuch": w_how_much,
+            "how_much": w_how_much,
             # canonical nested object
             "fiveW2H": {
                 "what": w_what,
@@ -5949,7 +6286,7 @@ def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
                 "where": w_where,
                 "when": w_when,
                 "how": w_how,
-                "howMuch": w_how_much,
+                "how_much": w_how_much,
             },
             "validationStatus": r.get("validation_status") or "verde",
             "validationErrors": r.get("validation_errors") or [],
@@ -5974,7 +6311,7 @@ def _sipoc_step_to_dict(r: dict, company_id: str, id_to_code: dict) -> dict:
         "outputs": [],
         "customers": [],
         "decisions": "",
-        "fiveW2H": {"what": "", "why": "", "who": "", "where": "", "when": "", "how": "", "howMuch": {}},
+        "fiveW2H": {"what": "", "why": "", "who": "", "where": "", "when": "", "how": "", "how_much": {}},
         "validationStatus": r.get("validation_status") or "verde",
         "validationErrors": r.get("validation_errors") or [],
         "contractVersion": r.get("contract_version") or "v1",
@@ -6048,6 +6385,7 @@ async def create_workflow_step(company_id: str, request: Request):
             "contract_version": "v2",
             "validation_status": validation["status"],
             "validation_errors": validation["errors"],
+            "assigned_to_agent_id": body.get("assignedToAgentId") or body.get("assigned_to_agent_id") or None,
         }).execute().data[0]
 
         return _sipoc_step_to_dict(row, company_id, {})
@@ -6088,6 +6426,7 @@ async def update_workflow_step(step_id: str, request: Request):
             "contract_version": "v2",
             "validation_status": validation["status"],
             "validation_errors": validation["errors"],
+            "assigned_to_agent_id": body.get("assignedToAgentId") or body.get("assigned_to_agent_id") or None,
         }).eq("id", step_id).execute().data[0]
 
         return _sipoc_step_to_dict(updated, body.get("companyId") or "", {})
@@ -8512,6 +8851,83 @@ async def reject_approval(
     _ = payload  # reason é opcional por enquanto; endpoint mantém compatibilidade.
     return await _set_approval_status(request, approval_id, "rejected")
 
+
+# ── FASE 4 — Approval Gate: Athena Recommendation → Council ─────────────────
+
+@app.post("/api/approvals/athena-recommendation")
+@app.post("/approvals/athena-recommendation")
+async def create_athena_recommendation_approval(request: Request):
+    """Converte uma athena_recommendation pendente em approval do council.
+
+    Body JSON:
+      - recommendation_id: str (obrigatório)
+
+    Workflow:
+      1. Busca recommendation por id (RLS valida company)
+      2. Cria row em `approvals` com request_type='strategy' (mais próximo do domínio)
+         e payload espelhando a recommendation
+      3. Retorna o approval criado
+    """
+    from pydantic import BaseModel
+
+    class Body(BaseModel):
+        recommendation_id: str
+
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+
+    try:
+        body_json = await request.json()
+        body = Body(**body_json)
+    except Exception as e:
+        raise HTTPException(422, f"invalid_body: {e}")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+
+        # 1. Buscar recommendation
+        rec_res = (
+            client.table("athena_recommendations")
+            .select("*")
+            .eq("id", body.recommendation_id)
+            .limit(1)
+            .execute()
+        )
+        if not rec_res.data:
+            raise HTTPException(404, "recommendation_not_found")
+        rec = rec_res.data[0]
+
+        # 2. Criar approval
+        approval_payload = {
+            "company_id": rec["company_id"],
+            "request_type": "strategy",
+            "payload": {
+                "source": "athena_recommendation",
+                "recommendation_id": rec["id"],
+                "kind": rec["kind"],
+                "title": rec["title"],
+                "rationale": rec["rationale"],
+                "confidence": float(rec.get("confidence") or 0),
+                "estimated_effort": rec.get("estimated_effort"),
+                "proposed_changes_json": rec.get("proposed_changes_json"),
+                "target_agent_id": rec.get("target_agent_id"),
+            },
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        appr_res = client.table("approvals").insert(approval_payload).execute()
+        if not appr_res.data:
+            raise HTTPException(500, "approval_insert_failed")
+
+        return CouncilApproval(**appr_res.data[0]).to_zod_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"create_athena_recommendation_approval failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/health")
 async def health_check():
     return {"status": "online", "service": "VectraClaw Agent Engine"}
@@ -8547,6 +8963,21 @@ async def websocket_companies(
     await websocket.accept()
 
     # --- Auth ---
+    # VEC-DEBUG: bypass para desenvolvimento local (alinha com auth_middleware)
+    if os.getenv("VECTRACLAW_AUTH_DISABLED") == "true":
+        await ws_manager.connect(websocket, company_id)
+        await ws_manager.emit_hello(company_id)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            logger.debug("WS error company=%s: %s", company_id, exc)
+        finally:
+            ws_manager.disconnect(websocket, company_id)
+        return
+
     if token:
         try:
             claims = validate_supabase_jwt(token)
@@ -9740,13 +10171,17 @@ from src.api_routes import admin as _admin_routes  # noqa: E402
 from src.api_routes import sipoc_diagnose as _sipoc_diagnose_routes  # noqa: E402
 from src.api_routes import connectors as _connectors_routes  # noqa: E402  # W3 PRD Fundação
 from src.api_routes import nous_hermes as _nous_hermes_routes  # noqa: E402  # PRD Nous Hermes F1
+from src.api_routes import gemini_native as _gemini_native_routes  # noqa: E402  # PRD Gemini Native F2
 from src.api_routes import whatsapp_templates as _whatsapp_templates_routes  # noqa: E402  # W11 PR1
 from src.api_routes import agent_skills as _agent_skills_routes  # noqa: E402  # W15.1
 from src.api_routes import llm_api_keys as _llm_api_keys_routes  # noqa: E402  # W13.1 AI Gateway
 from src.api_routes import sipoc_commit as _sipoc_commit_routes  # noqa: E402  # PR2.3 autopilot SIPOC commit
 from src.api_routes import bpmn_materialize as _bpmn_materialize_routes  # noqa: E402  # Phase 3 BPMN bridge
+from src.api_routes import bpmn_gateway_bindings as _bpmn_gateway_bindings_routes  # noqa: E402  # P0-BE-1 BPMN gateway catalog
 from src.api_routes import agent_mcp_bindings as _agent_mcp_bindings_routes  # noqa: E402  # N6 MCP bindings
 from src.api_routes import intelligence as _intelligence_routes  # noqa: E402  # VEC-168
+from src.api_routes import cloudflare_finetunes as _cloudflare_finetunes_routes  # noqa: E402
+from src.api_routes import sipoc_bpmn as _sipoc_bpmn_routes  # noqa: E402  # BPMN diagram por processo SIPOC
 
 app.include_router(_prospects_routes.router)
 app.include_router(_research_templates_routes.router)
@@ -9763,10 +10198,18 @@ app.include_router(_admin_routes.router)
 app.include_router(_sipoc_diagnose_routes.router)
 app.include_router(_connectors_routes.router)  # W3 PRD Fundação Orchestration
 app.include_router(_nous_hermes_routes.router)
+app.include_router(_gemini_native_routes.router)
 app.include_router(_whatsapp_templates_routes.router)  # W11 PR1 — WhatsApp Templates catalog
 app.include_router(_agent_skills_routes.router)  # W15.1 — Agent Skills + Operation Types catalog
 app.include_router(_llm_api_keys_routes.router)  # W13.1 — AI Gateway llm_api_keys CRUD
 app.include_router(_sipoc_commit_routes.router)  # PR2.3 autopilot — SIPOC commit endpoint
 app.include_router(_bpmn_materialize_routes.router)  # Phase 3 autopilot — BPMN materialize bridge
+app.include_router(_bpmn_gateway_bindings_routes.router)  # P0-BE-1 BPMN gateway bindings catalog
 app.include_router(_agent_mcp_bindings_routes.router)  # N6 — MCP server catalog + agent MCP bindings
 app.include_router(_intelligence_routes.router)  # VEC-168 — cross-company intelligence dashboard
+app.include_router(_cloudflare_finetunes_routes.router)  # Cloudflare Workers AI finetunes
+app.include_router(_sipoc_bpmn_routes.router)  # BPMN diagram por processo SIPOC
+
+from src.api_routes import gymsite as _gymsite_routes  # noqa: E402
+app.include_router(_gymsite_routes.router)
+

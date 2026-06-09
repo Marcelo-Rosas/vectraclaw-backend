@@ -451,7 +451,7 @@ _REC_DB_STATUSES = {"pending", "approved", "applied", "rejected", "superseded"}
 #   - Frontend Zod: src/types/api.ts (VectraClip)
 #   - Documentação: docs/ATHENA-RECOMMENDATIONS.md
 # 8 valores divididos em 2 categorias:
-#   - 5 EXECUTÁVEIS: Athena auto-aplica via mutação após aprovação humana
+#   - 5 EXECUTÁVEIS: POST .../apply após PATCH approved (AC-2)
 #   - 3 INFORMATIVOS: apenas relatório/insight (humano lê + decide)
 _REC_VALID_KINDS = {
     # Executáveis (Athena auto-aplica)
@@ -459,6 +459,7 @@ _REC_VALID_KINDS = {
     "create_specialty", "consolidate_agents",
     # Informativos (Athena só reporta)
     "diagnose_gap", "suggest_automation", "suggest_hire_agent",
+    "prompt_adjust",
 }
 
 
@@ -490,7 +491,7 @@ class AthenaRecommendationPatchBody(BaseModel):
     """Payload de PATCH /api/athena/recommendations/{id}.
 
     Workflow:
-      - status='approved': humano aprovou; precisa aplicar manualmente o prompt
+      - status='approved': humano aprovou; em seguida POST .../apply (AC-2) ou mark-applied manual
       - status='rejected': humano rejeitou; review_notes obrigatório se confidence>=0.85
       - status='superseded': recommendation mais nova substitui esta (raro, manual)
     """
@@ -507,6 +508,22 @@ class AthenaRecommendationMarkAppliedBody(BaseModel):
     """
     applied_history_id: Optional[str] = None
     notes: Optional[str] = None
+
+
+class ApplyRecommendationBody(BaseModel):
+    """POST /api/athena/recommendations/{id}/apply — AC-2 v1."""
+
+    dry_run: bool = False
+    run_mcp_handshake: bool = True  # reservado bundle v2; ignorado em v1
+    decisions: Optional[List[Dict[str, Any]]] = None  # reservado bundle v2
+
+
+class ApplyRecommendationResult(BaseModel):
+    status: str
+    recommendation_id: str
+    agent_id: Optional[str] = None
+    created: Dict[str, Any] = Field(default_factory=dict)
+    errors: Dict[str, str] = Field(default_factory=dict)
 
 
 @router.get("/api/athena/recommendations")
@@ -695,6 +712,66 @@ async def patch_athena_recommendation(
         raise HTTPException(500, str(e))
 
 
+@router.post("/api/athena/recommendations/{recommendation_id}/apply")
+@router.post("/athena/recommendations/{recommendation_id}/apply")
+async def apply_athena_recommendation(
+    request: Request,
+    recommendation_id: str,
+    body: ApplyRecommendationBody,
+):
+    """Executa mutações do proposed_changes_json (5 kinds executáveis v1).
+
+    Pré-requisito: status='approved' (PATCH antes).
+    Kinds informativos → 422 kind_not_executable.
+    dry_run=true valida sem persistir (recommendation permanece approved).
+  """
+    from fastapi.responses import JSONResponse
+
+    from src.api import get_authenticated_client, supabase
+    from src.services.athena_recommendation_apply import apply_athena_recommendation
+
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        existing = (
+            client.table("athena_recommendations")
+            .select("*")
+            .eq("id", recommendation_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(404, "recommendation_not_found")
+
+        rec = existing.data[0]
+        notes = None
+        if body.dry_run:
+            notes = "dry_run"
+
+        result = apply_athena_recommendation(
+            supabase,
+            rec,
+            dry_run=body.dry_run,
+            review_notes_append=notes,
+        )
+        payload = ApplyRecommendationResult(**result).model_dump()
+
+        if result["status"] in ("failed", "partial_apply"):
+            return JSONResponse(status_code=422, content=payload)
+        if result.get("errors") and result["status"] == "applied":
+            # already_applied ou dry_run marker
+            if result["errors"].get("status") == "already_applied":
+                raise HTTPException(409, detail=payload)
+        return payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("athena.apply_recommendation failed: %s", e)
+        raise HTTPException(500, str(e))
+
+
 @router.post("/api/athena/recommendations/{recommendation_id}/mark-applied")
 @router.post("/athena/recommendations/{recommendation_id}/mark-applied")
 async def mark_recommendation_applied(
@@ -784,4 +861,47 @@ async def mark_recommendation_applied(
         raise
     except Exception as e:
         logger.error("athena.mark_applied failed: %s", e)
+        raise HTTPException(500, str(e))
+
+
+@router.post("/api/athena/monitor-workflows")
+@router.post("/athena/monitor-workflows")
+async def athena_monitor_workflows(request: Request):
+    """Dispara a rotina de monitoramento Athena para a company do usuário.
+
+    Consome telemetria dos últimos 30 dias e gera recommendations
+    (`prompt_adjust`, `suggest_hire_agent`) quando thresholds são atingidos.
+    Requer JWT válido (RLS filtra company_id).
+
+    Retorna lista de recommendations criadas (pode ser vazia).
+    """
+    from src.api import supabase, get_authenticated_client
+    from src.services.athena_monitor import monitor_workflows
+
+    if not supabase:
+        raise HTTPException(503, "supabase_required")
+
+    try:
+        client = get_authenticated_client(request.state.token)
+        # Extrai company_id do JWT (padrão usado em outros endpoints)
+        from src.api import _extract_vectraclip_claims
+        claims = _extract_vectraclip_claims(request.state.token)
+        company_id = claims.get("company_id")
+        # Fallback para auth disabled (request.state.company_id setado no middleware)
+        if not company_id:
+            company_id = getattr(request.state, "company_id", None)
+        if not company_id:
+            raise HTTPException(403, "JWT sem company_id")
+
+        recommendations = monitor_workflows(supabase, company_id)
+        return {
+            "triggered_at": datetime.now(timezone.utc).isoformat(),
+            "company_id": company_id,
+            "recommendations_created": len(recommendations),
+            "recommendations": [AthenaRecommendationOut(**r).model_dump() for r in recommendations],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("athena.monitor_workflows failed: %s", e)
         raise HTTPException(500, str(e))

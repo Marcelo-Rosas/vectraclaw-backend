@@ -1,9 +1,9 @@
 tunnel: 7488faec-a04f-463c-a3fa-cb6cd0b0a205
-credentials-file: /etc/cloudflared/7488faec-a04f-463c-a3fa-cb6cd0b0a205.json
+credentials-file: C:\Users\marce\VectraClaw\cloudflared\7488faec-a04f-463c-a3fa-cb6cd0b0a205.json
 
 ingress:
   - hostname: api-vectraclip.vectracargo.com.br
-    service: http://backend:3000
+    service: http://localhost:8000
     originRequest:
       # WebSocket upgrade (wss://) — pass-through de Upgrade/Connection/querystring
       connectTimeout: 30s

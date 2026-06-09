@@ -131,6 +131,8 @@ class Task(CamelModel):
     cost_usd: float = 0.0
     claimed_at: Optional[datetime] = None
     workflow_step_id: Optional[str] = None
+    workflow_definition_id: Optional[str] = None
+    routine_id: Optional[str] = None
     dependency_step_codes: List[str] = Field(default_factory=list)
     successor_step_codes: List[str] = Field(default_factory=list)
     is_critical_path: bool = False
@@ -236,7 +238,9 @@ class WorkflowStepRich(CamelModel):
     trigger_type: Optional[str] = None
     trigger_config: Dict[str, Any] = Field(default_factory=dict)
     agent_specialty_config_id: Optional[str] = None
+    assigned_to_agent_id: Optional[str] = None
     sipoc_meta: Optional[Dict[str, Any]] = None
+    documents: Optional[List[Dict[str, Any]]] = None
 
     class Config:
         alias_generator = to_camel
@@ -642,9 +646,9 @@ class AuditLogEntry(CamelModel):
 class CouncilApproval(CamelModel):
     id: str
     company_id: str
-    request_type: Literal["hire_agent", "strategy", "budget_increase", "task_done"]
+    request_type: Literal["hire_agent", "strategy", "budget_increase", "task_done", "oracle_fallback"]
     payload: dict
-    status: Literal["pending", "approved", "rejected"]
+    status: Literal["pending", "approved", "rejected", "pending_council"]
     approved_by_user_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
@@ -1175,6 +1179,8 @@ class SipocPosition(CamelModel):
     title: str
     description: Optional[str] = None
     reports_to_id: Optional[str] = None
+    is_bot: bool = False
+    linked_agent_id: Optional[str] = None
     metadata: Dict[str, Any] = {}
     created_at: datetime
     updated_at: datetime
@@ -1191,6 +1197,9 @@ class SipocProcess(CamelModel):
     status: Literal["rascunho", "em_revisao", "aprovado", "arquivado"] = "rascunho"
     version: int = 1
     responsible_id: Optional[str] = None
+    goal_id: Optional[str] = None
+    workflow_definition_id: Optional[str] = None
+    project_id: Optional[str] = None
     metadata: Dict[str, Any] = {}
     created_at: datetime
     updated_at: datetime
@@ -1221,6 +1230,7 @@ class Project(CamelModel):
     mission: Optional[str] = None
     status: str = "backlog"
     lead_agent_id: Optional[str] = None
+    goal_id: Optional[str] = None
     target_date: Optional[str] = None
     issue_completion_pct: int = 0
     created_at: Optional[datetime] = None
@@ -1422,3 +1432,26 @@ class Prospect(CamelModel):
 
     def to_zod_dict(self):
         return self.dict(by_alias=True)
+
+class SkillImportProposal(CamelModel):
+    id: str
+    company_id: str
+    source: str
+    status: str
+    raw_input: Optional[str] = None
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    domain: Optional[str] = None
+    description: Optional[str] = None
+    compatible_roles: List[str] = Field(default_factory=list)
+    system_prompt_template: Optional[str] = None
+    config_schema: Optional[Any] = None
+    promoted_specialty_id: Optional[str] = None
+    dismissed_reason: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_zod_dict(self):
+        return self.dict(by_alias=True)
+
