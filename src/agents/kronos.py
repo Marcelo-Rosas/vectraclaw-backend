@@ -386,6 +386,7 @@ def clear_routine_ofx_cursor(
 
 def scan_ofx_directory(
     path: str,
+    # pyrefly: ignore [bad-function-definition]
     inicio: str = None,
     fim: str = None,
 ) -> list[OFXTransaction]:
@@ -1501,7 +1502,12 @@ def resolve_kronos_inputs(task: dict) -> dict[str, str]:
                 os.getenv(key) if key in ("OFX_PATH", "PLANNER_PATH") else ""
             )
             if env_value:
-                resolved[key] = env_value.strip()
+                resolved[key] = env_value.strip(" \"'")
+
+    # Fallback strip quotes for all resolved values
+    for k, v in resolved.items():
+        if isinstance(v, str):
+            resolved[k] = v.strip(" \"'")
 
     return resolved
 
@@ -1874,3 +1880,10 @@ def _parse_date(s: str) -> date:
         except ValueError:
             continue
     raise ValueError(f"Formato de data desconhecido: {s!r}")
+
+
+from src.agents.kronos_planner_credentials import (  # noqa: E402
+    planner_credentials_error_message,
+    resolve_planner_credentials,
+    resolve_planner_web_context,
+)

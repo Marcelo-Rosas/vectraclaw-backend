@@ -111,4 +111,5 @@ def handle_freight_quotation(task: Dict[str, Any], supabase_client) -> Dict[str,
                 "TODO W13.2+: importar price_tables CFN pra cotação automática",
             ],
         },
+        "log_excerpt": f"Mercator (freight-quotation) gerou escalação para {external_name or 'cliente'}"
     }

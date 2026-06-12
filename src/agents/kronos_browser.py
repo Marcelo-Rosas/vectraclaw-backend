@@ -120,6 +120,9 @@ class KronosPlannerSession:
         self,
         email: Optional[str] = None,
         password: Optional[str] = None,
+        *,
+        base_url: Optional[str] = None,
+        login_url: Optional[str] = None,
         headless: Optional[bool] = None,
         storage_state_path: Optional[Path] = None,
         nav_timeout_ms: int = DEFAULT_NAV_TIMEOUT_MS,
@@ -130,9 +133,13 @@ class KronosPlannerSession:
         ).strip()
         if not self.email or not self.password:
             raise KronosBrowserConfigError(
-                "PLANNER_EMAIL e PLANNER_PASSWORD precisam estar no .env ou serem "
-                "passados explicitamente para KronosPlannerSession()."
+                "Credenciais de automação web ausentes — passe email/password, "
+                "configure Admin → MCP (mcp-web-automation) ou .env PLANNER_* (dev)."
             )
+
+        self.base_url = (base_url or PLANNER_BASE_URL).rstrip("/")
+        self.login_url = (login_url or f"{self.base_url}/login").rstrip("/")
+        self.home_url = f"{self.base_url}/inicio"
 
         if headless is None:
             headless = not _truthy_env("KRONOS_PLAYWRIGHT_HEADED", default=False)
@@ -218,10 +225,10 @@ class KronosPlannerSession:
         # para /inicio. Se não logado, /login renderiza o form (evita o alert
         # "Sua sessão expirou" que aparece quando vamos para /inicio sem cookie).
         try:
-            await page.goto(PLANNER_LOGIN_URL, wait_until="domcontentloaded")
+            await page.goto(self.login_url, wait_until="domcontentloaded")
         except PlaywrightTimeoutError as exc:
             raise KronosLoginFailed(
-                f"timeout navegando para {PLANNER_LOGIN_URL}: {exc}"
+                f"timeout navegando para {self.login_url}: {exc}"
             ) from exc
 
         try:

@@ -32,26 +32,26 @@ Referências:
 from __future__ import annotations
 
 import logging
+from fastapi import HTTPException
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import networkx as nx  # dep já usada em src/services/workflow_graph.py
+import networkx as nx  # type: ignore  # dep já usada em src/services/workflow_graph.py
+
+from src.services.bpmn_gateway_catalog import (
+    load_gateway_lookup,
+    resolve_logic_pattern_for_gateway,
+    resolve_binding_row,
+    infer_gateway_topology,
+)
 
 logger = logging.getLogger("BpmnMaterialize")
 
 # Tipos de nó BPMN considerados executáveis (viram workflow_steps).
 # Outros (start_event, end_event, gateway_*) são estruturais — não criam step.
 _EXECUTABLE_NODE_TYPES: Set[str] = {"service_task", "task", "user_task", "manual_task"}
-
-# Tipos de gateway que viram dica de logic_pattern no step upstream.
-_GATEWAY_TYPES_TO_LOGIC: Dict[str, str] = {
-    "gateway_exclusive": "split-if",
-    "gateway_parallel": "simple",  # parallel é decisão do execution engine, não do step
-    "gateway_inclusive": "split-switch",
-}
-
 
 class BpmnMaterializeError(Exception):
     """Erro fatal do materialize. Endpoint mapeia pra HTTP status."""
@@ -111,7 +111,7 @@ def _topological_sort(
             G.add_edge(src, tgt)
 
     try:
-        ordered = list(nx.topological_sort(G))
+        ordered = [str(n) for n in nx.topological_sort(G)]
         return ordered, warnings
     except nx.NetworkXUnfeasible:
         # Ciclo detectado — fallback estável (input order)
@@ -142,13 +142,31 @@ def _resolve_diagram(
     if not res.data:
         raise BpmnMaterializeError("diagram_not_found", f"diagrama {diagram_id} não existe", 404)
     diagram = res.data[0]
-    if str(diagram["company_id"]) != str(user_company_id):
+    if str(diagram["company_id"]) != user_company_id:
         logger.warning(
             "materialize cross-tenant attempt: diagram=%s company=%s user=%s",
             diagram_id, diagram["company_id"], user_company_id,
         )
         raise BpmnMaterializeError("diagram_not_found", f"diagrama {diagram_id} não existe", 404)
     return diagram
+
+
+def get_bpmn_diagram_by_process_id(supabase, process_id: str, company_id: str) -> dict:
+    """Fetch BPMN diagram linked to a SIPOC process.
+    Raises HTTPException 404 if not found or tenant mismatch.
+    """
+    res = (
+        supabase.table("bpmn_diagrams")
+        .select("id, diagram_json, linked_sipoc_process_id, company_id")
+        .eq("linked_sipoc_process_id", process_id)
+        .eq("company_id", company_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail=f"BPMN diagram for process {process_id} not found")
+    row = res.data[0]
+    return {"diagramId": row.get("id"), "diagramJson": row.get("diagram_json")}
 
 
 def _validate_specialty_config(
@@ -241,21 +259,162 @@ def _delete_workflow_cascade(supabase, workflow_id: str) -> None:
         logger.warning("materialize replace: delete definition falhou workflow=%s: %s", workflow_id, exc)
 
 
+def _count_edges(node_id: str, edges: List[Dict[str, Any]]) -> Tuple[int, int]:
+    incoming = sum(1 for e in edges if e.get("target") == node_id)
+    outgoing = sum(1 for e in edges if e.get("source") == node_id)
+    return incoming, outgoing
+
+
 def _gateway_logic_hint(
-    node: Dict[str, Any], all_nodes: Dict[str, Dict[str, Any]], edges: List[Dict[str, Any]]
-) -> Optional[str]:
+    node: Dict[str, Any],
+    all_nodes: Dict[str, Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+    gateway_lookup: Dict[Tuple[str, str], Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Se o próximo nó downstream do step for um gateway, retorna o logic_pattern
-    correspondente. Best-effort — só olha 1 hop downstream."""
+    correspondente (kebab) + a binding row. Best-effort — só olha 1 hop downstream."""
     node_id = node.get("id")
     if not node_id:
-        return None
+        return None, None
     for e in edges:
         if e.get("source") == node_id:
             target_id = e.get("target")
             target = all_nodes.get(target_id) if target_id else None
-            if target and target.get("type") in _GATEWAY_TYPES_TO_LOGIC:
-                return _GATEWAY_TYPES_TO_LOGIC[target["type"]]
-    return None
+            if not target:
+                continue
+            gtype = target.get("type")
+            if not gtype or not gtype.startswith("gateway_"):
+                continue
+            incoming, outgoing = _count_edges(target_id, edges)
+            topology = infer_gateway_topology(gtype, incoming, outgoing)
+            if topology:
+                pattern = resolve_logic_pattern_for_gateway(gateway_lookup, gtype, topology)
+                binding = resolve_binding_row(gateway_lookup, gtype, topology)
+                return pattern, binding
+    return None, None
+
+
+def _build_decisions_for_gateway(
+    gateway_node: Dict[str, Any],
+    all_nodes: Dict[str, Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+    node_id_to_row_id: Dict[str, str],
+) -> Optional[List[Dict[str, Any]]]:
+    """Se gateway_exclusive fork com 2+ edges label, mapeia true/false step_ids.
+    
+    Estrutura mínima alinhada com engine v2 (workflow_engine.py).
+    """
+    gtype = gateway_node.get("type")
+    if gtype != "gateway_exclusive":
+        return None
+    gid = gateway_node.get("id")
+    outgoing = [e for e in edges if e.get("source") == gid]
+    if len(outgoing) < 2:
+        return None
+    
+    # Walk cada edge do gateway até achar próximo executable node
+    def _next_executable_row_id(edge: Dict[str, Any]) -> Optional[str]:
+        visited: Set[str] = set()
+        stack = [edge.get("target")]
+        while stack:
+            nid = stack.pop()
+            if not nid or nid in visited:
+                continue
+            visited.add(nid)
+            node = all_nodes.get(nid)
+            if not node:
+                continue
+            if node.get("type") in _EXECUTABLE_NODE_TYPES:
+                return node_id_to_row_id.get(nid)
+            # Se for gateway/event, segue downstream
+            for e2 in edges:
+                if e2.get("source") == nid:
+                    stack.append(e2.get("target"))
+        return None
+    
+    labeled = []
+    for e in outgoing:
+        label = (e.get("label") or e.get("data", {}).get("label") or "").strip()
+        target_row = _next_executable_row_id(e)
+        if target_row:
+            labeled.append({"label": label or "segue", "target_row_id": target_row})
+    
+    if len(labeled) < 2:
+        return None
+    
+    # Primeiro label = true, segundo = false (convenção mínima; user edita depois)
+    return [{
+        "condition": {
+            "op": "eq",
+            "field": "edge_label",
+            "value": labeled[0]["label"],
+        },
+        "true_step_id": labeled[0]["target_row_id"],
+        "false_step_id": labeled[1]["target_row_id"],
+    }]
+
+
+def _resolve_sipoc_columns_map(
+    supabase,
+    component_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """Batch lookup: linked_sipoc_component_id → {type, content}.
+
+    Silencioso se tabela ausente ou sem rows.
+    """
+    if not component_ids:
+        return {}
+    try:
+        res = (
+            supabase.table("sipoc_components")
+            .select("id, type, content")
+            .in_("id", list(set(component_ids)))
+            .execute()
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in res.data or []:
+            out[row.get("id")] = {
+                "type": row.get("type"),
+                "content": row.get("content"),
+            }
+        return out
+    except Exception as exc:
+        logger.warning("_resolve_sipoc_columns_map failed: %s", exc)
+        return {}
+
+
+def _resolve_setor_map(
+    supabase,
+    position_ids: List[str],
+    company_id: str,
+) -> Dict[str, str]:
+    """Batch lookup: assignee_position_id → setor (sipoc_sectors.name).
+    
+    Silencioso se tabela ausente ou sem rows.
+    """
+    if not position_ids:
+        return {}
+    try:
+        res = (
+            supabase.table("sipoc_positions")
+            .select("id, sector_id, sipoc_sectors(name)")
+            .in_("id", position_ids)
+            .eq("company_id", company_id)
+            .execute()
+        )
+        out: Dict[str, str] = {}
+        for row in res.data or []:
+            sector = row.get("sipoc_sectors")
+            if isinstance(sector, dict):
+                name = sector.get("name") or sector.get("slug")
+            else:
+                name = None
+            if name:
+                out[row.get("id")] = name
+        return out
+    except Exception as exc:
+        logger.warning("_resolve_setor_map failed: %s", exc)
+        return {}
 
 
 def _build_step_row(
@@ -269,6 +428,9 @@ def _build_step_row(
     company_id: str,
     supabase,
     warnings: List[str],
+    decisions: Optional[List[Dict[str, Any]]] = None,
+    setor: Optional[str] = None,
+    sipoc_component: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Constrói row de workflow_steps a partir de BpmnNode + node.data."""
     label = node_data.get("label") or node.get("data", {}).get("label") or slug
@@ -318,16 +480,16 @@ def _build_step_row(
         "validation_errors": [],
         "logic_pattern": node_data.get("logic_pattern"),  # se vier do BPMN; senão NULL
         "responsavel": responsavel,
-        "setor": None,
+        "setor": setor,
         "ferramentas": [],
         "sla_horas": None,
         "alertas": [],
-        "suppliers": None,
-        "inputs": None,
-        "outputs": None,
-        "customers": None,
-        "decisions": None,
-        "five_w2h": None,
+        "suppliers": [sipoc_component["content"]] if sipoc_component and sipoc_component.get("type") == "supplier" else None,
+        "inputs": [sipoc_component["content"]] if sipoc_component and sipoc_component.get("type") == "input" else None,
+        "outputs": [sipoc_component["content"]] if sipoc_component and sipoc_component.get("type") == "output" else None,
+        "customers": [sipoc_component["content"]] if sipoc_component and sipoc_component.get("type") == "customer" else None,
+        "decisions": decisions,
+        "five_w2h": node_data.get("five_w2h") if isinstance(node_data.get("five_w2h"), dict) else None,
         "sipoc_meta": {
             "source": "bpmn_materialize",
             "node_id": node.get("id"),
@@ -401,6 +563,25 @@ def materialize_bpmn_to_workflow(
     # Indexa nodes pra lookup rápido
     all_nodes: Dict[str, Dict[str, Any]] = {n.get("id"): n for n in nodes_raw if n.get("id")}
 
+    # P0-BE-1: catálogo gateway bindings (metadata-driven, sem dict hardcoded)
+    gateway_lookup = load_gateway_lookup(supabase)
+
+    # P0-BE-2: batch resolve setor via assignee_position_id → sipoc_positions → sipoc_sectors
+    position_ids: List[str] = []
+    for n in all_nodes.values():
+        pos_id = (n.get("data") or {}).get("assignee_position_id")
+        if pos_id:
+            position_ids.append(pos_id)
+    setor_map = _resolve_setor_map(supabase, list(set(position_ids)), user_company_id)
+
+    # P2-BE-7: batch resolve SIPOC columns via linked_sipoc_component_id
+    component_ids: List[str] = []
+    for n in all_nodes.values():
+        comp_id = (n.get("data") or {}).get("linked_sipoc_component_id")
+        if comp_id:
+            component_ids.append(comp_id)
+    sipoc_columns_map = _resolve_sipoc_columns_map(supabase, component_ids)
+
     # Filtra nodes executáveis
     executable_ids: List[str] = [
         nid for nid, n in all_nodes.items() if n.get("type") in _EXECUTABLE_NODE_TYPES
@@ -434,6 +615,8 @@ def materialize_bpmn_to_workflow(
         "version": 1,
         "trigger_type": "manual",  # FK workflow_trigger_types
         "is_scheduled": False,
+        "goal_id": diagram.get("linked_goal_id"),
+        "kind": diagram.get("workflow_kind") or "project",
         "created_at": now,
         "updated_at": now,
     }
@@ -489,6 +672,26 @@ def materialize_bpmn_to_workflow(
         slug = node_id_to_slug[nid]
         proximo_codes = resolve_downstream_slugs(nid)
 
+        # P0-BE-2: resolve setor via assignee_position_id
+        step_setor = setor_map.get(node_data.get("assignee_position_id")) or None
+
+        # P2-BE-7: resolve SIPOC columns via linked_sipoc_component_id
+        step_sipoc_component = sipoc_columns_map.get(node_data.get("linked_sipoc_component_id"))
+
+        # P0-BE-2: gateway logic pattern + warnings (decisions em 2ª pass depois)
+        logic_pattern_hint = None
+        binding_row = None
+        if not node_data.get("logic_pattern"):
+            logic_pattern_hint, binding_row = _gateway_logic_hint(
+                node, all_nodes, edges, gateway_lookup
+            )
+            if binding_row and binding_row.get("engine_status") == "pending":
+                warnings.append(
+                    f"node={slug}: gateway binding '{binding_row.get('bpmn_gateway_type')}' "
+                    f"({binding_row.get('topology')}) está pending — "
+                    "materializa, mas execução paralela ainda não ativa"
+                )
+
         row = _build_step_row(
             workflow_id=workflow_id,
             step_order=idx,
@@ -499,10 +702,12 @@ def materialize_bpmn_to_workflow(
             company_id=user_company_id,
             supabase=supabase,
             warnings=warnings,
+            setor=step_setor,
+            sipoc_component=step_sipoc_component,
         )
         # Gateway hint pro logic_pattern (se step não trouxe explicit)
-        if not row.get("logic_pattern"):
-            row["logic_pattern"] = _gateway_logic_hint(node, all_nodes, edges)
+        if not row.get("logic_pattern") and logic_pattern_hint:
+            row["logic_pattern"] = logic_pattern_hint
 
         step_rows.append(row)
         node_id_to_row_id[nid] = row["id"]
@@ -547,6 +752,37 @@ def materialize_bpmn_to_workflow(
             except Exception as exc:
                 warnings.append(f"step '{row['slug']}': on_success_step_id update falhou ({exc!s})")
 
+    # 3ª pass: resolve decisions[] para steps upstream de gateway_exclusive fork
+    # (precisa de node_id_to_row_id completo — por isso após INSERT)
+    for row in step_rows:
+        node_id = None
+        for nid, rid in node_id_to_row_id.items():
+            if rid == row["id"]:
+                node_id = nid
+                break
+        if not node_id:
+            continue
+        # Procura gateway downstream
+        gateway_node = None
+        for e in edges:
+            if e.get("source") == node_id:
+                tgt = all_nodes.get(e.get("target"))
+                if tgt and tgt.get("type") == "gateway_exclusive":
+                    gateway_node = tgt
+                    break
+        if not gateway_node:
+            continue
+        decisions_payload = _build_decisions_for_gateway(
+            gateway_node, all_nodes, edges, node_id_to_row_id
+        )
+        if decisions_payload:
+            try:
+                supabase.table("workflow_steps").update(
+                    {"decisions": decisions_payload}
+                ).eq("id", row["id"]).execute()
+            except Exception as exc:
+                warnings.append(f"step '{row['slug']}': decisions update falhou ({exc!s})")
+
     # Atualiza bpmn_diagrams.linked_workflow_id
     try:
         supabase.table("bpmn_diagrams").update(
@@ -568,3 +804,61 @@ def materialize_bpmn_to_workflow(
         "linked_diagram_id": diagram_id,
         "replaced": replaced,
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Wrappers compatíveis com testes legados (P0-BE-2)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _find_immediate_downstream_gateway(
+    node_id: str,
+    all_nodes: Dict[str, Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Retorna o primeiro gateway downstream de um nó (1 hop)."""
+    for e in edges:
+        if e.get("source") == node_id:
+            target = all_nodes.get(e.get("target"))
+            if target and target.get("type", "").startswith("gateway_"):
+                return target
+    return None
+
+
+def _resolve_gateway_logic_from_catalog(
+    gateway_node: Dict[str, Any],
+    edges: List[Dict[str, Any]],
+    gateway_lookup: Dict[Tuple[str, str], Dict[str, Any]],
+    warnings: List[str],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve logic_pattern + binding row para um gateway node.
+
+    Wrapper usado por testes legados; materialize principal usa
+    `_gateway_logic_hint` (olha a partir do step upstream).
+    """
+    gtype = gateway_node.get("type")
+    gid = gateway_node.get("id")
+    incoming, outgoing = _count_edges(gid, edges)
+    topology = infer_gateway_topology(gtype, incoming, outgoing)
+    if not topology:
+        return None, None
+    binding = resolve_binding_row(gateway_lookup, gtype, topology)
+    if binding and binding.get("engine_status") == "pending":
+        warnings.append(
+            f"gateway binding '{gtype}' ({topology}) está pending — "
+            "materializa, mas execução paralela ainda não ativa"
+        )
+    return resolve_logic_pattern_for_gateway(gateway_lookup, gtype, topology), binding
+
+
+def _build_exclusive_fork_decisions(
+    gateway_id: str,
+    edges: List[Dict[str, Any]],
+    all_nodes: Dict[str, Dict[str, Any]],
+    node_id_to_row_id: Dict[str, str],
+    warnings: List[str],  # noqa: ARG001
+) -> Optional[List[Dict[str, Any]]]:
+    """Wrapper compatível com testes legados."""
+    gateway_node = all_nodes.get(gateway_id)
+    if not gateway_node:
+        return None
+    return _build_decisions_for_gateway(gateway_node, all_nodes, edges, node_id_to_row_id)

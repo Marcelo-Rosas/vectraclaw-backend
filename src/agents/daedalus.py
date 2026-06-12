@@ -22,10 +22,13 @@ do fallback estatístico — fallback fica como rede de segurança permanente.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+from src.services.agent_llm import generate_for_agent
 
 logger = logging.getLogger("Daedalus")
 
@@ -68,7 +71,7 @@ def _load_sipoc_process_components(supabase: Any, process_id: str) -> List[Dict[
     try:
         res = (
             supabase.table("sipoc_components")
-            .select("id, type, content, order, automation_status, responsible_position_id")
+            .select("id, type, content, order, responsible_position_id, sipoc_positions(metadata)")
             .eq("process_id", process_id)
             .order("order")
             .execute()
@@ -89,13 +92,40 @@ def _activity_label(component: Dict[str, Any], idx: int) -> str:
     return f"Atividade {idx + 1}"
 
 
+def _resolve_specialty_configs(supabase: Any, company_id: str) -> Dict[str, str]:
+    """Resolve todos os agent_specialty_configs da company.
+    
+    Retorna mapeamento: agent_id -> agent_specialty_config_id
+    Assumimos 1 config primária por agente para o escopo do Daedalus inicial,
+    ou escolhe a primeira encontrada.
+    """
+    try:
+        res = (
+            supabase.table("agent_specialty_configs")
+            .select("id, agent_id")
+            .eq("company_id", company_id)
+            .execute()
+        )
+        mapping = {}
+        for row in res.data or []:
+            config_id = row.get("id")
+            agent_id = row.get("agent_id")
+            if agent_id and config_id and agent_id not in mapping:
+                mapping[agent_id] = config_id
+        return mapping
+    except Exception as exc:
+        logger.warning("Daedalus: falha ao resolver specialty configs company=%s: %s", company_id, exc)
+        return {}
+
+
 def _generate_linear_diagram(
     *,
-    activity_labels: List[str],
+    activities: List[Dict[str, Any]],
+    op_type_map: Dict[str, str],
     layout_step_x: int = 200,
     layout_y: int = 200,
 ) -> Dict[str, Any]:
-    """Gera diagrama linear: start → 1 user_task por activity → end.
+    """Gera diagrama linear: start → 1 task por activity → end.
 
     Layout simples horizontal: start em x=0, tasks em x=200,400,..., end por último.
     Frontend pode reposicionar (auto_layout=true ativa dagre na UI).
@@ -115,14 +145,29 @@ def _generate_linear_diagram(
     prev_id = start_id
     x_cursor = layout_step_x
 
-    # 1 user_task por activity
-    for i, label in enumerate(activity_labels):
+    for i, act in enumerate(activities):
+        label = _activity_label(act, i)
         node_id = f"task-{i + 1}"
+        
+        pos = act.get("sipoc_positions") or {}
+        pos_meta = pos.get("metadata") or {}
+        is_bot = pos_meta.get("is_bot") is True
+        agent_id = pos_meta.get("linked_agent_id")
+        cfg_id = op_type_map.get(agent_id) if agent_id else None
+        
+        node_type = "user_task"
+        if is_bot and cfg_id:
+            node_type = "service_task"
+
         nodes.append({
             "id": node_id,
-            "type": "user_task",
+            "type": node_type,
             "position": {"x": x_cursor, "y": layout_y},
-            "data": {"label": label},
+            "data": {
+                "label": label,
+                "linked_sipoc_component_id": act.get("id"),
+                **({"agent_specialty_config_id": cfg_id} if node_type == "service_task" else {})
+            },
         })
         edges.append({
             "id": f"edge-{prev_id}-{node_id}",
@@ -187,6 +232,216 @@ def _persist_bpmn_diagram(
     return None
 
 
+def _apply_horizontal_layout(diagram_json: Dict[str, Any], step_x: int = 200, layout_y: int = 200) -> Dict[str, Any]:
+    """Adiciona positions horizontais em nodes que não têm.
+
+    Layout: start → tasks → gateways → end, da esquerda pra direita.
+    Forks deslocam branches pra cima/baixo.
+    """
+    nodes = list(diagram_json.get("nodes") or [])
+    edges = list(diagram_json.get("edges") or [])
+    if not nodes:
+        return diagram_json
+
+    # Indexa edges por source
+    outgoing: Dict[str, List[Dict[str, Any]]] = {}
+    for e in edges:
+        src = e.get("source")
+        if src:
+            outgoing.setdefault(src, []).append(e)
+
+    # Ordena topologicamente simples (BFS a partir de start_event)
+    node_map: Dict[str, Dict[str, Any]] = {n["id"]: n for n in nodes if n.get("id")}
+    start_nodes = [n for n in nodes if n.get("type") == "start_event"]
+    start_id = start_nodes[0]["id"] if start_nodes else nodes[0]["id"]
+
+    visited: set = set()
+    order: List[str] = []
+    queue = [start_id]
+    while queue:
+        nid = queue.pop(0)
+        if nid in visited:
+            continue
+        visited.add(nid)
+        order.append(nid)
+        for e in outgoing.get(nid, []):
+            tgt = e.get("target")
+            if tgt and tgt not in visited:
+                queue.append(tgt)
+
+    # Adiciona nodes órfãos no final
+    for n in nodes:
+        if n["id"] not in visited:
+            order.append(n["id"])
+
+    # Atribui positions
+    rank: Dict[str, int] = {}
+    for nid in order:
+        preds = [e for e in edges if e.get("target") == nid]
+        if preds:
+            rank[nid] = max(rank.get(e.get("source", nid), 0) for e in preds) + 1
+        else:
+            rank[nid] = 0
+
+    max_rank = max(rank.values()) if rank else 0
+    branch_offsets: Dict[str, int] = {}
+
+    for nid in order:
+        node = node_map[nid]
+        if "position" in node:
+            continue
+        r = rank[nid]
+        x = r * step_x
+        gtype = node.get("type", "")
+        out_edges = outgoing.get(nid, [])
+
+        if gtype.startswith("gateway_") and len(out_edges) >= 2:
+            # Fork: gateway central, branches deslocadas
+            node["position"] = {"x": x, "y": layout_y}
+            for i, e in enumerate(out_edges):
+                tgt = e.get("target")
+                offset = (i - (len(out_edges) - 1) / 2) * 120
+                branch_offsets[tgt] = offset
+        else:
+            y_off = branch_offsets.get(nid, 0)
+            node["position"] = {"x": x, "y": layout_y + y_off}
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def _enrich_diagram_with_sipoc_data(
+    diagram_json: Dict[str, Any],
+    activities: List[Dict[str, Any]],
+    op_type_map: Dict[str, str],
+) -> Dict[str, Any]:
+    """Pós-processamento para injetar o auto-cabeamento do SIPOC no diagrama gerado pelo LLM."""
+    nodes = diagram_json.get("nodes", [])
+    
+    for node in nodes:
+        node_type = node.get("type")
+        if node_type not in ("user_task", "service_task"):
+            continue
+            
+        node_data = node.get("data") or {}
+        label = node_data.get("label", "")
+        
+        best_act = None
+        for i, act in enumerate(activities):
+            act_label = _activity_label(act, i)
+            # Match bidirecional simples ignorando case
+            if label and act_label and (act_label.lower() in label.lower() or label.lower() in act_label.lower()):
+                best_act = act
+                break
+                
+        if best_act:
+            pos = best_act.get("sipoc_positions") or {}
+            pos_meta = pos.get("metadata") or {}
+            is_bot = pos_meta.get("is_bot") is True
+            agent_id = pos_meta.get("linked_agent_id")
+            cfg_id = op_type_map.get(agent_id) if agent_id else None
+            
+            node_data["linked_sipoc_component_id"] = best_act.get("id")
+            if is_bot and cfg_id:
+                node["type"] = "service_task"
+                node_data["agent_specialty_config_id"] = cfg_id
+                
+            node["data"] = node_data
+            
+    return diagram_json
+
+
+_DAEDALUS_SYSTEM_PROMPT = """You are Daedalus, a BPMN diagram generator for the Vectra workflow engine.
+
+Your task: analyze a list of business activities and generate a BPMN diagram JSON that may include real gateways (decision points and parallel splits) when the workflow logic suggests them.
+
+Rules:
+1. Use ONLY these node types: start_event, end_event, user_task, service_task, gateway_exclusive, gateway_parallel
+2. Every gateway_exclusive MUST have exactly 2 outgoing edges with labels "Sim" and "Não" (or meaningful business labels)
+3. Every gateway_parallel MUST have 2+ outgoing edges (no labels needed)
+4. All edges must be type: "sequence_flow"
+5. Do NOT include positions — they will be auto-generated
+6. Node IDs must be unique strings (e.g., "start", "task-1", "gw-1", "end")
+7. Data labels must be in Portuguese, concise (max 40 chars)
+8. A node that points to a gateway MUST NOT have any other outgoing edges. Exactly ONE sequence_flow should go from the node to the gateway. Do NOT create bypass edges.
+9. You MUST include nodes for ALL the provided activities. Do not skip or truncate the process.
+
+Gateway heuristics:
+- If an activity involves approval, verification, validation, or a yes/no decision → insert gateway_exclusive AFTER it
+- If activities can run independently/simultaneously → use gateway_parallel to fork and gateway_parallel to join
+- If the text mentions "se ... então ... senão" or "caso" → gateway_exclusive
+- If the text mentions "ao mesmo tempo", "em paralelo", "simultaneamente" → gateway_parallel
+
+Output format (strict JSON, no markdown):
+{
+  "nodes": [
+    {"id": "start", "type": "start_event", "data": {"label": "Início"}},
+    {"id": "task-1", "type": "user_task", "data": {"label": "Verificar documento"}},
+    {"id": "gw-1", "type": "gateway_exclusive", "data": {"label": "Aprovado?"}},
+    {"id": "task-2", "type": "user_task", "data": {"label": "Processar pagamento"}},
+    {"id": "task-3", "type": "user_task", "data": {"label": "Notificar rejeição"}},
+    {"id": "end", "type": "end_event", "data": {"label": "Fim"}}
+  ],
+  "edges": [
+    {"id": "e1", "source": "start", "target": "task-1", "type": "sequence_flow"},
+    {"id": "e2", "source": "task-1", "target": "gw-1", "type": "sequence_flow"},
+    {"id": "e3", "source": "gw-1", "target": "task-2", "type": "sequence_flow", "label": "Sim"},
+    {"id": "e4", "source": "gw-1", "target": "task-3", "type": "sequence_flow", "label": "Não"},
+    {"id": "e5", "source": "task-2", "target": "end", "type": "sequence_flow"},
+    {"id": "e6", "source": "task-3", "target": "end", "type": "sequence_flow"}
+  ]
+}"""
+
+
+def _build_bpmn_prompt(activity_labels: List[str], source_type: str, context: str = "") -> str:
+    activities_block = "\n".join(f"{i + 1}. {label}" for i, label in enumerate(activity_labels))
+    ctx_block = f"\nContexto adicional:\n{context}" if context else ""
+    return (
+        f"Atividades do processo ({source_type}):\n{activities_block}{ctx_block}\n\n"
+        "Gere o diagrama BPMN JSON conforme as regras. "
+        "Insira gateways reais (exclusive/parallel) sempre que o fluxo de negócio indicar decisão ou paralelismo. "
+        "Responda APENAS com JSON válido, sem markdown."
+    )
+
+
+async def _generate_llm_diagram(
+    activity_labels: List[str],
+    source_type: str,
+    context: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Tenta gerar diagrama via LLM. Retorna dict {nodes, edges} ou None se falhar."""
+    prompt = _build_bpmn_prompt(activity_labels, source_type, context)
+    try:
+        text, meta = await generate_for_agent(
+            DAEDALUS_AGENT_ID,
+            prompt,
+            system_instruction=_DAEDALUS_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            fallback_model="gemini-3-flash-preview",
+        )
+        logger.info("Daedalus LLM: model=%s tokens=%s", meta.get("model_used"), meta.get("tokens"))
+        raw = json.loads(text.strip())
+        nodes = raw.get("nodes")
+        edges = raw.get("edges")
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            logger.warning("Daedalus LLM: resposta sem nodes/edges válidos")
+            return None
+        # Sanity check: IDs únicos
+        ids = [n.get("id") for n in nodes if n.get("id")]
+        if len(ids) != len(set(ids)):
+            logger.warning("Daedalus LLM: IDs duplicados nos nodes")
+            return None
+        # Sanity check: edges referenciam nodes existentes
+        node_ids = set(ids)
+        for e in edges:
+            if e.get("source") not in node_ids or e.get("target") not in node_ids:
+                logger.warning("Daedalus LLM: edge referencia node inexistente")
+                return None
+        return {"nodes": nodes, "edges": edges}
+    except Exception as exc:
+        logger.warning("Daedalus LLM generation failed: %s", exc)
+        return None
+
+
 def _handle_bpmn_generate(task: dict, supabase: Any) -> Dict[str, Any]:
     """Handler op_type='bpmn-generate' (mantido sem mudança desde PR G+H).
 
@@ -217,6 +472,9 @@ def _handle_bpmn_generate(task: dict, supabase: Any) -> Dict[str, Any]:
     diagram_name: str = (input_data.get("name") or "").strip()
     linked_sipoc_process_id: Optional[str] = None
     activity_labels: List[str] = []
+    activities: List[Dict[str, Any]] = []
+
+    op_type_map = _resolve_specialty_configs(supabase, str(company_id))
 
     if source_type == "sipoc_process":
         process_id = input_data.get("source_id")
@@ -248,10 +506,31 @@ def _handle_bpmn_generate(task: dict, supabase: Any) -> Dict[str, Any]:
                 "source_type='freeform' exige input_json.freeform_text",
             )
         activity_labels = [text[:80]]
+        activities = [{"content": {"name": text[:80]}}]
         if not diagram_name:
             diagram_name = f"BPMN freeform: {text[:60]}"
 
-    diagram_json = _generate_linear_diagram(activity_labels=activity_labels)
+    # P3-BE-8 — tenta LLM real com gateways; fallback estatístico permanente
+    context = ""
+    if source_type == "sipoc_process" and linked_sipoc_process_id:
+        context = f"Processo SIPOC ID: {linked_sipoc_process_id}"
+
+    llm_diagram = asyncio.run(_generate_llm_diagram(activity_labels, source_type, context))
+    if llm_diagram:
+        diagram_json = _apply_horizontal_layout(llm_diagram)
+        diagram_json = _enrich_diagram_with_sipoc_data(diagram_json, activities, op_type_map)
+        engine_mode = "llm"
+        confidence = 0.85
+        tools = ["expert_judgment", "llm_gemini", "gateway_inference", "sipoc_auto_cabling"]
+        description = f"Gerado pelo Daedalus (LLM com gateways e auto-cabeamento). source_type={source_type}"
+        warnings: List[str] = []
+    else:
+        diagram_json = _generate_linear_diagram(activities=activities, op_type_map=op_type_map)
+        engine_mode = "statistical_fallback"
+        confidence = 0.5
+        tools = ["expert_judgment", "statistical_fallback", "linear_layout", "sipoc_auto_cabling"]
+        description = f"Gerado pelo Daedalus (fallback estatístico, sem LLM, com auto-cabeamento). source_type={source_type}"
+        warnings = ["llm_generation_failed_fallback_linear"]
 
     diagram_id = _persist_bpmn_diagram(
         supabase,
@@ -260,7 +539,7 @@ def _handle_bpmn_generate(task: dict, supabase: Any) -> Dict[str, Any]:
         diagram_json=diagram_json,
         generated_by_task_id=task_id or None,
         linked_sipoc_process_id=linked_sipoc_process_id,
-        description=f"Gerado pelo Daedalus (fallback estatístico, sem LLM). source_type={source_type}",
+        description=description,
     )
 
     completed_at = _now_iso()
@@ -268,11 +547,10 @@ def _handle_bpmn_generate(task: dict, supabase: Any) -> Dict[str, Any]:
     edges_count = len(diagram_json.get("edges", []))
 
     logger.info(
-        "Daedalus done task=%s diagram_id=%s nodes=%d edges=%d source_type=%s",
-        task_id, diagram_id, nodes_count, edges_count, source_type,
+        "Daedalus done task=%s diagram_id=%s nodes=%d edges=%d engine_mode=%s",
+        task_id, diagram_id, nodes_count, edges_count, engine_mode,
     )
 
-    warnings: List[str] = []
     if not diagram_id:
         warnings.append("persist_failed_diagram_not_saved")
 
@@ -287,25 +565,25 @@ def _handle_bpmn_generate(task: dict, supabase: Any) -> Dict[str, Any]:
                 "source_id": str(input_data.get("source_id")) if input_data.get("source_id") else None,
                 "diagram_name": diagram_name,
             },
-            "tools_techniques_applied": ["expert_judgment", "statistical_fallback", "linear_layout"],
+            "tools_techniques_applied": tools,
             "outputs": {
                 "status": "done",
                 "diagram_id": diagram_id,
                 "diagram_json": diagram_json,
                 "nodes_count": nodes_count,
                 "edges_count": edges_count,
-                "engine_mode": "statistical_fallback",  # vira "llm" quando R1 Gemini for resolvido
+                "engine_mode": engine_mode,
             },
             "validation": {
                 "all_required_inputs_present": True,
-                "confidence": 0.5,  # fallback estatístico = baixa confiança vs LLM real
+                "confidence": confidence,
                 "warnings": warnings,
-                "needs_human_review": True,  # diagrama linear é só ponto de partida pra edição manual
+                "needs_human_review": engine_mode != "llm",
             },
             "citations": [],
             "metadata": {"persisted_diagram_id": diagram_id},
         },
-        "cost_usd": 0.0,  # zero LLM call neste handler
+        "cost_usd": 0.0,  # LLM cost é trackeado em agent_llm / gemini_client
         "status_override": "done" if diagram_id else "review",
     }
 

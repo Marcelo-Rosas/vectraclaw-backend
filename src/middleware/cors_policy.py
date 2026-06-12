@@ -19,6 +19,7 @@ _CORE_CORS_ORIGINS: tuple[str, ...] = (
 _DEFAULT_ORIGIN_REGEX = (
     r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
     r"|^https://app\.vectraclip\.vectracargo\.com\.br$"
+    r"|^https://[a-f0-9]+\.vectraclip-frontend\.pages\.dev$"
 )
 
 

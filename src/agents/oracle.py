@@ -1034,3 +1034,45 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
         "cost_usd": cost_usd,
         "status_override": result.get("_status_override") or ("review" if require_review else None),
     }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fase 5 — Post-Mortem & Aprendizado (Oracle Agent)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def analyze_project_post_mortem(project_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Analisa os dados de um projeto concluído (tarefas, atrasos, custos, etc.)
+    e gera 'Lições Aprendidas' baseadas na Vectra Rubric v1 para combater Toil
+    e retroalimentar a base de conhecimento (Fase 5 do PMO Autônomo).
+    """
+    prompt = (
+        "Você é o Oracle (Inteligência Central), responsável pela Fase 5 de Governança do PMO Autônomo.\n"
+        "Sua tarefa é analisar o Post-Mortem do projeto abaixo, identificando padrões de erro (Toil), "
+        "gargalos operacionais estruturais e sugerindo melhorias sistêmicas (Self-Improving) baseadas "
+        "na Vectra Rubric v1.\n\n"
+        f"Dados do Projeto: {json.dumps(project_data, ensure_ascii=False, indent=2)}\n\n"
+        "Retorne EXCLUSIVAMENTE um JSON válido com a seguinte estrutura (sem blocos de markdown extras):\n"
+        "{\n"
+        '  "toil_identificado": ["lista de gargalos encontrados na execução estrutural do projeto"],\n'
+        '  "licoes_aprendidas": ["lista de regras ou aprendizados para projetos futuros similares"],\n'
+        '  "sugestoes_otimizacao": ["sugestões práticas de automação ou ajuste de SLA (ex: transferir tarefa para Hermes)"],\n'
+        '  "score_saude_final": numero_de_0_a_100_baseado_em_atrasos_e_custos\n'
+        "}\n"
+    )
+    
+    system_instruction = (
+        "Você é a Inteligência Central do PMO. Seu output deve ser analítico, focado em governança "
+        "estrutural, mitigação de Toil e melhoria de processos, gerando apenas JSON válido."
+    )
+    
+    try:
+        text, metadata = await generate(
+            DEFAULT_MODEL, prompt,
+            system_instruction=system_instruction,
+            response_mime_type="application/json"
+        )
+        parsed = json.loads(text)
+        return {"structured_data": parsed, "metadata": metadata}
+    except Exception as e:
+        logger.error(f"analyze_project_post_mortem failed: {e}")
+        return {"error": str(e)}

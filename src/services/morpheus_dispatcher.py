@@ -167,8 +167,23 @@ class MorpheusDispatcher:
     # Resolução de agente
     # ------------------------------------------------------------------
 
-    def _find_agent(self, company_id: str, specialty_slug: str) -> Optional[str]:
-        """Acha agente idle com a specialty_slug na company."""
+    def _find_agent(
+        self,
+        company_id: str,
+        specialty_slug: str,
+        *,
+        operation_type: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve um agente para a specialty.
+
+        Hardening:
+        - Determinístico: evita `LIMIT 1` sem `ORDER BY`.
+        - Não depende de `idle`: materialização de workflow deve conseguir
+          atribuir um agente mesmo quando todos estão `working` (a task fica em
+          backlog/queued e será consumida depois).
+        - Quando `operation_type` é informado, prefere `primary_agent_id` do
+          `operation_types_catalog` se ele estiver configurado para a specialty.
+        """
         try:
             sp_res = (
                 self.client.table("agent_specialties")
@@ -192,17 +207,64 @@ class MorpheusDispatcher:
             if not agent_ids:
                 return None
 
+            # Preferência canônica quando o op_type declara um primary_agent_id.
+            if operation_type:
+                try:
+                    op_res = (
+                        self.client.table("operation_types_catalog")
+                        .select("primary_agent_id")
+                        .eq("id", operation_type)
+                        .limit(1)
+                        .execute()
+                    )
+                    op_row = (op_res.data or [None])[0]
+                    primary = (op_row or {}).get("primary_agent_id")
+                    if primary and primary in agent_ids:
+                        agp = (
+                            self.client.table("agents")
+                            .select("id,status")
+                            .eq("company_id", company_id)
+                            .eq("id", primary)
+                            .limit(1)
+                            .execute()
+                        )
+                        rowp = (agp.data or [None])[0]
+                        if rowp and rowp.get("status") != "offline":
+                            return rowp["id"]
+                except Exception as exc:
+                    logger.debug(
+                        "[morpheus] primary_agent lookup failed op_type=%r: %s",
+                        operation_type,
+                        exc,
+                    )
+
+            # Fallback determinístico por prioridade de status.
             ag_res = (
                 self.client.table("agents")
-                .select("id")
+                .select("id,status")
                 .eq("company_id", company_id)
                 .in_("id", agent_ids)
-                .eq("status", "idle")
-                .limit(1)
                 .execute()
             )
-            ag = (ag_res.data or [None])[0]
-            return ag["id"] if ag else None
+            candidates = list(ag_res.data or [])
+            if not candidates:
+                return None
+
+            def _rank(status: Optional[str]) -> int:
+                s = (status or "").strip().lower()
+                if s == "idle":
+                    return 0
+                if s == "working":
+                    return 1
+                if s == "paused":
+                    return 2
+                if s == "offline":
+                    return 9
+                return 5
+
+            candidates.sort(key=lambda r: (_rank(r.get("status")), str(r.get("id"))))
+            best = candidates[0]
+            return str(best.get("id")) if best.get("id") else None
         except Exception as e:
             logger.warning("[morpheus] find_agent failed specialty=%r: %s", specialty_slug, e)
             return None

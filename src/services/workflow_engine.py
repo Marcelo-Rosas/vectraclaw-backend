@@ -77,10 +77,10 @@ class WorkflowStep(BaseModel):
     on_failure_step_id: UUID | None = None
     on_failure_action: FailureAction = FailureAction.BLOCK
 
-    # Engine v2 (Task #42 PoC SPLIT-IF) — interpretadores dos logic_patterns
+    # Engine v2 (Task #42 PoC split-if) — interpretadores dos logic_patterns
     # consomem estes campos. Mantidos opcionais para não quebrar steps SIMPLE
     # do engine v1.
-    logic_pattern: str | None = None              # 'SIMPLE' | 'SPLIT-IF' | ...
+    logic_pattern: str | None = None              # 'simple' | 'split-if' | ...
     decisions: list[dict] | None = None           # jsonb — só relevante p/ SPLIT/SWITCH
 
 
@@ -108,6 +108,7 @@ class WorkflowRepository(Protocol):
     def fetch_workflow_by_slug(self, slug: str) -> WorkflowDefinition | None: ...
     def fetch_steps(self, workflow_id: UUID) -> list[WorkflowStep]: ...
     def fetch_step(self, step_id: UUID) -> WorkflowStep | None: ...
+    def fetch_tasks_for_step(self, step_id: UUID) -> list[dict]: ...
 
 
 class SupabaseWorkflowRepository:
@@ -156,6 +157,23 @@ class SupabaseWorkflowRepository:
             raise RepositoryError(f"fetch_step({step_id}) failed") from exc
         return WorkflowStep.model_validate(res.data[0]) if res.data else None
 
+    def fetch_tasks_for_step(self, step_id: UUID) -> list[dict]:
+        """Busca tasks associadas a um step (via workflow_step_id).
+
+        Retorna lista vazia se schema não conectar ou erro.
+        """
+        try:
+            res = (
+                self._client.table("tasks")
+                .select("id, status, output_json")
+                .eq("workflow_step_id", str(step_id))
+                .execute()
+            )
+            return list(res.data or [])
+        except Exception as exc:
+            logger.warning("fetch_tasks_for_step(%s) failed: %s", step_id, exc)
+            return []
+
 
 # ---------- Engine ----------
 
@@ -203,9 +221,9 @@ def get_engine(client) -> WorkflowEngine:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Engine v2 — PoC do interpretador SPLIT-IF (Task #42)
+# Engine v2 — PoC do interpretador split-if (Task #42)
 #
-# Permite que workflow_steps com logic_pattern='SPLIT-IF' resolvam
+# Permite que workflow_steps com logic_pattern='split-if' resolvam
 # dinamicamente o próximo step baseado em uma condição contra o output_json
 # da task atual (task_context).
 #
@@ -324,7 +342,7 @@ def advance_v2(
     """Engine v2 PoC: interpreta logic_pattern do step para resolver próximo.
 
     - SIMPLE (ou None): delega para `engine.advance(current, outcome)`.
-    - SPLIT-IF: avalia `current.decisions[0].condition` contra `task_context`,
+    - split-if: avalia `current.decisions[0].condition` contra `task_context`,
       retorna step apontado por `true_step_id` ou `false_step_id`.
     - Outros patterns: NotImplementedError("pending") — task #42 escalará.
 
@@ -337,33 +355,70 @@ def advance_v2(
     if outcome is StepOutcome.FAILURE:
         return engine.advance(current, outcome)
 
-    # SIMPLE ou ausente: comportamento engine v1
-    if pattern in (None, "SIMPLE"):
+    # simple ou ausente: comportamento engine v1
+    if pattern in (None, "simple"):
         return engine.advance(current, outcome)
 
-    if pattern == "SPLIT-IF":
+    if pattern == "split-if":
         decisions = current.decisions or []
         if not decisions:
             raise ConditionEvaluationError(
-                f"step {current.step_code} é SPLIT-IF mas decisions[] vazio"
+                f"step {current.step_code} é split-if mas decisions[] vazio"
             )
         decision = decisions[0]
         condition = decision.get("condition")
         if not condition:
             raise ConditionEvaluationError(
-                f"step {current.step_code} SPLIT-IF sem condition em decisions[0]"
+                f"step {current.step_code} split-if sem condition em decisions[0]"
             )
         outcome_bool = _evaluate_condition(condition, task_context or {})
 
         target_id_str = decision.get("true_step_id" if outcome_bool else "false_step_id")
         if not target_id_str:
             logger.info(
-                "step %s SPLIT-IF outcome=%s sem target — workflow termina",
+                "step %s split-if outcome=%s sem target — workflow termina",
                 current.step_code, outcome_bool,
             )
             return None
 
         return engine.get_step(UUID(target_id_str))
+
+    # P1-BE-5 — split-parallel stub (fork não tem step único)
+    if pattern == "split-parallel":
+        logger.info(
+            "step %s split-parallel: fork sem step único — "
+            "TaskFactory/daemon deve usar proximo_step_codes para gerar múltiplas tasks",
+            current.step_code,
+        )
+        return None
+
+    # P1-BE-6 — merge-by-key handler (join)
+    if pattern == "merge-by-key":
+        steps = engine.get_steps(current.workflow_id)
+        predecessors = [s for s in steps if s.on_success_step_id == current.id]
+        if not predecessors:
+            # Sem predecessors conhecidos — trata como linear
+            return engine.advance(current, outcome)
+
+        all_done = True
+        for pred in predecessors:
+            tasks = engine._repo.fetch_tasks_for_step(pred.id)
+            if not tasks:
+                all_done = False
+                break
+            if not any(t.get("status") == "done" for t in tasks):
+                all_done = False
+                break
+
+        if all_done:
+            return engine.advance(current, outcome)
+
+        logger.info(
+            "step %s merge-by-key: aguardando predecessors %s",
+            current.step_code,
+            [p.step_code for p in predecessors],
+        )
+        return None
 
     # Patterns ainda não implementados (task #42 escala depois)
     raise NotImplementedError(

@@ -46,7 +46,7 @@ async def _emit_run_heartbeat(
     # W8 — `claude_cli_subscription` adicionado (auditor 2026-05-18).
     # `nous_hermes` omitido de propósito (PRD §8.5 / R15): tokens=0 polui burn rate
     # até trajectory ingest existir.
-    if provider not in ("anthropic", "ollama", "huggingface", "groq", "claude_cli_subscription"):
+    if provider not in ("anthropic", "ollama", "huggingface", "groq", "claude_cli_subscription", "cloudflare"):
         return
     if not agent_id:
         return
@@ -60,6 +60,7 @@ async def _emit_run_heartbeat(
             "huggingface": "HuggingFace",
             "groq": "Groq",
             "claude_cli_subscription": "Claude CLI",
+            "cloudflare": "Cloudflare AI",
         }.get(provider, provider.title())
         log_excerpt = (
             f"{provider_label}: {result.tokens_output} tokens em "

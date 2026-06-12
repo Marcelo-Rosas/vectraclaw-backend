@@ -348,15 +348,18 @@ class ResilientHarnessDaemon:
             # Sucesso → 'working' (mesmo padrão de `_emit_oracle_records`);
             # falha → 'errored'. Distinção fim vs claim fica em `log_excerpt`.
             hb_status = "working" if (success and status != "blocked") else "errored"
+            log_excerpt = (task_meta or {}).get("log_excerpt")
+            if not log_excerpt:
+                log_excerpt = (
+                    f"task {status}"
+                    + (f": {task_meta.get('operation_type')}" if task_meta and task_meta.get("operation_type") else "")
+                )
             self._emit_task_lifecycle_heartbeat(
                 task_id=task_id,
                 status=hb_status,
                 company_id=(task_meta or {}).get("company_id"),
                 operation_type=(task_meta or {}).get("operation_type"),
-                log_excerpt=(
-                    f"task {status}"
-                    + (f": {task_meta.get('operation_type')}" if task_meta and task_meta.get("operation_type") else "")
-                ),
+                log_excerpt=log_excerpt,
                 cost_usd=cost_usd,
             )
         except Exception as e:
@@ -607,9 +610,9 @@ class ResilientHarnessDaemon:
         # PR7 Fase 1 — fast-path catalog-driven (operation_types_catalog.handler_*).
         # Se o op_type tem handler ref na tabela, despacha por ela. Senão (ou em
         # falha), cai na cadeia if-elif abaixo (fallback intacto).
-        _matched, _catalog_result = self._try_catalog_dispatch(task, op_type)
-        if _matched:
-            return _catalog_result
+        _matched, catalog_result = self._try_catalog_dispatch(task, op_type)
+        if _matched and catalog_result is not None:
+            return catalog_result
 
         # Deterministic branches for native Python agents
         # W9 (2026-05-18) — Morpheus inbound triage. Sem LLM, puro matching
@@ -630,6 +633,16 @@ class ResilientHarnessDaemon:
         if op_type == "freight-quotation":
             from src.agents.mercator import handle_freight_quotation
             result = handle_freight_quotation(task, self._get_supabase())
+            return _json.dumps(result)
+
+        elif op_type == "ofx-audit":
+            from src.agents.hermes_auditor import handle_ofx_audit
+            result = handle_ofx_audit(task, self._get_supabase())
+            return _json.dumps(result)
+
+        if op_type == "dre-audit":
+            from src.agents.plutus import handle_dre_audit
+            result = handle_dre_audit(task, self._get_supabase())
             return _json.dumps(result)
 
         if op_type == "financial-audit":
@@ -677,9 +690,9 @@ class ResilientHarnessDaemon:
                 },
             })
 
-        if op_type == "oracle-report":
+        if op_type in ("oracle-report", "responsavel-pelo-disparo-de-e-mails"):
             from src.agents.hermes_reporter import entrypoint as hr_entry
-            result = hr_entry(task)
+            result = hr_entry(task, self._get_supabase())
             return _json.dumps(result)
 
         if op_type == "rag-ingest":
@@ -1121,6 +1134,8 @@ class ResilientHarnessDaemon:
             subject = f"Oracle Research — {company_name or title}"
 
             from src.agents.hermes_reporter import render_html, send_smtp
+            from src.agent_ids import HERMES_AGENT_ID
+            from src.services.adapter_field_resolve import load_mcp_imap_smtp_credentials
             # Catalog-driven (Regra #2): header deriva de company_name + report_type,
             # não literal "Vectra Cargo" cravado.
             html_body = render_html(
@@ -1129,7 +1144,17 @@ class ResilientHarnessDaemon:
                 company_name=company_name or None,
                 report_type="Oracle Research",
             )
-            msg_id = send_smtp(subject, html_body, [recipient])
+            company_id = str(task.get("company_id") or "").strip()
+            smtp_creds = (
+                load_mcp_imap_smtp_credentials(
+                    self._get_supabase(),
+                    company_id,
+                    agent_id=HERMES_AGENT_ID,
+                )
+                if company_id
+                else None
+            )
+            msg_id = send_smtp(subject, html_body, [recipient], credentials=smtp_creds)
             logger.info(
                 "_send_oracle_research_email: enviado msg_id=%s recipient=%s task=%s",
                 msg_id, recipient, task.get("id"),
@@ -1281,6 +1306,7 @@ class ResilientHarnessDaemon:
                             cost_usd = 0.0
                             output_json = None
                             status_override = None
+                            log_excerpt = None
                             try:
                                 raw = self.execute_task(task)
                                 success = True
@@ -1290,7 +1316,8 @@ class ResilientHarnessDaemon:
                                     cost_usd = float(parsed.get("cost_usd", 0) or 0)
                                     output_json = parsed.get("output_json")
                                     status_override = parsed.get("status_override")
-                                    if parsed.get("status") == "errored":
+                                    log_excerpt = parsed.get("log_excerpt")
+                                    if parsed.get("status") == "errored" or parsed.get("status") == "error":
                                         success = False
                                         if output_json is None:
                                             output_json = {
@@ -1316,6 +1343,7 @@ class ResilientHarnessDaemon:
                                     task_meta={
                                         "company_id": task.get("company_id"),
                                         "operation_type": task.get("operation_type"),
+                                        "log_excerpt": log_excerpt,
                                     },
                                 )
                         else:

@@ -10,6 +10,7 @@ logger = logging.getLogger("OracleFlow")
 
 class FlowState(TypedDict):
     session_id: str
+    company_id: Optional[str]
     process_id: Optional[str]
     domain: str
     user_profile: str  # beginner | advanced | pmo
@@ -41,7 +42,11 @@ async def supervisor_node(state: FlowState) -> Dict[str, Any]:
                 state.get("session_id"), iterations)
     if iterations >= 3:
         return {"current_node": "human_fallback"}
-    return {"current_node": "execute_task"}
+        
+    if iterations == 0:
+        return {"current_node": "executor"}
+    else:
+        return {"current_node": "corrector"}
 
 
 async def executor_node(state: FlowState) -> Dict[str, Any]:
@@ -50,6 +55,15 @@ async def executor_node(state: FlowState) -> Dict[str, Any]:
                 state.get("session_id"), state.get("current_event"), state.get("iteration_count", 0))
     result = await run_maker(state)
     logger.info("oracle.flow.maker_done session=%s", state.get("session_id"))
+    return result
+
+
+async def corrector_node(state: FlowState) -> Dict[str, Any]:
+    from src.agents.oracle_corrector import run_corrector
+    logger.info("oracle.flow.corrector_started session=%s event=%s iteration=%d",
+                state.get("session_id"), state.get("current_event"), state.get("iteration_count", 0))
+    result = await run_corrector(state)
+    logger.info("oracle.flow.corrector_done session=%s", state.get("session_id"))
     return result
 
 
@@ -73,6 +87,28 @@ async def human_fallback_node(state: FlowState) -> Dict[str, Any]:
     )
     logger.warning("oracle.flow.human_fallback session=%s feedback=%.200s",
                    state.get("session_id"), feedback)
+    
+    # Criar solicitação de aprovação no Council
+    company_id = state.get("company_id")
+    if company_id:
+        try:
+            from src.api import supabase
+            if supabase:
+                supabase.table("approvals").insert({
+                    "company_id": company_id,
+                    "request_type": "oracle_fallback",
+                    "status": "pending_council",
+                    "payload": {
+                        "session_id": state.get("session_id"),
+                        "domain": state.get("domain"),
+                        "feedback": feedback,
+                        "maker_response_text": state.get("maker_response_text")
+                    }
+                }).execute()
+                logger.info("oracle.flow.human_fallback: approval request opened in Council for session=%s", state.get("session_id"))
+        except Exception as e:
+            logger.error("oracle.flow.human_fallback: failed to create approval request: %s", e)
+
     return {
         "checker_corrections": [
             {
@@ -88,8 +124,11 @@ async def human_fallback_node(state: FlowState) -> Dict[str, Any]:
 
 
 def _route_after_supervisor(state: FlowState) -> str:
-    if state.get("current_node") == "human_fallback":
+    current = state.get("current_node")
+    if current == "human_fallback":
         return "human_fallback"
+    if current == "corrector":
+        return "corrector"
     return "executor"
 
 
@@ -104,16 +143,18 @@ _ORCHESTRATOR = None
 
 
 def build_orchestrator():
-    workflow = StateGraph(FlowState)
+    workflow = [FlowState]
 
     workflow.add_node("supervisor", supervisor_node)
     workflow.add_node("executor", executor_node)
+    workflow.add_node("corrector", corrector_node)
     workflow.add_node("checker", checker_node)
     workflow.add_node("human_fallback", human_fallback_node)
 
     workflow.set_entry_point("supervisor")
     workflow.add_conditional_edges("supervisor", _route_after_supervisor)
     workflow.add_edge("executor", "checker")
+    workflow.add_edge("corrector", "checker")
     workflow.add_conditional_edges("checker", _route_after_checker)
     workflow.add_edge("human_fallback", END)
 

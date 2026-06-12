@@ -277,6 +277,20 @@ class HuggingFaceAgentClient:
                     f"{e}"
                 ),
             )
+        except openai.APITimeoutError as e:
+            elapsed = time.monotonic() - start
+            logger.error("HuggingFaceAgentClient: timeout — %s", e)
+            return ExecutionResult(
+                success=False,
+                content="",
+                tool_calls=tool_calls_log,
+                turn_count=turn,
+                tokens_input=total_input,
+                tokens_output=total_output,
+                execution_time_seconds=round(elapsed, 3),
+                tokens_per_second=_tps(),
+                error=f"Timeout ao chamar HuggingFace Inference: {e}",
+            )
         except openai.APIConnectionError as e:
             elapsed = time.monotonic() - start
             logger.error("HuggingFaceAgentClient: conexão falhou — %s", e)
@@ -293,20 +307,6 @@ class HuggingFaceAgentClient:
                     f"HuggingFace Inference inacessível em {self._base_url}. "
                     f"Verifique conectividade e status em status.huggingface.co. Detalhe: {e}"
                 ),
-            )
-        except openai.APITimeoutError as e:
-            elapsed = time.monotonic() - start
-            logger.error("HuggingFaceAgentClient: timeout — %s", e)
-            return ExecutionResult(
-                success=False,
-                content="",
-                tool_calls=tool_calls_log,
-                turn_count=turn,
-                tokens_input=total_input,
-                tokens_output=total_output,
-                execution_time_seconds=round(elapsed, 3),
-                tokens_per_second=_tps(),
-                error=f"Timeout ao chamar HuggingFace Inference: {e}",
             )
         except Exception as e:
             elapsed = time.monotonic() - start

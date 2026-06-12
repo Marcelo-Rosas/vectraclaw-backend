@@ -42,6 +42,11 @@ from src.agents.kronos_browser import (
     KronosPlannerSession,
     KronosSaveTimeout,
 )
+from src.agents.kronos_planner_credentials import (
+    planner_credentials_error_message,
+    resolve_planner_credentials,
+    resolve_planner_web_context,
+)
 from src.agents.kronos_categorizer import (
     MatchResult,
     Rule,
@@ -50,6 +55,7 @@ from src.agents.kronos_categorizer import (
 )
 from src.agents.kronos_pdf_enricher import (
     build_pdf_lookup,
+    enrich_ofx_file,
     find_enriched_description,
     parse_brl_amount_to_centavos,
     parse_c6_pdf,
@@ -215,13 +221,14 @@ async def _run_planner_import_async(
 
     instituicao = (
         inputs.get("PLANNER_INSTITUICAO")
+        # pyrefly: ignore [unbound-name]
         or os.getenv("PLANNER_INSTITUICAO", "")
     ).strip()
     routine_id = (task.get("input_json") or {}).get("routine_id")
 
     ofx_path = Path(ofx_path_str)
     if not ofx_path.exists():
-        return _errored(f"OFX_PATH não existe: {ofx_path}")
+        return _errored(f"OFX_PATH não existe: {repr(ofx_path_str)} (cwd: {os.getcwd()})")
 
     cursor = _read_cursor(supabase_client, routine_id)
     target_file = _pick_target_file(ofx_path, cursor)
@@ -256,12 +263,49 @@ async def _run_planner_import_async(
     # usa OFX_PATH (auto-detect picka .pdf mais recente do mesmo dir).
     pdf_lookup = _load_pdf_lookup(inputs.get("PDF_PATH") or inputs.get("OFX_PATH"))
 
+    # Opção A (VEC-425): enriquece os <MEMO> genéricos do OFX ("TRANSF ENVIADA
+    # PIX" → "Pix enviado para NOME") ANTES de subir no Meu Planner, cruzando
+    # com o PDF por (data, |valor|). `target_file` segue apontando pro arquivo
+    # original (cursor, período, screenshot); só o upload usa o enriquecido.
+    import_file = target_file
+    enrich_changes: list[dict] = []
+    if pdf_lookup:
+        try:
+            enriched_file, enrich_changes = enrich_ofx_file(target_file, pdf_lookup)
+            if enrich_changes:
+                import_file = enriched_file
+                logger.info(
+                    "task=%s: OFX enriquecido — %d descrição(ões) reescrita(s) antes do import",
+                    task_id,
+                    len(enrich_changes),
+                )
+        except Exception as exc:  # noqa: BLE001 — enrichment é best-effort
+            logger.warning(
+                "task=%s: enrich_ofx_file falhou (não fatal, segue com OFX original): %s",
+                task_id,
+                exc,
+            )
+
+    email, password = resolve_planner_credentials(task, supabase_client)
+    if not email or not password:
+        return _errored(
+            planner_credentials_error_message(
+                task, supabase_client, email=email, password=password
+            )
+        )
+    web_ctx = resolve_planner_web_context(task, supabase_client)
+
     screenshot_path: Optional[str] = None
     toast_text = ""
     categorization_stats: Optional[dict[str, Any]] = None
     try:
-        async with KronosPlannerSession() as session:
-            await _do_import_flow(session, target_file, instituicao)
+        async with KronosPlannerSession(
+            email=email,
+            password=password,
+            base_url=web_ctx.get("base_url") or None,
+            login_url=web_ctx.get("login_url") or None,
+        ) as session:
+            await _do_import_flow(session, import_file, instituicao)
             toast_text = await _capture_post_import_toast(session)
 
             # VEC-423 fix: o Meu Planner mostra um modal "Importação realizada
@@ -335,6 +379,11 @@ async def _run_planner_import_async(
     }
     if categorization_stats is not None:
         output_json["categorization"] = categorization_stats
+    if enrich_changes:
+        output_json["ofx_enrichment"] = {
+            "memos_rewritten": len(enrich_changes),
+            "samples": enrich_changes[:5],
+        }
 
     # Task #43 — Acordo arquitetural "nada hardcoded": handoff Hermes Reporter
     # NÃO é mais feito aqui via constante _HERMESREPORTER_AGENT_ID.
@@ -387,9 +436,23 @@ async def _run_categorize_only_async(
         "yes" if pdf_lookup else "no",
     )
 
+    email, password = resolve_planner_credentials(task, supabase_client)
+    if not email or not password:
+        return _errored(
+            planner_credentials_error_message(
+                task, supabase_client, email=email, password=password
+            )
+        )
+    web_ctx = resolve_planner_web_context(task, supabase_client)
+
     screenshot_path: Optional[str] = None
     try:
-        async with KronosPlannerSession() as session:
+        async with KronosPlannerSession(
+            email=email,
+            password=password,
+            base_url=web_ctx.get("base_url") or None,
+            login_url=web_ctx.get("login_url") or None,
+        ) as session:
             page = session.page
             assert page is not None, "KronosPlannerSession sem page ativa"
 
@@ -1205,7 +1268,9 @@ async def _categorize_pending_lines(
             continue
 
         try:
-            await _apply_categorization_to_row(session, pinned_row, result)
+            # VEC-426/Audit: Step 2 apenas gera as sugestões (dry-run).
+            # A aplicação real ocorre no Step 3 (apply-corrections).
+            await _mark_row(pinned_row, "categorized")
             stats["lines_categorized"] += 1
             success_detail: dict[str, Any] = {
                 "desc": enriched_desc[:60],

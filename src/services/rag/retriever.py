@@ -26,6 +26,7 @@ async def query_top_k(
     *,
     k: int = 5,
     min_score: float = 0.0,
+    metadata_filter: Optional[dict] = None,
     embedder: Optional[object] = None,
     supabase_client=None,
 ) -> List[ChunkResult]:
@@ -36,6 +37,7 @@ async def query_top_k(
         company_id: UUID da company. Obrigatório (multi-tenant).
         k: top-k chunks a retornar (default 5).
         min_score: score mínimo (0..1) para filtrar resultado ruim.
+        metadata_filter: dict com filtro jsonb para os metadados.
         embedder: instance reutilizável; se None, usa resolve_embedder().
         supabase_client: injetável para testes; default usa src.api.supabase.
 
@@ -72,10 +74,11 @@ async def query_top_k(
             "p_company_id": company_id,
             "p_match_count": int(k),
             "p_min_score": float(min_score),
+            "p_metadata_filter": metadata_filter or {},
         },
     ).execute()
 
-    rows = res.data or []
+    rows = [r for r in (res.data or []) if isinstance(r, dict)]
     out = [
         ChunkResult(
             id=str(r["id"]),

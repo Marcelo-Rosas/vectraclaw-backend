@@ -48,6 +48,7 @@ class TaskFactory:
             self.client.table("workflow_steps")
             .select("*")
             .eq("workflow_id", workflow_id)
+            .eq("active", True)
             .order("step_order")
             .execute()
         )
@@ -82,6 +83,60 @@ class TaskFactory:
     # ------------------------------------------------------------------
     # Materialize
     # ------------------------------------------------------------------
+
+    def _resolve_assigned_agent_id(
+        self, company_id: str, row: Dict[str, Any], operation_type: str
+    ) -> Optional[str]:
+        """Resolve assigned_to_agent_id para um step.
+
+        Ordem:
+        0) `assigned_to_agent_id` (override explícito declarado no step)
+        1) `agent_specialty_config_id` (override por specialty config)
+        2) `specialty_slug` via MorpheusDispatcher (determinístico)
+        3) fallback Oracle para `oracle-*` (exceto op_types de e-mail)
+        """
+        explicit_agent_id = (row.get("assigned_to_agent_id") or "").strip()
+        if explicit_agent_id:
+            return str(explicit_agent_id)
+
+        cfg_id = (row.get("agent_specialty_config_id") or "").strip()
+        if cfg_id:
+            try:
+                cfg = (
+                    self.client.table("agent_specialty_configs")
+                    .select("agent_id")
+                    .eq("id", cfg_id)
+                    .eq("company_id", company_id)
+                    .limit(1)
+                    .execute()
+                )
+                cfg_row = (cfg.data or [None])[0]
+                agent_id = (cfg_row or {}).get("agent_id")
+                if agent_id:
+                    return str(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "_resolve_assigned_agent_id: config_id lookup failed (%s): %s",
+                    cfg_id,
+                    exc,
+                )
+
+        spec_slug = (row.get("specialty_slug") or "").strip()
+        if spec_slug:
+            agent_id = self._dispatcher._find_agent(
+                company_id, spec_slug, operation_type=operation_type
+            )
+            if agent_id:
+                return str(agent_id)
+
+        op = str(operation_type or "")
+        if op.startswith("oracle-") and op not in (
+            "oracle-report",
+            "responsavel-pelo-disparo-de-e-mails",
+        ):
+            return ORACLE_AGENT_ID
+
+        return None
 
     def materialize_workflow(
         self,
@@ -145,6 +200,7 @@ class TaskFactory:
                 "description": parent_input.description,
                 "budget_limit": parent_input.budget_limit,
                 "goal_id": parent_input.goal_id,
+                "workflow_definition_id": wf.get("id") if wf else None,
                 "operation_type": "orchestration",
                 "status": "in_progress",
                 "spent": 0,
@@ -185,11 +241,7 @@ class TaskFactory:
                     or "other"
                 )
                 spec_slug = row.get("specialty_slug")
-                agent_id = None
-                if spec_slug:
-                    agent_id = self._dispatcher._find_agent(company_id, spec_slug)
-                if not agent_id and str(op_type).startswith("oracle-"):
-                    agent_id = ORACLE_AGENT_ID
+                agent_id = self._resolve_assigned_agent_id(company_id, row, op_type)
 
                 merged_child_input = dict(step_inputs.get(step_code, {}) or {})
                 merged_child_input["workflowStepSlug"] = step_code
@@ -199,6 +251,7 @@ class TaskFactory:
                     "company_id": company_id,
                     "parent_task_id": parent_id,
                     "workflow_step_id": row["id"],
+                    "workflow_definition_id": wf.get("id") if wf else None,
                     "title": f"[{workflow_slug}] {row.get('name') or step_code}",
                     "description": str(row.get("description") or "")[:2000],
                     "operation_type": op_type,
@@ -344,20 +397,20 @@ class TaskFactory:
         self.rollup_parent(str(parent_id))
 
     def rollup_parent(self, parent_id: str) -> None:
-        res = (
-            self.client.table("task_tree_status")
-            .select("*")
-            .eq("parent_id", parent_id)
-            .limit(1)
+        sib = (
+            self.client.table("tasks")
+            .select("id,status")
+            .eq("parent_task_id", parent_id)
             .execute()
         )
-        rows = res.data or []
-        if not rows:
+        children = sib.data or []
+        if not children:
             return
-        row = rows[0]
-        total = int(row.get("children_total") or 0)
-        done = int(row.get("children_done") or 0)
-        blocked = int(row.get("children_blocked") or 0)
+
+        total = len(children)
+        done = sum(1 for c in children if c.get("status") == "done")
+        blocked_or_errored = sum(1 for c in children if c.get("status") in ("blocked", "errored"))
+
         if total == 0:
             return
 
@@ -366,9 +419,10 @@ class TaskFactory:
 
         if done == total:
             patch["status"] = "done"
-        elif blocked > 0:
+        elif blocked_or_errored > 0:
             patch["status"] = "blocked"
         else:
             return
 
         self.client.table("tasks").update(patch).eq("id", parent_id).execute()
+

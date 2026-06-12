@@ -7,6 +7,7 @@ Cobre transições pós-execução: reject (review → blocked), evaluate
 Endpoints:
 - POST /api/tasks/{task_id}/reject       reject_task
 - POST /api/tasks/{task_id}/evaluate     evaluate_task
+- POST /api/tasks/{task_id}/auto-heal    auto_heal_task
 
 ⚠️ approve_task NÃO está aqui (versão antiga continua em api.py por enquanto;
 a versão nova com review_notes vem na Step 8.8 cleanup).
@@ -101,4 +102,36 @@ async def evaluate_task(request: Request, task_id: str, payload: EvaluateTaskInp
         raise
     except Exception as e:
         logger.error(f"evaluate_task failed task_id={task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/tasks/{task_id}/auto-heal")
+async def auto_heal_task_endpoint(request: Request, task_id: str):
+    """
+    Aciona o agente Generativo (Healer) que utiliza a metodologia dos 5 Porquês 
+    para tentar identificar e curar a falha da task (se 'errored' ou 'blocked').
+    Se a cura for possível (ex: erro no input_json), corrige e volta para 'queued'.
+    Se for impossível (ex: API bloqueou acesso), documenta a causa raiz e envia para 'blocked'.
+    """
+    from src.api import get_authenticated_client
+    from src.services.task_healer import auto_heal_task
+
+    try:
+        # Só pra garantir autenticação e pegar company_id
+        client = get_authenticated_client(request.state.token)
+        # O backend atual não injeta company_id explicitamente nas rotas /api/tasks/{task_id}
+        # mas as regras de RLS garantem. Pra facilitar a chamada do serviço root:
+        res = client.table("tasks").select("company_id").eq("id", task_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Task não encontrada")
+        
+        company_id = res.data[0]["company_id"]
+        
+        result = await auto_heal_task(company_id, task_id)
+        return result
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"auto_heal_task_endpoint failed task_id={task_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

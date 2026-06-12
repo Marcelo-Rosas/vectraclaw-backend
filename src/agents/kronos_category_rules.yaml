@@ -140,6 +140,9 @@ rules:
 - pattern: Pix enviado para JOSE BATINGA PEREIRA
   categoria: Despesas Pessoais
   subcategoria: 'Despesas Pessoais: Uso Pessoal'
+- pattern: Pix enviado para Hans Gerd Schumann
+  categoria: Despesas Pessoais
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
 
 # -- Operacionais (frete e administrativo) --
 - pattern: Pix enviado para LEANDRO DE OLIVEIRA
@@ -314,7 +317,7 @@ rules:
   subcategoria: 'Despesas Pessoais: Moradia – Aluguel'
 - pattern: EQUILIBRIO MARMITARIA
   categoria: Despesas Pessoais
-  subcategoria: 'Despesas Pessoais: Moradia – Aluguel'
+  subcategoria: 'Despesas Pessoais: Uso Pessoal'
 - pattern: STARKLINK
   categoria: Despesas Operacionais – Galpão
   subcategoria: Despesas Operacionais - Internet

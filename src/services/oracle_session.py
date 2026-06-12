@@ -14,6 +14,9 @@ class _OracleSession:
         self.collected_5w2h: Dict[str, Dict[str, str]] = {}
         self.current_stage: str = "idle"
         self.last_active: float = time.time()
+        # Compiled SIPOC state from previous turn's extraction — injected into
+        # the next turn's prompt to prevent redundant questions.
+        self.compiled_state: Optional[List[Dict[str, Any]]] = None
 
 
 _SESSIONS: Dict[str, _OracleSession] = {}

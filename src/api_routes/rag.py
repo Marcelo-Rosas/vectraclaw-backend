@@ -72,20 +72,17 @@ from src.services.rag import ensure_bucket_exists as _ensure_rag_bucket_exists  
 # Models
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Closed enums alinhados a docs/PRD-RAG-categorization (Step 11)
-RagCategoria = Literal["manual", "procedimento", "contrato", "tabela", "email", "outro"]
-RagDepartamento = Literal["operacao", "comercial", "financeiro", "rh", "juridico", "ti"]
-RagConfidencialidade = Literal["publica", "interna", "restrita"]
-
+# Categorização dinâmica, removidos Literals hardcoded
 
 class RagUploadMetadata(BaseModel):
     """Categorização opcional anexada ao upload. Persiste em rag_documents.metadata."""
-    categoria: Optional[RagCategoria] = None
+    categoria: Optional[str] = None
     tags: List[str] = Field(default_factory=list, max_length=20)
-    departamento: Optional[RagDepartamento] = None
-    confidencialidade: Optional[RagConfidencialidade] = None
+    departamento: Optional[str] = None
+    confidencialidade: Optional[str] = None
     data_referencia: Optional[str] = None  # 'YYYY-MM'
     vinculo_processo_id: Optional[str] = None  # uuid
+    agente_id: Optional[str] = None
 
     @field_validator("data_referencia")
     @classmethod
@@ -123,6 +120,7 @@ class RagQueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     k: int = Field(default=5, ge=1, le=50)
     min_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    metadata_filter: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RagChunkOut(BaseModel):
@@ -228,17 +226,19 @@ async def upload_rag_document(
     )
     if existing.data:
         existing_doc = existing.data[0]
-        logger.info(
-            "rag.upload: duplicate sha256=%s for company=%s (returning existing doc=%s status=%s)",
-            sha256[:12], company_id, existing_doc["id"], existing_doc["status"],
-        )
-        return {
-            "document_id": existing_doc["id"],
-            "task_id": existing_doc.get("ingest_task_id"),
-            "status": existing_doc["status"],
-            "duplicate": True,
-            "filename": existing_doc["filename"],
-        }
+        # Supabase pode retornar [None] ou [True] — guard defensivo
+        if isinstance(existing_doc, dict):
+            logger.info(
+                "rag.upload: duplicate sha256=%s for company=%s (returning existing doc=%s status=%s)",
+                sha256[:12], company_id, existing_doc.get("id"), existing_doc.get("status"),
+            )
+            return {
+                "document_id": existing_doc["id"],
+                "task_id": existing_doc.get("ingest_task_id"),
+                "status": existing_doc.get("status"),
+                "duplicate": True,
+                "filename": existing_doc.get("filename"),
+            }
 
     # Upload Storage. upsert=true permite re-upload caso DB e Storage divirjam.
     try:
@@ -270,9 +270,10 @@ async def upload_rag_document(
         insert_doc_row["metadata"] = metadata_dict
     try:
         doc_res = supabase.table("rag_documents").insert(insert_doc_row).execute()
-        if not doc_res.data:
-            raise HTTPException(500, "rag_documents insert returned empty")
-        document_id = doc_res.data[0]["id"]
+        first = doc_res.data[0] if doc_res.data else None
+        if not isinstance(first, dict):
+            raise HTTPException(500, f"rag_documents insert returned unexpected result: {first!r}")
+        document_id = first["id"]
     except Exception as e:
         # Cleanup: tentar remover arquivo do bucket pra não criar lixo órfão
         try:
@@ -304,9 +305,10 @@ async def upload_rag_document(
     }
     try:
         task_res = supabase.table("tasks").insert(task_row).execute()
-        if not task_res.data:
-            raise HTTPException(500, "task insert returned empty")
-        task_id = task_res.data[0]["id"]
+        first_task = task_res.data[0] if task_res.data else None
+        if not isinstance(first_task, dict):
+            raise HTTPException(500, f"task insert returned unexpected result: {first_task!r}")
+        task_id = first_task["id"]
     except Exception as e:
         logger.error("rag.upload task insert failed: %s", e)
         raise HTTPException(500, f"task_insert_failed: {e}")
@@ -360,7 +362,8 @@ async def list_rag_documents(
         if status:
             query = query.eq("status", status)
         res = query.execute()
-        return [RagDocumentOut(**row).model_dump() for row in (res.data or [])]
+        rows = [r for r in (res.data or []) if isinstance(r, dict)]
+        return [RagDocumentOut(**row).model_dump() for row in rows]
     except Exception as e:
         logger.error("rag.list_documents failed: %s", e)
         raise HTTPException(500, str(e))
@@ -383,9 +386,10 @@ async def get_rag_document(request: Request, document_id: str):
             .limit(1)
             .execute()
         )
-        if not res.data:
+        row = res.data[0] if res.data else None
+        if not isinstance(row, dict):
             raise HTTPException(404, "rag_document_not_found")
-        return RagDocumentOut(**res.data[0]).model_dump()
+        return RagDocumentOut(**row).model_dump()
     except HTTPException:
         raise
     except Exception as e:
@@ -418,6 +422,7 @@ async def query_rag_corpus(
             company_id=company_id,
             k=body.k,
             min_score=body.min_score,
+            metadata_filter=body.metadata_filter,
             supabase_client=supabase,
         )
     except RuntimeError as e:
@@ -470,9 +475,9 @@ async def delete_rag_document(request: Request, document_id: str):
             .limit(1)
             .execute()
         )
-        if not existing.data:
+        row = existing.data[0] if existing.data else None
+        if not isinstance(row, dict):
             raise HTTPException(404, "rag_document_not_found")
-        row = existing.data[0]
 
         # Storage cleanup (best-effort; FK CASCADE cuida dos chunks)
         bucket = os.getenv("RAG_STORAGE_BUCKET", _RAG_DEFAULT_BUCKET)

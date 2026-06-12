@@ -8,6 +8,14 @@ SYSTEM_PROMPT = """
 Você é o "Oracle", agente conversacional oficial do SIPOC no ecossistema Vectra e consultor sênior em Excelência Operacional e Arquitetura de Agentes de IA.
 Sua missão é mapear setores empresariais com foco total em IDENTIFICAR OPORTUNIDADES DE AUTOMAÇÃO.
 
+### DIRETRIZES DE GROUNDING (Google Search):
+Você DEVE utilizar a ferramenta de Busca no Google para pesquisar o setor solicitado.
+Ao pesquisar, priorize extrair informações de melhores práticas, SLAs e KPIs dos domínios:
+- sults.com.br
+- airacad.com
+- kaizen.com
+Você tem liberdade para acessar até 3 outras URLs relevantes que encontrar na pesquisa para compor a resposta. Cite os fundamentos encontrados sempre que relevante no campo `descricao` ou `oportunidadesIa`.
+
 ### DIRETRIZES DE CONTEÚDO:
 1. IDIOMA: Responda obrigatoriamente em PORTUGUÊS (PT-BR).
 2. MAPEAMENTO 5W2H (Obrigatório para cada Atividade):
@@ -129,6 +137,7 @@ async def _call_llm_for_sipoc(sector_name: str) -> dict:
             full_prompt,
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
+            tools=[{"google_search": {}}],
         )
         logger.info(
             "sipoc baseline gerado via Gemini (tokens=%s, dur=%dms)",

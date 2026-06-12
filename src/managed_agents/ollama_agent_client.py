@@ -191,6 +191,20 @@ class OllamaAgentClient:
                     error=f"OllamaAgentClient: limite de turns atingido ({_MAX_TURNS})",
                 )
 
+        except openai.APITimeoutError as e:
+            elapsed = time.monotonic() - start
+            logger.error("OllamaAgentClient: timeout — %s", e)
+            return ExecutionResult(
+                success=False,
+                content="",
+                tool_calls=tool_calls_log,
+                turn_count=turn,
+                tokens_input=total_input,
+                tokens_output=total_output,
+                execution_time_seconds=round(elapsed, 3),
+                tokens_per_second=_tps(),
+                error=f"Timeout ao chamar Ollama: {e}",
+            )
         except openai.APIConnectionError as e:
             elapsed = time.monotonic() - start
             logger.error(
@@ -210,20 +224,6 @@ class OllamaAgentClient:
                     f"Ollama inacessível em {self._base_url}. "
                     f"Verifique se 'ollama serve' está rodando. Detalhe: {e}"
                 ),
-            )
-        except openai.APITimeoutError as e:
-            elapsed = time.monotonic() - start
-            logger.error("OllamaAgentClient: timeout — %s", e)
-            return ExecutionResult(
-                success=False,
-                content="",
-                tool_calls=tool_calls_log,
-                turn_count=turn,
-                tokens_input=total_input,
-                tokens_output=total_output,
-                execution_time_seconds=round(elapsed, 3),
-                tokens_per_second=_tps(),
-                error=f"Timeout ao chamar Ollama: {e}",
             )
         except Exception as e:
             elapsed = time.monotonic() - start

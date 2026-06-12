@@ -17,6 +17,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from src.services.gemini_client import generate as gemini_generate
 from src.services.llm_cost import calc_llm_cost
 
 logger = logging.getLogger("Athena")

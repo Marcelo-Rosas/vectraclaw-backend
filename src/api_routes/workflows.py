@@ -53,6 +53,8 @@ class WorkflowUpsertMeta(BaseModel):
     trigger_type='cron' e is_scheduled=true, o handler de save sincroniza
     automaticamente uma row em `vectraclip.routines` (preserva compat com
     daemon cron existente até PR-T3 deprecar o endpoint de routines).
+
+    FASE 1: ganhou `goal_id` e `kind` (project/routine) para linkage com goals.
     """
 
     slug: Optional[str] = None
@@ -61,6 +63,8 @@ class WorkflowUpsertMeta(BaseModel):
     trigger_type: Optional[str] = None       # default 'manual' aplicado no save
     cron_expression: Optional[str] = None
     is_scheduled: Optional[bool] = None
+    goal_id: Optional[str] = None
+    kind: Optional[str] = None               # 'project' | 'routine'
 
     class Config:
         populate_by_name = True
@@ -424,6 +428,10 @@ async def _save_workflow_definition_and_steps(
             "version": new_ver,
             **trigger_patch,
         }
+        if meta.goal_id is not None:
+            upd["goal_id"] = meta.goal_id or None
+        if meta.kind is not None:
+            upd["kind"] = meta.kind
         supabase.table("workflow_definitions").update(upd).eq("id", wf_row["id"]).execute()
         wf_id = wf_row["id"]
     else:
@@ -438,6 +446,10 @@ async def _save_workflow_definition_and_steps(
             "updated_at": now,
             **trigger_patch,
         }
+        if meta.goal_id is not None:
+            insert_row["goal_id"] = meta.goal_id or None
+        if meta.kind is not None:
+            insert_row["kind"] = meta.kind
         ins = supabase.table("workflow_definitions").insert(insert_row).execute()
         if not ins.data:
             raise HTTPException(status_code=500, detail="workflow_insert_failed")

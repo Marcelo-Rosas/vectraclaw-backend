@@ -9,6 +9,7 @@ Endpoints (todos bloqueiam role=viewer e role=sector_responsible):
 - DELETE /api/sipoc/positions/{position_id}      delete_position
 - GET    /api/companies/{company_id}/app_users   list_company_users
 - PATCH  /api/app_users/{user_id}                patch_app_user
+- POST   /api/admin/schema-architect             schema_architect (NAVI)
 
 CHECK constraints relevantes (do PR2 #131):
 - app_users.role ∈ (admin, platform_admin, consultant, company_admin,
@@ -24,7 +25,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger("api.admin")
 router = APIRouter(tags=["admin"])
@@ -50,6 +51,22 @@ class PatchAppUserInput(BaseModel):
     role: Optional[str] = None
     assigned_position_id: Optional[str] = None
     name: Optional[str] = None
+
+
+class SchemaArchitectInput(BaseModel):
+    """Corpo para geração/revisão de schema JSON (NAVI Schema Architect)."""
+
+    specialty: Optional[str] = None
+    existing_schema: Optional[str] = None
+    model: Optional[str] = None
+    catalog_type: Optional[str] = None
+    catalog_id: Optional[str] = None
+
+
+class SchemaArchitectApplyInput(BaseModel):
+    catalog_type: str
+    catalog_id: str
+    target_schema: Any = Field(alias="schema")  # array JSON de field definitions
 
 
 def _position_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -293,3 +310,178 @@ async def patch_app_user(request: Request, user_id: str, payload: PatchAppUserIn
     except Exception as e:
         logger.error(f"patch_app_user failed: {e}")
         raise HTTPException(500, str(e))
+
+
+# -----------------------------------------------------------------------------
+# Schema Architect (NAVI) — catálogos admin + Gemini
+# -----------------------------------------------------------------------------
+
+@router.get("/api/admin/schema-architect/catalog-types")
+@router.get("/admin/schema-architect/catalog-types")
+async def schema_architect_catalog_types(request: Request):
+    from src.api import get_user_scope, require_role_not
+    from src.services.schema_architect_catalog import list_catalog_types
+
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _ADMIN_BLOCKED_ROLES, "listar catálogos do Schema Architect")
+    return list_catalog_types()
+
+
+@router.get("/api/admin/schema-architect/catalogs/{catalog_type}/items")
+@router.get("/admin/schema-architect/catalogs/{catalog_type}/items")
+async def schema_architect_catalog_items(
+    request: Request,
+    catalog_type: str,
+    include_inactive: bool = False,
+):
+    from src.api import supabase, get_user_scope, require_role_not
+    from src.services.schema_architect_catalog import list_catalog_items
+
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _ADMIN_BLOCKED_ROLES, "listar itens do catálogo")
+    if not supabase:
+        return []
+    try:
+        return list_catalog_items(
+            supabase, catalog_type, include_inactive=include_inactive
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.error("schema_architect_catalog_items failed: %s", e)
+        raise HTTPException(500, "catalog_list_failed") from e
+
+
+@router.get("/api/admin/schema-architect/catalogs/{catalog_type}/items/{catalog_id}")
+@router.get("/admin/schema-architect/catalogs/{catalog_type}/items/{catalog_id}")
+async def schema_architect_catalog_item(
+    request: Request,
+    catalog_type: str,
+    catalog_id: str,
+):
+    from src.api import supabase, get_user_scope, require_role_not
+    from src.services.schema_architect_catalog import load_catalog_item
+
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _ADMIN_BLOCKED_ROLES, "carregar item do catálogo")
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    try:
+        return load_catalog_item(supabase, catalog_type, catalog_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.error("schema_architect_catalog_item failed: %s", e)
+        raise HTTPException(500, "catalog_load_failed") from e
+
+
+@router.post("/api/admin/schema-architect/apply")
+@router.post("/admin/schema-architect/apply")
+async def schema_architect_apply(request: Request, payload: SchemaArchitectApplyInput):
+    from src.api import supabase, get_user_scope, require_role_not
+    from src.services.schema_architect_catalog import apply_catalog_schema
+
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _ADMIN_BLOCKED_ROLES, "aplicar schema no catálogo")
+    if not supabase:
+        raise HTTPException(503, "supabase_unavailable")
+    try:
+        item = apply_catalog_schema(
+            supabase,
+            payload.catalog_type,
+            payload.catalog_id,
+            payload.target_schema,
+        )
+        return {"ok": True, "item": item}
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.error("schema_architect_apply failed: %s", e, exc_info=True)
+        raise HTTPException(500, "schema_apply_failed") from e
+
+
+@router.post("/api/admin/schema-architect")
+@router.post("/admin/schema-architect")
+async def schema_architect(request: Request, payload: SchemaArchitectInput):
+    """
+    Gera ou revisa um schema JSON de configuração para especialidade de agente.
+
+    - Sem `existing_schema`: gera schema do zero.
+    - Com `existing_schema`: revisão crítica + JSON sugerido.
+    """
+    from src.api import get_user_scope, require_role_not
+    from src.api import supabase
+    from src.services.schema_architect import generate_or_review_schema
+    from src.services.schema_architect_catalog import (
+        CATALOG_REGISTRY,
+        load_catalog_item,
+    )
+
+    scope = get_user_scope(request.state.token)
+    require_role_not(scope, _ADMIN_BLOCKED_ROLES, "usar Schema Architect")
+
+    catalog_type = (payload.catalog_type or "").strip() or None
+    catalog_id = (payload.catalog_id or "").strip() or None
+    existing_schema = payload.existing_schema
+    catalog_context: Optional[Dict[str, Any]] = None
+    specialty = (payload.specialty or "").strip()
+
+    if catalog_type and catalog_id:
+        if not supabase:
+            raise HTTPException(503, "supabase_unavailable")
+        try:
+            loaded = load_catalog_item(supabase, catalog_type, catalog_id)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        meta_def = CATALOG_REGISTRY.get(catalog_type)
+        specialty = specialty or loaded.get("name") or ""
+        if existing_schema is None or not existing_schema.strip():
+            existing_schema = loaded.get("schemaJson") or ""
+        catalog_context = {
+            "name": loaded.get("name"),
+            "catalogLabel": meta_def.label if meta_def else catalog_type,
+            "shapeHint": loaded.get("shapeHint") or "",
+            "description": loaded.get("description") or "",
+            "extra": loaded.get("extra") or {},
+        }
+
+    if not specialty:
+        raise HTTPException(400, "specialty_or_catalog_required")
+
+    try:
+        kwargs: Dict[str, Any] = {}
+        if payload.model and payload.model.strip():
+            kwargs["model"] = payload.model.strip()
+        if catalog_context:
+            kwargs["catalog_context"] = catalog_context
+        text, meta = await generate_or_review_schema(
+            specialty,
+            existing_schema,
+            **kwargs,
+        )
+        has_existing = bool((existing_schema or "").strip())
+        return {
+            "specialty": specialty,
+            "catalogType": catalog_type,
+            "catalogId": catalog_id,
+            "mode": "review" if has_existing else "generate",
+            "text": text,
+            "model": meta.get("model_used"),
+            "tokens": meta.get("tokens"),
+            "duration_ms": meta.get("duration_ms"),
+        }
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RuntimeError as e:
+        if "GEMINI_API_KEY" in str(e):
+            raise HTTPException(503, "gemini_api_key_not_configured") from e
+        raise HTTPException(500, str(e)) from e
+    except Exception as e:
+        logger.error("schema_architect failed: %s", e, exc_info=True)
+        raise HTTPException(500, "schema_architect_failed") from e
