@@ -1,6 +1,28 @@
+"""Agente Maker do fluxo SIPOC.
+
+O ``OracleMaker`` é responsável por gerar as respostas do assistente
+ durante a construção de um SIPOC. Ele interpreta o estado atual do
+diálogo (evento, estágio, perfil do usuário) e invoca o LLM Oracle
+produzindo tanto texto para o usuário quanto estruturas de dados
+para o backend.
+
+Integração com o orquestrador:
+- Recebe o ``FlowState`` completo do ``executor_node``.
+- Lê ``previous_feedback`` (feedback do checker da iteração anterior)
+  e o incorpora no prompt quando presente.
+- Retorna um partial update contendo ``maker_response_text`` e
+  ``maker_structured``.
+
+O campo ``iteration_count`` NÃO deve ser modificado aqui; o
+orquestrador (``supervisor_node``) é o único responsável por
+incrementá-lo, garantindo controle centralizado do loop.
+"""
+
+from __future__ import annotations
+
 import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from src.agents.oracle import build_oracle_prompt
 from src.services.oracle_llm_stream import stream_oracle_response
@@ -10,14 +32,22 @@ logger = logging.getLogger("OracleMaker")
 
 
 def _parse_w2h_analysis(text: str) -> Dict[str, Any]:
+    """Extrai score, padrão lógico e sugestão de uma análise 5W2H.
+
+    Essa função utiliza expressões regulares permissivas para
+    compatibilizar variações de idioma (ex: "Score de Automação"
+    vs "Score") e capitalização.
+    """
     score_m = re.search(
         r"Score\s*(?:de\s*Automa[çc][aã]o)?[:\s*]*(\d+)\s*/\s*100",
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     pattern_m = re.search(
         r"Padr[aã]o\s*L[oó]gico[:\s*]*"
         r"(SIMPLE|SPLIT|LOOP-FOR-EACH|WAIT-EVENT|SUBFLOW|MANUAL)",
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     suggestion_m = re.search(r"Sugest[aã]o[:\s*]+(.+?)(?:\n|$)", text, re.IGNORECASE)
     return {
@@ -28,6 +58,14 @@ def _parse_w2h_analysis(text: str) -> Dict[str, Any]:
 
 
 def _classify_meta_intent(text: str) -> str:
+    """Classifica a intenção da mensagem do usuário em meta-diálogo.
+
+    Categorias:
+        correction: usuário quer corrigir algo previamente dito.
+        question:  usuário faz uma pergunta sobre o processo/SIPOC.
+        skip:      usuário pede para avançar/ignorar etapa.
+        other:     qualquer outra intenção.
+    """
     t = (text or "").lower()
     if re.search(r"\b(corrig|errei|errado|muda|alterar|substituir|troca)\w*\b", t):
         return "correction"
@@ -39,6 +77,7 @@ def _classify_meta_intent(text: str) -> str:
 
 
 def _event_to_component_type(stage: str) -> str:
+    """Traduz o estágio atual do SIPOC para o tipo de componente."""
     return {
         "mapping_suppliers": "supplier",
         "mapping_inputs": "input",
@@ -49,6 +88,14 @@ def _event_to_component_type(stage: str) -> str:
 
 
 def _build_context_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Monta o contexto específico para o prompt do Oracle.
+
+    O contexto varia conforme o evento atual do diálogo:
+    - ``stage_intro``: informa o tipo de componente do estágio.
+    - ``component_ack``: informa o valor confirmado pelo usuário.
+    - ``w2h_question``: traz a atividade e respostas 5W2H já coletadas.
+    - ``w2h_analysis``: traz os dados 5W2H completos para análise.
+    """
     event = state.get("current_event", "")
     stage = state.get("current_stage", "")
     activity = (state.get("pending_activity") or {}).get("name", "atividade")
@@ -76,10 +123,52 @@ def _build_context_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _inject_feedback_into_prompt(
+    user_prompt: str, feedback: Optional[str]
+) -> str:
+    """Injeta o feedback do checker no prompt do maker.
+
+    Quando o checker rejeitou a resposta anterior, essa função
+    prefixa o prompt do maker com o feedback, orientando-o a
+    corrigir os problemas apontados.
+    """
+    if not feedback:
+        return user_prompt
+    return (
+        f"[O revisor indicou um problema na resposta anterior: {feedback}]\n"
+        "Revise sua resposta levando isso em conta.\n\n"
+        f"{user_prompt}"
+    )
+
+
 async def run_maker(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Gera a resposta do Oracle para o estado atual do diálogo.
+
+    Args:
+        state: Estado completo do fluxo SIPOC (``FlowState``).
+
+    Returns:
+        Partial update contendo:
+            - ``maker_response_text``: texto completo gerado pelo LLM.
+            - ``maker_structured``: dados estruturados extraídos do texto,
+              quando aplicável (ex: score/pattern de análise 5W2H).
+    """
     session_id = state.get("session_id", "")
     current_event = state.get("current_event", "meta_input")
-    checker_feedback = state.get("checker_feedback", "")
+
+    # O orquestrador garante que ``previous_feedback`` contenha o
+    # feedback da iteração anterior. Mantemos fallback para
+    # ``checker_feedback`` por compatibilidade com chamadas legadas.
+    previous_feedback: Optional[str] = state.get("previous_feedback") or state.get("checker_feedback") or None
+
+    logger.info(
+        "oracle.flow.maker_started session=%s event=%s iteration=%d has_feedback=%s",
+        session_id,
+        current_event,
+        state.get("iteration_count", 0),
+        bool(previous_feedback),
+    )
+
     q = get_stream_queue(session_id)
 
     payload = {
@@ -92,13 +181,7 @@ async def run_maker(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     system, user_prompt = build_oracle_prompt(payload)
-
-    if checker_feedback:
-        user_prompt = (
-            f"[O revisor indicou um problema na resposta anterior: {checker_feedback}]\n"
-            f"Revise sua resposta levando isso em conta.\n\n"
-            f"{user_prompt}"
-        )
+    user_prompt = _inject_feedback_into_prompt(user_prompt, previous_feedback)
 
     full_text = ""
     try:
@@ -121,9 +204,9 @@ async def run_maker(state: Dict[str, Any]) -> Dict[str, Any]:
     elif current_event == "component_ack":
         maker_structured = {"confirmed_value": state.get("last_user_message", "")}
 
+    logger.info("oracle.flow.maker_done session=%s event=%s", session_id, current_event)
+
     return {
         "maker_response_text": full_text,
         "maker_structured": maker_structured,
-        "iteration_count": state.get("iteration_count", 0) + 1,
-        "current_node": "checker",
     }

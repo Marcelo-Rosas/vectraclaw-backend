@@ -151,6 +151,21 @@ def _read_hermes_inbox(payload_json: str) -> str:
         return json.dumps({"success": False, "error": str(e)})
 
 
+def _run_async(coro):
+    """Executa uma coroutine de forma segura, lidando com nested event loops."""
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    # Já existe um loop rodando (ex: chamado de dentro de async handler).
+    # Não podemos usar asyncio.run() aqui; criamos uma nova task e
+    # executamos via run_in_executor para não bloquear.
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
 def _query_rag(payload_json: str) -> str:
     """Query top-k chunks da memória corporativa via pgvector. Retorna JSON.
 
@@ -158,7 +173,6 @@ def _query_rag(payload_json: str) -> str:
     Multi-tenant garantido pelo p_company_id no RPC match_rag_chunks.
     """
     try:
-        import asyncio as _asyncio
         data = json.loads(payload_json)
         company_id = (data.get("company_id") or "").strip()
         query = (data.get("query") or "").strip()
@@ -176,7 +190,7 @@ def _query_rag(payload_json: str) -> str:
 
         from src.services.rag.retriever import query_top_k
 
-        results = _asyncio.run(query_top_k(
+        results = _run_async(query_top_k(
             query,
             company_id=company_id,
             k=k,

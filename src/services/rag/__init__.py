@@ -4,7 +4,7 @@ src.services.rag — Pipeline RAG do VectraClaw.
 Substitui o RAG PHP standalone por uma stack Python integrada:
 - Extract: PDF/TXT/HTML/JSON/XLSX → texto + páginas
 - Chunk: split em segmentos (default 500 tokens, 100 overlap)
-- Embed: OpenAI text-embedding-3-small (1536 dim — locked pelo schema)
+- Embed: OpenAI text-embedding-3-small (768 dim — locked pelo schema, migration 20260520140000)
 - Retrieve: pgvector HNSW cosine via Supabase RPC
 
 Schema: vectraclip.rag_documents + vectraclip.rag_chunks (PR #18).

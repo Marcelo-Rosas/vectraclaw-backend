@@ -42,7 +42,8 @@ UPDATE vectraclip.operation_types_catalog SET handler_module='src.agents.kronos_
 UPDATE vectraclip.operation_types_catalog SET handler_module='src.agents.kronos_planner',          handler_function='entrypoint_categorize_pendings', handler_is_async=false, handler_pass_supabase=true WHERE id='planner-categorize-pendings';
 UPDATE vectraclip.operation_types_catalog SET handler_module='src.agents.kronos_audit',            handler_function='entrypoint_kronos_audit',  handler_is_async=false, handler_pass_supabase=true WHERE id='kronos-audit-historico';
 UPDATE vectraclip.operation_types_catalog SET handler_module='src.agents.kronos_apply_corrections',handler_function='entrypoint_apply_corrections', handler_is_async=false, handler_pass_supabase=true WHERE id='planner-apply-corrections';
-UPDATE vectraclip.operation_types_catalog SET handler_module='src.agents.mnemos',                  handler_function='entrypoint',               handler_is_async=false, handler_pass_supabase=true WHERE id='rag-ingest';
+UPDATE vectraclip.operation_types_catalog SET handler_module='src.agents.mnemos',                  handler_function='entrypoint',               handler_is_async=true,  handler_pass_supabase=true WHERE id='rag-ingest';
+UPDATE vectraclip.operation_types_catalog SET handler_module='src.services.athena_rag',            handler_function='entrypoint',               handler_is_async=true,  handler_pass_supabase=true WHERE id='athena-rag-ingest';
 
 -- ── Caso especial: oracle-report tem assinatura (task) — SÓ task (Correção B) ─
 UPDATE vectraclip.operation_types_catalog SET handler_module='src.agents.hermes_reporter',         handler_function='entrypoint',               handler_is_async=false, handler_pass_supabase=false WHERE id='oracle-report';

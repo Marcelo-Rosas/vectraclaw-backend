@@ -10115,31 +10115,46 @@ if __name__ == "__main__":
 
 @app.post("/api/workflow/run-orchestrator")
 async def run_flow_orchestrator(request: Request):
+    """Executa o orquestrador Oracle SIPOC e transmite eventos via SSE.
+
+    Este endpoint é um debug/health-check do grafo. Em produção, prefira
+    ``stream_oracle_chat_v2`` (``oracle_runner.py``), que oferece
+    streaming de deltas do LLM e persistência de sessão.
+    """
     try:
-        from src.services.flow_orchestrator import build_orchestrator
-        from langchain_core.messages import HumanMessage  # pyright: ignore[reportMissingImports]
+        from src.services.flow_orchestrator import (
+            build_orchestrator,
+            build_initial_flow_state,
+        )
     except ImportError:
         raise HTTPException(status_code=500, detail="LangGraph engine not installed or built.")
-        
+
     data = await request.json()
     prompt = data.get("prompt", "Inicie o fluxo base.")
-    
-    app_orchestrator = build_orchestrator()
-    initial_state = {
-        "messages": [HumanMessage(content=prompt)],
-        "context_data": {},
-        "iteration_count": 0,
-        "current_node": "supervisor"
-    }
-    
+    session_id = data.get("session_id", "debug-session")
+
+    orch = build_orchestrator()
+    initial_state = build_initial_flow_state(
+        session_id=session_id,
+        user_message=prompt,
+        domain=data.get("domain", "Processo"),
+        user_profile=data.get("user_profile", "advanced"),
+        current_stage=data.get("stage", "idle"),
+        current_event=data.get("event", "meta_input"),
+    )
+
     async def event_generator():
-        # Transmite os eventos passo a passo usando Server-Sent Events (SSE)
-        for output in app_orchestrator.stream(initial_state):
-            for key, value in output.items():
-                event_data = {"node": key, "message": f"Nó Concluído: {key}"}
-                yield f"data: {_json_wf.dumps(event_data)}\n\n"
-                await asyncio.sleep(0.5)
-        yield "data: {\"node\": \"END\", \"message\": \"Fluxo Finalizado\"}\n\n"
+        try:
+            async for output in orch.astream(initial_state):
+                for key, value in output.items():
+                    event_data = {"node": key, "message": f"Nó Concluído: {key}"}
+                    yield f"data: {_json_wf.dumps(event_data)}\n\n"
+                    await asyncio.sleep(0.1)
+            yield "data: {\"node\": \"END\", \"message\": \"Fluxo Finalizado\"}\n\n"
+        except Exception as exc:
+            logger.error("run_flow_orchestrator failed: %s", exc, exc_info=True)
+            yield f"data: {_json_wf.dumps({'node': 'ERROR', 'message': str(exc)})}\n\n"
+            yield "data: {\"node\": \"END\", \"message\": \"Fluxo Finalizado com Erro\"}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

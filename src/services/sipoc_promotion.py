@@ -82,3 +82,31 @@ async def promote_activity_to_automation(supabase_client, component_id: str) -> 
         "routine_id": routine_id,
         "score": score
     }
+
+
+async def promote_process_to_workflow(
+    supabase_client,
+    *,
+    sipoc_process_id: str,
+    goal_id: str,
+    company_id: str,
+    kind: str = "project",
+) -> Dict[str, Any]:
+    """Promove um processo SIPOC para um workflow executável.
+
+    Cria um workflow baseado no processo SIPOC, com steps derivados das
+    atividades mapeadas.
+    """
+    from src.services.workflow_graph import WorkflowGraphService
+
+    try:
+        wf_service = WorkflowGraphService(supabase_client)
+        result = await wf_service.create_from_sipoc(
+            sipoc_process_id=sipoc_process_id,
+            goal_id=goal_id,
+            company_id=company_id,
+            kind=kind,
+        )
+        return {"success": True, "workflow_id": result.get("id"), **result}
+    except Exception as exc:
+        return {"error": str(exc)}

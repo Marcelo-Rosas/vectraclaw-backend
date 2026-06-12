@@ -1,3 +1,28 @@
+"""Agente Checker do fluxo SIPOC.
+
+O ``OracleChecker`` valida as respostas geradas pelo ``OracleMaker``.
+Ele atua como um revisor independente, avaliando se o conteúdo
+atende aos critérios de qualidade definidos para cada tipo de evento
+do diálogo (``meta_input``, ``component_ack``, ``w2h_analysis`` etc.).
+
+Integração com o orquestrador:
+- Recebe o ``FlowState`` completo do ``checker_node``.
+- Retorna um partial update contendo obrigatoriamente
+  ``checker_verdict`` (``accept`` ou ``revise``) e opcionalmente
+  ``checker_feedback`` e ``checker_corrections``.
+- NÃO retorna ``current_node``; o roteamento é responsabilidade do
+  grafo LangGraph (ver ``_route_after_checker`` no orquestrador).
+
+Regras de fallback:
+- Em caso de falha de parsing do JSON do LLM, o checker aceita
+  permissivamente para não travar o usuário, mas emite warning.
+- Em caso de exceção inesperada (LLM indisponível, timeout etc.),
+  o checker emite ``revise`` com feedback técnico, evitando
+  propagar uma resposta não verificada.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 from typing import Any, Dict, List
@@ -7,6 +32,13 @@ from src.services.agent_llm import generate_for_agent
 from src.services.gemini_client import DEFAULT_MODEL
 
 logger = logging.getLogger("OracleChecker")
+
+# ---------------------------------------------------------------------------
+# Constantes de domínio
+# ---------------------------------------------------------------------------
+
+VEREDICT_ACCEPT = "accept"
+VEREDICT_REVISE = "revise"
 
 _VECTRA_RUBRIC = (
     "Vectra Rubric v1:\n"
@@ -23,10 +55,36 @@ _VALID_PATTERNS = frozenset(
 )
 
 
+# ---------------------------------------------------------------------------
+# API pública
+# ---------------------------------------------------------------------------
+
 async def run_checker(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Valida a resposta do maker de acordo com o evento atual.
+
+    A validação é especializada por tipo de evento:
+        - ``w2h_analysis``: valida score, padrão lógico e acionabilidade.
+        - ``component_ack``: valida concisão e fidelidade aos dados.
+        - ``meta_input``: valida classificação de intenção e utilidade.
+        - outros: fallback por tamanho do texto.
+
+    Args:
+        state: Estado completo do fluxo SIPOC (``FlowState``).
+
+    Returns:
+        Partial update contendo ``checker_verdict``, ``checker_feedback``
+        e ``checker_corrections``.
+    """
     event = state.get("current_event", "meta_input")
     maker_text = state.get("maker_response_text", "")
     session_id = state.get("session_id", "")
+
+    logger.info(
+        "oracle.flow.checker_started session=%s event=%s iteration=%d",
+        session_id,
+        event,
+        state.get("iteration_count", 0),
+    )
 
     try:
         if event == "w2h_analysis":
@@ -37,11 +95,34 @@ async def run_checker(state: Dict[str, Any]) -> Dict[str, Any]:
             return await _check_meta_input(state, maker_text)
         return _check_format_only(maker_text, max_lines=6)
     except Exception as exc:
-        logger.error("oracle_checker failed session=%s event=%s: %s", session_id, event, exc)
-        return _accept()
+        # Falhas técnicas não devem propagar uma resposta não verificada.
+        # Em vez de aceitar silenciosamente, pedimos revisão com feedback
+        # técnico. O supervisor limita o número de tentativas.
+        logger.error(
+            "oracle_checker failed session=%s event=%s: %s",
+            session_id,
+            event,
+            exc,
+            exc_info=True,
+        )
+        return _revise_technical(
+            "Não foi possível validar a resposta automaticamente. "
+            "Por favor, reveja a informação ou tente novamente em instantes."
+        )
 
+
+# ---------------------------------------------------------------------------
+# Validadores específicos por evento
+# ---------------------------------------------------------------------------
 
 async def _check_w2h_analysis(state: Dict[str, Any], maker_text: str) -> Dict[str, Any]:
+    """Valida uma análise 5W2H e automação de atividade.
+
+    Critérios:
+        1. Respostas 5W2H muito curtas (< 5 palavras) devem reduzir o score.
+        2. Padrão lógico deve ser coerente com o campo "how".
+        3. Sugestão deve ser acionável (evitar genericidades).
+    """
     activity = (state.get("pending_activity") or {}).get("name", "atividade")
     w2h_data = (state.get("pending_activity") or {}).get("w2h_data") or {}
     w2h_rows = "\n".join(f"- {k}: {v}" for k, v in w2h_data.items() if v) or "(sem dados)"
@@ -64,7 +145,8 @@ async def _check_w2h_analysis(state: Dict[str, Any], maker_text: str) -> Dict[st
     )
 
     text, _ = await generate_for_agent(
-        ORACLE_AGENT_ID, prompt,
+        ORACLE_AGENT_ID,
+        prompt,
         response_mime_type="application/json",
         fallback_model=DEFAULT_MODEL,
     )
@@ -72,6 +154,13 @@ async def _check_w2h_analysis(state: Dict[str, Any], maker_text: str) -> Dict[st
 
 
 async def _check_component_ack(state: Dict[str, Any], maker_text: str) -> Dict[str, Any]:
+    """Valida a confirmação (ack) de um componente SIPOC.
+
+    Critérios:
+        - Máximo 3 linhas.
+        - Não inventou dados além do fornecido.
+        - Insight (se houver) é relevante.
+    """
     value = state.get("last_user_message", "")
     stage = state.get("current_stage", "")
     comp_type = _event_to_component_type(stage)
@@ -88,7 +177,8 @@ async def _check_component_ack(state: Dict[str, Any], maker_text: str) -> Dict[s
     )
 
     text, _ = await generate_for_agent(
-        ORACLE_AGENT_ID, prompt,
+        ORACLE_AGENT_ID,
+        prompt,
         response_mime_type="application/json",
         fallback_model=DEFAULT_MODEL,
     )
@@ -96,6 +186,7 @@ async def _check_component_ack(state: Dict[str, Any], maker_text: str) -> Dict[s
 
 
 async def _check_meta_input(state: Dict[str, Any], maker_text: str) -> Dict[str, Any]:
+    """Valida a classificação de intenção e resposta em meta-diálogo."""
     intent = (state.get("maker_structured") or {}).get("intent", "other")
     user_message = state.get("last_user_message", "")
 
@@ -109,41 +200,69 @@ async def _check_meta_input(state: Dict[str, Any], maker_text: str) -> Dict[str,
     )
 
     text, _ = await generate_for_agent(
-        ORACLE_AGENT_ID, prompt,
+        ORACLE_AGENT_ID,
+        prompt,
         response_mime_type="application/json",
         fallback_model=DEFAULT_MODEL,
     )
     return _parse_result(text, state, event="meta_input")
 
 
+# ---------------------------------------------------------------------------
+# Fallbacks e helpers
+# ---------------------------------------------------------------------------
+
 def _check_format_only(maker_text: str, max_lines: int = 6) -> Dict[str, Any]:
-    line_count = len([l for l in maker_text.strip().split("\n") if l.strip()])
+    """Validação heurística de último recurso: limita tamanho da resposta."""
+    line_count = len([line for line in maker_text.strip().split("\n") if line.strip()])
     if line_count <= max_lines * 2:
         return _accept()
+
     truncated = "\n".join(maker_text.strip().split("\n")[:max_lines])
     return {
-        "checker_verdict": "revise",
-        "checker_feedback": f"Resposta muito longa ({line_count} linhas, máx {max_lines}). Seja mais conciso.",
+        "checker_verdict": VEREDICT_REVISE,
+        "checker_feedback": (
+            f"Resposta muito longa ({line_count} linhas, máx {max_lines}). Seja mais conciso."
+        ),
         "checker_corrections": [
             {"type": "correction", "kind": "replace_text", "replacement": truncated}
         ],
-        "current_node": "execute_task",
     }
 
 
 def _accept() -> Dict[str, Any]:
+    """Retorna um veredicto de aceitação limpo."""
     return {
-        "checker_verdict": "accept",
+        "checker_verdict": VEREDICT_ACCEPT,
         "checker_feedback": "",
         "checker_corrections": [],
-        "current_node": "end",
+    }
+
+
+def _revise_technical(feedback: str) -> Dict[str, Any]:
+    """Retorna um veredicto de revisão para falhas técnicas do checker."""
+    return {
+        "checker_verdict": VEREDICT_REVISE,
+        "checker_feedback": feedback,
+        "checker_corrections": [
+            {
+                "type": "technical_failure",
+                "reason": feedback,
+            }
+        ],
     }
 
 
 def _parse_result(result_text: str, state: Dict[str, Any], event: str) -> Dict[str, Any]:
+    """Faz parsing robusto do JSON retornado pelo LLM checker.
+
+    Remove blocos de markdown (```json ... ```) caso presentes.
+    Em caso de falha de parsing, aceita permissivamente para não
+    travar o usuário, mas loga o incidente.
+    """
     corrections: List[Dict[str, Any]] = []
     feedback = ""
-    verdict = "accept"
+    verdict = VEREDICT_ACCEPT
 
     try:
         cleaned = result_text.strip()
@@ -154,7 +273,7 @@ def _parse_result(result_text: str, state: Dict[str, Any], event: str) -> Dict[s
                 cleaned = cleaned[:-3].strip()
 
         data = json.loads(cleaned)
-        verdict = str(data.get("verdict", "accept"))
+        verdict = str(data.get("verdict", VEREDICT_ACCEPT))
         feedback = str(data.get("feedback", ""))
 
         replacement = data.get("replacement_text")
@@ -188,19 +307,22 @@ def _parse_result(result_text: str, state: Dict[str, Any], event: str) -> Dict[s
                     })
 
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        logger.warning("oracle_checker parse failed: %s — raw: %.300s", exc, result_text)
-        verdict = "accept"
+        logger.warning(
+            "oracle_checker parse failed: %s — raw: %.300s",
+            exc,
+            result_text,
+        )
+        verdict = VEREDICT_ACCEPT
 
-    current_node = "end" if verdict == "accept" else "execute_task"
     return {
         "checker_verdict": verdict,
         "checker_feedback": feedback,
         "checker_corrections": corrections,
-        "current_node": current_node,
     }
 
 
 def _event_to_component_type(stage: str) -> str:
+    """Traduz o estágio atual do SIPOC para o tipo de componente."""
     return {
         "mapping_suppliers": "supplier",
         "mapping_inputs": "input",

@@ -1,6 +1,6 @@
 """
-Embedding via OpenAI API. Default: text-embedding-3-small com 1536 dims
-(parity com schema rag_chunks.embedding vector(1536)).
+Embedding via OpenAI API. Default: text-embedding-3-small com 768 dims
+(parity com schema rag_chunks.embedding vector(768) — migration 20260520140000).
 
 Wraps SDK openai síncrono via asyncio.to_thread. Padrão alinhado a
 src.managed_agents.ollama_agent_client (mesmo SDK, mesmo wrap).
@@ -8,7 +8,7 @@ src.managed_agents.ollama_agent_client (mesmo SDK, mesmo wrap).
 Para mudar para Gemini ou outro provider:
 - Criar `GeminiEmbedder` com mesmo contrato (`embed_one`, `embed_batch`)
 - Atualizar `rag_chunks.embedding_model` ao salvar
-- Garantir dim=1536 OU criar tabela paralela com dim diferente
+- Garantir dim=768 OU criar tabela paralela com dim diferente
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from openai import OpenAI
 logger = logging.getLogger("rag.embedder")
 
 DEFAULT_MODEL = "text-embedding-3-small"
-DEFAULT_DIMENSIONS = 1536
+DEFAULT_DIMENSIONS = 768
 DEFAULT_GEMINI_MODEL = "gemini-embedding-001"
 
 
@@ -76,8 +76,8 @@ class OpenAIEmbedder:
             "input": non_empty_texts,
         }
         # text-embedding-3-* aceita `dimensions` (truncamento via Matryoshka).
-        # Para text-embedding-3-small com dimensions=1536 (default), o truncamento
-        # é no-op mas ainda assim aceita o param.
+        # Para text-embedding-3-small com dimensions=768 (default pós-migration),
+        # o truncamento reduz de 1536 nativas para 768.
         if self.model.startswith("text-embedding-3-"):
             kwargs["dimensions"] = self.dimensions
 
@@ -99,9 +99,9 @@ class OpenAIEmbedder:
 
 
 class GeminiEmbedder:
-    """Embedding client via Google Gemini API com Matryoshka 1536 dims.
+    """Embedding client via Google Gemini API com Matryoshka 768 dims.
 
-    Mantém parity de schema com OpenAIEmbedder (dim=1536, vector(1536)).
+    Mantém parity de schema com OpenAIEmbedder (dim=768, vector(768)).
     `gemini-embedding-001` aceita output_dimensionality em [128, 3072];
     para dim < 3072, NÃO normaliza automaticamente — fazemos L2 manual
     pra garantir cosine similarity correta no índice HNSW.

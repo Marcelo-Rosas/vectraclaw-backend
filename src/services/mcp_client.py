@@ -15,6 +15,7 @@ import json
 import logging
 from typing import List, Dict, Any, Optional, Tuple, Callable
 
+# pyrefly: ignore [untyped-import]
 import requests
 
 logger = logging.getLogger("MCP_Client")

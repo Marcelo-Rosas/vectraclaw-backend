@@ -684,7 +684,7 @@ class ResilientHarnessDaemon:
 
         if op_type == "rag-ingest":
             from src.agents.mnemos import entrypoint as mnemos_entry
-            result = mnemos_entry(task, self._get_supabase())
+            result = asyncio.run(mnemos_entry(task, self._get_supabase()))
             return _json.dumps(result)
 
         # VEC-388 PR1 - Athena (9o daemon, PMOia Heldman/PMBOK)

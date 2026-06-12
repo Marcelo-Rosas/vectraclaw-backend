@@ -15,6 +15,15 @@ class _OracleSession:
         self.current_stage: str = "idle"
         self.last_active: float = time.time()
 
+        # Metadados do último turno maker-checker.
+        # Permitem que turnos futuros acessem o histórico de validação
+        # sem depender exclusivamente do histórico de mensagens.
+        self.last_checker_verdict: str = "accept"
+        self.last_checker_feedback: str = ""
+        self.last_checker_corrections: List[Dict[str, Any]] = []
+        self.last_maker_structured: Dict[str, Any] = {}
+        self.last_iteration_count: int = 0
+
 
 _SESSIONS: Dict[str, _OracleSession] = {}
 _STREAM_QUEUES: Dict[str, "asyncio.Queue[Dict[str, Any]]"] = {}
