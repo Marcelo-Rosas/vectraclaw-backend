@@ -2672,7 +2672,22 @@ async def doctor_scheduler(interval_s: int):
 async def startup_event():
     _refresh_llm_price_cache(force=True)
     app.state.doctor_task = asyncio.create_task(doctor_scheduler(interval_s=30))
-    app.state.morpheus_task = asyncio.create_task(morpheus_scheduler(interval_s=10))
+    # Morpheus dispatcher: por padrão roda como worker standalone
+    # (docker-compose service `morpheus` / `python -m src.morpheus_daemon`),
+    # decoplado do app. O scheduler asyncio in-app morre quando o Cloud Run
+    # escala a zero, deixando tasks presas em `backlog`. Mantemos a opção in-app
+    # atrás de MORPHEUS_IN_APP pra ambientes single-process (ex.: dev local sem
+    # o worker), mas NÃO ligar junto com o worker standalone (dispatcher duplo).
+    if os.getenv("MORPHEUS_IN_APP", "false").strip().lower() in ("1", "true", "yes"):
+        app.state.morpheus_task = asyncio.create_task(morpheus_scheduler(interval_s=10))
+        logger.info("[morpheus] in-app scheduler HABILITADO (MORPHEUS_IN_APP)")
+    else:
+        app.state.morpheus_task = None
+        logger.warning(
+            "[morpheus] in-app scheduler DESABILITADO — garanta o worker "
+            "standalone rodando (docker-compose service 'morpheus' / "
+            "'python -m src.morpheus_daemon'), senão tasks ficam presas em backlog."
+        )
 
 @app.on_event("shutdown")
 async def shutdown_event():
