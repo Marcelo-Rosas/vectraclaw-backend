@@ -51,6 +51,23 @@ def register_effect(slug: str, fn: Effect) -> None:
     EFFECTS[slug] = fn
 
 
+_CLIENTS_LOADED = False
+
+
+def _ensure_clients_registered() -> None:
+    """Importa módulos clientes uma vez pra popular os registries (hooks
+    registram em import-time). Lazy pra evitar import circular e custo no boot."""
+    global _CLIENTS_LOADED
+    if _CLIENTS_LOADED:
+        return
+    _CLIENTS_LOADED = True
+    for module in ("src.agents.workflow_builder",):
+        try:
+            __import__(module)
+        except Exception as exc:  # noqa: BLE001 - registro best-effort, não derruba execução
+            logger.warning("registro de cliente '%s' falhou: %s", module, exc)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -131,6 +148,7 @@ def _safe_json(text: str) -> Optional[Dict[str, Any]]:
 
 async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, Any]:
     """Entrypoint chamado pelo daemon quando há `_resolved_specialty` com template."""
+    _ensure_clients_registered()
     started = _now_iso()
     task_id = str(task.get("id") or "")
     op_type = str(task.get("operation_type") or "")
