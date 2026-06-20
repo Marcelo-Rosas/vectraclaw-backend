@@ -41,14 +41,21 @@ Effect = Callable[[Dict[str, Any], Any, Dict[str, Any], Dict[str, Any]], Dict[st
 
 INPUT_BUILDERS: Dict[str, InputBuilder] = {}
 EFFECTS: Dict[str, Effect] = {}
+# slugs cuja execução é SÓ efeito (chamada de tool/API, sem LLM). O effect roda
+# direto com task.input_json — não há render de prompt nem generate_for_agent.
+EFFECT_ONLY: set = set()
 
 
 def register_input_builder(slug: str, fn: InputBuilder) -> None:
     INPUT_BUILDERS[slug] = fn
 
 
-def register_effect(slug: str, fn: Effect) -> None:
+def register_effect(slug: str, fn: Effect, *, llm: bool = True) -> None:
+    """Registra effect pra um slug. llm=False → specialty effect-only (pula o LLM,
+    roda o effect direto com o input — pra folhas que só chamam tool/API)."""
     EFFECTS[slug] = fn
+    if not llm:
+        EFFECT_ONLY.add(slug)
 
 
 _CLIENTS_LOADED = False
@@ -61,7 +68,7 @@ def _ensure_clients_registered() -> None:
     if _CLIENTS_LOADED:
         return
     _CLIENTS_LOADED = True
-    for module in ("src.agents.workflow_builder",):
+    for module in ("src.agents.workflow_builder", "src.agents.prospect_leaves"):
         try:
             __import__(module)
         except Exception as exc:  # noqa: BLE001 - registro best-effort, não derruba execução
@@ -168,6 +175,24 @@ async def execute_specialty(task: Dict[str, Any], supabase: Any) -> Dict[str, An
 
     values = _resolve_template_values(spec, config_values, shared_values, payload)
     slug = str(getattr(spec, "slug", "") or "")
+
+    # Folha effect-only (chamada de tool/API, sem LLM): roda o effect direto com
+    # o input_json. Sem render de prompt nem generate_for_agent.
+    if slug in EFFECT_ONLY:
+        effect = EFFECTS.get(slug)
+        if not effect:
+            return _error(task_id, op_type, started, "effect_only_sem_effect",
+                          f"slug {slug} é effect-only mas não tem effect registrado.")
+        try:
+            effect_out = effect(task, supabase, payload, values)
+        except Exception as exc:
+            return _error(task_id, op_type, started, "effect_failed", f"effect[{slug}] falhou: {exc}")
+        summary = (effect_out or {}).get("summary") if isinstance(effect_out, dict) else None
+        return _envelope("succeeded", str(summary or "ok"), {
+            "handler_name": "specialty-generic", "specialty_slug": slug, "execution_id": task_id,
+            "outputs": payload, "effect": effect_out, "metadata": {"mode": "effect_only"},
+            "execution_started_at": started, "execution_completed_at": _now_iso(),
+        })
 
     # input-builder hook (ex.: workflow-builder injeta componentes SIPOC)
     extra_context: Optional[str] = None
