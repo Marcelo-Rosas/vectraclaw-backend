@@ -728,6 +728,16 @@ class ResilientHarnessDaemon:
             result = run_skill_for_task(task)
             return _json.dumps(result)
 
+        # Catalog-driven generic executor — roda qualquer specialty atribuída
+        # ao agente via system_prompt_template + config_schema (sem handler
+        # Python dedicado). Precede o claude -p deprecado. Só dispara quando o
+        # daemon resolveu uma specialty com template pra esta op_type.
+        resolved_spec = task.get("_resolved_specialty")
+        if resolved_spec is not None and getattr(resolved_spec, "system_prompt_template", ""):
+            from src.agents.specialty_generic import execute_specialty as generic_execute
+            result = asyncio.run(generic_execute(task, self._get_supabase()))
+            return _json.dumps(result)
+
         # Default: forward to claude -p
         # TODO(W8): remover este caminho após todos agentes terem adapter
         # configurado. Caminho catalog-driven correto: task com executor_type=auto
