@@ -126,9 +126,20 @@ async def generate_for_agent(
     except Exception as exc:
         logger.warning("generate_for_agent provider=%s falhou, fallback gemini: %s", provider, exc)
 
-    # google ou fallback
+    # google ou fallback.
+    # BUG latente: se o provider NÃO é google (ex.: 'nous_hermes' sem branch, ou
+    # groq/anthropic que lançaram acima), cfg.model pode ser de OUTRO provider
+    # (ex.: 'claude-sonnet-4-5') — inválido pro gemini e causa erro, não 429.
+    # Só confiamos em cfg.model quando o provider é google; senão usamos
+    # fallback_model (gemini-válido, vindo do config) ou DEFAULT_MODEL.
     from src.services.gemini_client import generate as gemini_generate, DEFAULT_MODEL
+    gemini_model = (model if provider == "google" else None) or fallback_model or DEFAULT_MODEL
+    if provider != "google":
+        logger.warning(
+            "generate_for_agent provider=%s sem branch dedicado — fallback gemini model=%s",
+            provider, gemini_model,
+        )
     return await gemini_generate(
-        model or DEFAULT_MODEL, prompt,
+        gemini_model, prompt,
         system_instruction=system_instruction, response_mime_type=response_mime_type,
     )
